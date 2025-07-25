@@ -1,5 +1,6 @@
 const express = require('express');
 const bodyParser = require('body-parser');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -8,6 +9,11 @@ const PORT = process.env.PORT || 10000;
 const VERIFY_TOKEN = 'mytoken123';
 
 app.use(bodyParser.json());
+
+// ✅ Serve the privacy policy page
+app.get('/privacy-policy', (req, res) => {
+  res.sendFile(path.join(__dirname, 'privacy-policy.html'));
+});
 
 // Required GET endpoint for Facebook verification
 app.get('/webhook', (req, res) => {
