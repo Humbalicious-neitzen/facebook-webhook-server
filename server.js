@@ -5,7 +5,7 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// 👉 Must match the Verify Token you type in Facebook
+// ✅ Must match the Verify Token you type in Facebook Developer Console
 const VERIFY_TOKEN = 'mytoken123';
 
 app.use(bodyParser.json());
@@ -15,7 +15,7 @@ app.get('/privacy-policy', (req, res) => {
   res.sendFile(path.join(__dirname, 'privacy-policy.html'));
 });
 
-// Required GET endpoint for Facebook verification
+// ✅ GET endpoint for Facebook webhook verification
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -33,10 +33,28 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-// Optional POST for receiving messages
+// ✅ POST endpoint to receive messages
 app.post('/webhook', (req, res) => {
-  console.log('🔔 Incoming webhook payload:');
+  console.log('📩 Incoming webhook payload:');
   console.dir(req.body, { depth: null });
+
+  const body = req.body;
+
+  if (body.object === 'page') {
+    body.entry.forEach(entry => {
+      const webhookEvent = entry.messaging[0];
+
+      // ✅ Extract PSID here
+      const senderPsid = webhookEvent.sender.id;
+      console.log('✅ PSID:', senderPsid);
+
+      // You can also check the message content if needed
+      if (webhookEvent.message && webhookEvent.message.text) {
+        console.log('💬 Message Text:', webhookEvent.message.text);
+      }
+    });
+  }
+
   res.status(200).send('EVENT_RECEIVED');
 });
 
