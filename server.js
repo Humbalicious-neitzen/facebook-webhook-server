@@ -19,6 +19,26 @@ const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN; // Page token (the one 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
+// ✅ Toggle flag to enable/disable auto-replies
+const AUTO_REPLY_ENABLED = false; // set to false to pause automation
+
+...
+
+// Inside your webhook message handler:
+if (webhookEvent.message && webhookEvent.message.text) {
+    console.log('💬 Message Text:', webhookEvent.message.text);
+
+    if (AUTO_REPLY_ENABLED) {
+        // Your existing ChatGPT + send reply logic here
+        const userMessage = webhookEvent.message.text;
+        const replyText = await getChatGPTReply(userMessage);
+        await callSendAPI(senderPsid, replyText);
+    } else {
+        console.log("⚠️ Auto-reply is DISABLED — message received but no reply sent.");
+    }
+}
+
+
 // IG comments sometimes require a **user** token with instagram_* perms.
 // If you have one, set it; otherwise we’ll try PAGE_ACCESS_TOKEN.
 const IG_MANAGE_TOKEN = process.env.IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
