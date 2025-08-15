@@ -22,7 +22,7 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 // Render → Environment: AUTO_REPLY_ENABLED=true or false
 const AUTO_REPLY_ENABLED = String(process.env.AUTO_REPLY_ENABLED || 'false').toLowerCase() === 'true';
 
-// IG comment management token (once you have instagram_manage_comments)
+// IG comment management token (long-lived USER token for the IG account owner)
 const IG_MANAGE_TOKEN = process.env.IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
 
 // Behavior flags for handover/standby
@@ -70,7 +70,6 @@ function verifySignature(req) {
 // Webhook RECEIVE (POST)
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200); // ack fast
-
   if (!verifySignature(req)) { console.error('Signature verification failed'); return; }
 
   const body = req.body;
@@ -167,11 +166,12 @@ async function routePageChange(change) {
     const text = (v.message || '').trim();
     console.log('FB comment:', { commentId, text });
 
-    const reply = await decideReply(text);
+    // Don't compute a reply (and don't hit OpenAI) if disabled
     if (!AUTO_REPLY_ENABLED) {
-      console.log('Auto-reply disabled — would reply to FB comment:', reply);
+      console.log('Auto-reply disabled — would reply to FB comment.');
       return;
     }
+    const reply = await decideReply(text);
     await replyToFacebookComment(commentId, reply);
   }
 }
@@ -215,11 +215,12 @@ async function routeInstagramChange(change) {
     const text = (v.text || v.message || '').trim();
     console.log('IG comment:', { commentId, text });
 
-    const reply = await decideReply(text);
+    // Don't compute a reply (and don't hit OpenAI) if disabled
     if (!AUTO_REPLY_ENABLED) {
-      console.log('Auto-reply disabled — would reply to IG comment:', reply);
+      console.log('Auto-reply disabled — would reply to IG comment.');
       return;
     }
+    const reply = await decideReply(text);
     await replyToInstagramComment(commentId, reply);
   }
 }
@@ -238,19 +239,23 @@ async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
   console.log('PSID:', psid);
   if (text) console.log('Message Text:', text);
 
-  const reply = await decideReply(text);
-
+  // Don't compute a reply (and don't hit OpenAI) if disabled
   if (!AUTO_REPLY_ENABLED) {
-    console.log('Auto-reply disabled — would send DM:', reply);
+    console.log('Auto-reply disabled — would send DM.');
     return;
   }
+
+  const reply = await decideReply(text);
   await sendText(psid, reply);
 }
 
+/* =========================
+   Reply logic (uses OpenAI only when enabled)
+   ========================= */
 async function decideReply(text) {
   const t = (text || '').toLowerCase();
 
-  // Fast paths
+  // Fast paths (cheap, available even when disabled)
   if (/\brate|price|cost|room\b/.test(t)) {
     return 'You can view current rates and availability here: https://www.roameoresorts.com/';
   }
@@ -261,10 +266,11 @@ async function decideReply(text) {
     return 'Check-in is 3 pm; check-out is 11 am. For bookings: https://www.roameoresorts.com/';
   }
 
-  // ChatGPT fallback
-  if (!OPENAI_API_KEY) {
+  // If auto-replies are OFF or OpenAI key missing, use a safe canned reply (NO OpenAI calls)
+  if (!AUTO_REPLY_ENABLED || !OPENAI_API_KEY) {
     return 'Thanks for reaching out! For bookings and details: https://www.roameoresorts.com/';
   }
+
   try {
     const systemPrompt = `
 You are Roameo Resorts' helpful assistant.
