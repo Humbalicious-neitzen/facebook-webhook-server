@@ -5,7 +5,8 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const axios = require('axios');
-const LRU = require('lru-cache');
+// v10+ exports LRUCache (not LRU)
+const { LRUCache } = require('lru-cache');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -13,13 +14,12 @@ const PORT = process.env.PORT || 10000;
 // ===== ENV =====
 const APP_SECRET = process.env.APP_SECRET;                   // Meta app secret
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'verify_dev';
-const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;     // Page token (the one that returns name "Roameo Resorts" in /me)
+const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;     // Page token (returns name "Roameo Resorts" in /me)
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;           // OpenAI key
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
 // Optional behavior flags
 const ALLOW_REPLY_IN_STANDBY = (process.env.ALLOW_REPLY_IN_STANDBY || 'true').toLowerCase() === 'true';
-// If you're secondary (Page Inbox is primary), set this to "true" to call /take_thread_control before replying
 const AUTO_TAKE_THREAD_CONTROL = (process.env.AUTO_TAKE_THREAD_CONTROL || 'false').toLowerCase() === 'true';
 
 if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
@@ -32,7 +32,7 @@ app.use(bodyParser.json({
 }));
 
 // Idempotency (Meta may retry deliveries)
-const dedupe = new LRU({ max: 5000, ttl: 1000 * 60 * 60 }); // 1 hour
+const dedupe = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 }); // 1 hour
 
 // ===== Healthcheck
 app.get('/', (_req, res) => res.send('Roameo AutoReplyBot running'));
