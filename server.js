@@ -2,6 +2,7 @@
 // FB DMs + FB comment replies + IG DMs + IG comment replies
 // Unique GPT replies (EN/Urdu/Roman-Ur) + positivity + Weather (OpenWeather) + Distance/ETA (Geoapify)
 // Pricing-in-comments -> private reply + public "check inbox" note
+// Lightweight conversation state for CTA follow-up (dates/guests)
 // Admin helpers (subscribe/status)
 
 const express = require('express');
@@ -83,7 +84,7 @@ const FACTS = {
     executive: { base: 50000, n1: 45000, n2: 42500, n3: 40000 }
   },
   facilities: [
-    `Private riverfront huts facing the ${'Krishenganga River'}`,
+    `Private riverfront huts facing the Krishenganga River`,
     'Heaters, inverters & insulated huts (cozy even in winters)',
     'In-house kitchen (local & desi meals)',
     'Private internet access + SCOM SIM support',
@@ -161,6 +162,8 @@ We can help with rates, facilities, directions and travel timings here. For live
 app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 const dedupe = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 }); // 1h
 const tinyCache = new LRUCache({ max: 200, ttl: 1000 * 60 * 10 }); // 10m (weather/geo)
+// Conversation state (30 minutes per user)
+const convo = new LRUCache({ max: 5000, ttl: 1000 * 60 * 30 });
 
 /* =========================
    BASIC ROUTES
@@ -360,12 +363,12 @@ async function igPrivateReplyToComment(pageId, commentId, message) {
 
 async function routeInstagramChange(change, pageId) {
   const v = change.value || {};
-  const field = change.field || '';
-  const isComment = field === 'comments' || field.toLowerCase().includes('comment') || (v.item === 'comment');
+  theField = change.field || '';
+  const isComment = theField === 'comments' || theField.toLowerCase().includes('comment') || (v.item === 'comment');
   if (isComment && (v.comment_id || v.id)) {
     const commentId = v.comment_id || v.id;
     const text = (v.text || v.message || '').trim();
-    console.log('💬 IG comment event:', { field, verb: v.verb, commentId, text, media_id: v.media_id, from: v.from });
+    console.log('💬 IG comment event:', { field: theField, verb: v.verb, commentId, text, media_id: v.media_id, from: v.from });
     if (v.verb && v.verb !== 'add') return;
 
     if (isPricingIntent(text)) {
@@ -384,11 +387,76 @@ async function routeInstagramChange(change, pageId) {
 }
 
 /* =========================
-   SHARED DM HANDLER
+   SHARED DM HANDLER (with simple state)
    ========================= */
+function isAffirmative(text = '') {
+  const t = (text || '').trim().toLowerCase();
+
+  // English
+  const en = /\b(yes|yeah|yep|sure|ok(ay)?|please|go ahead|sounds good|alright|affirmative|y)\b/;
+
+  // Roman-Urdu
+  const ru = /\b(haan|han|ji|jee|bilkul|theek(?:\s*hai)?|acha|accha|zaroor|krdo|kardo|kar do|kr den|krden)\b/;
+
+  // Urdu script (جی، جی ہاں، ہاں، بالکل، ٹھیک ہے)
+  const ur = /(?:\u062C\u06CC|\u062C\u06CC\u06C1|\u06C1\u0627\u06BA|\u0628\u0644\u06A9\u0644|\u062A\u06BE\u06CC\u06A9\s?\u06C1\u06D2?)/;
+
+  return en.test(t) || ru.test(t) || ur.test(t);
+}
+
+function askForDetailsByLang(lang = 'en') {
+  if (lang === 'ur') {
+    return `زبردست! براہِ کرم اپنی *تاریخیں* اور *مہمانوں کی تعداد* بتا دیں۔ اگر آپ چاہیں تو *کس شہر سے روانہ ہوں گے* بھی بتا دیں تاکہ ہم راستے کا وقت بتا سکیں۔  
+بکنگ کی تصدیق ہمیشہ ویب سائٹ سے ہوتی ہے: ${SITE_URL}`;
+  } else if (lang === 'roman-ur') {
+    return `Great! Barah-e-meherbani apni *dates* aur *guests ki tadaad* bata dein. Agar chahein to *kis sheher se aa rahe hain* bhi likh dein taake hum route time bata saken.  
+Booking ki tasdeeq website se hoti hai: ${SITE_URL}`;
+  }
+  return `Awesome! Please share your *travel dates* and *number of guests*. If you like, also tell me *which city you’ll start from* so I can estimate drive time.  
+To confirm the booking, please use the website: ${SITE_URL}`;
+}
+
+function confirmAfterDetailsByLang(lang = 'en') {
+  if (lang === 'ur') {
+    return `شکریہ! آپ کی معلومات مل گئیں۔ بکنگ کی تصدیق کے لیے براہِ راست ویب سائٹ استعمال کریں: ${SITE_URL}  
+راستے کے بارے میں مدد یا ہٹ منتخب کرنے میں رہنمائی چاہیے ہو تو بتائیں—ہم موجود ہیں۔`;
+  } else if (lang === 'roman-ur') {
+    return `Shukriya! Aap ki maloomat mil gayi. Booking ki tasdeeq ke liye seedha website use karein: ${SITE_URL}  
+Route help ya hut choose karne mein rehnumai chahiye ho to batayein—hum yahin hain.`;
+  }
+  return `Thanks! Got your details. To confirm your booking, please use the website: ${SITE_URL}  
+If you’d like route help or hut suggestions, just say the word—I’m here.`;
+}
+
 async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
   console.log('🧑 PSID:', psid, '✉️', text);
-  if (!AUTO_REPLY_ENABLED) return console.log('🤖 Auto-reply disabled — would send DM.');
+  const lang = detectLanguage(text);
+  const state = convo.get(psid);
+
+  // If user says YES to the CTA (or general consent), ask for dates/guests
+  if (isAffirmative(text)) {
+    convo.set(psid, 'awaiting_details');
+    await sendText(psid, askForDetailsByLang(lang));
+    return;
+  }
+
+  // If we recently asked for details, treat next message as details
+  if (state === 'awaiting_details') {
+    convo.delete(psid); // clear the simple state
+    await sendText(psid, confirmAfterDetailsByLang(lang));
+    try {
+      // One helpful follow-up using GPT (e.g., if they mentioned origin city, distance/ETA, etc.)
+      const follow = await decideReply(text, { surface: 'dm', platform: opts.channel === 'instagram' ? 'instagram' : 'facebook' });
+      await sendText(psid, follow);
+    } catch (e) { logErr(e); }
+    return;
+  }
+
+  // Normal path
+  if (!AUTO_REPLY_ENABLED) {
+    console.log('🤖 Auto-reply disabled — would send DM.');
+    return;
+  }
   const reply = await decideReply(text, { surface: 'dm', platform: opts.channel === 'instagram' ? 'instagram' : 'facebook' });
   await sendText(psid, reply);
 }
