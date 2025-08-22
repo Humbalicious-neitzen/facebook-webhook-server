@@ -20,7 +20,7 @@ const PORT = process.env.PORT || 10000;
    ENV & CONSTANTS
    ========================= */
 const APP_SECRET = process.env.APP_SECRET;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'verify_dev';
+const VERIFY_TOKEN = process.envVERIFY_TOKEN || 'verify_dev';
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 
 // OpenAI
@@ -708,6 +708,13 @@ function isInfluencerInquiry(raw = '') {
   const t = (raw || '').toLowerCase();
   return /\b(influencer|collab|collaboration|barter|pr|gift(?:ing)?|review|creator|blogger|vlogger|media|shoot|photoshoot|content\s*partnership)\b/.test(t);
 }
+// NEW: explicit road-conditions intent
+function isRoadConditionIntent(text = '') {
+  const t = (text || '').toLowerCase();
+  const road = /\b(road|roads|highway|route|travel|rasta|raasta)\b/.test(t);
+  const cond = /\b(condition|status|halaat|flood|floods|barish|rain|landslide|cloud\s*burst|cloudburst|washout|damage)\b/.test(t);
+  return road && cond;
+}
 
 async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) {
   const t = (text || '').toLowerCase();
@@ -740,6 +747,20 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
     );
   }
 
+  // 0.3) NEW: Road condition intent (comment or DM)
+  if (isRoadConditionIntent(text)) {
+    const wxLine = (lat, lon) => `\n${lang === 'ur'
+      ? 'حالیہ موسم جاننے کے لیے ہم مدد کر سکتے ہیں —'
+      : lang === 'roman-ur'
+        ? 'Latest mausam check karne mein madad kar sakte hain —'
+        : 'We can also check recent weather —'} ${MAPS_LINK}`;
+    const baseUR = `سڑکیں عموماً کارپٹڈ اور کھلی رہتی ہیں۔ ریزورٹ کے قریب ایک چھوٹا سا پانی کا کراسنگ ہے؛ بزرگ مہمانوں کے لیے ہماری 4×4 جیپ مفت مدد دیتی ہے۔ تیز بارش یا لینڈ سلائیڈز کی صورت میں بہترین ٹائمنگ اور تازہ صورتحال کے لیے WhatsApp کریں: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY}).`;
+    const baseRU = `Roads aam tor par carpeted aur open hoti hain. Resort ke qareeb chhota pani crossing hai; buzurg mehmaanon ke liye 4×4 jeep free assist available hai. Agar tez barish/landslide ho, best timing aur latest update ke liye WhatsApp karein: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY}).`;
+    const baseEN = `Roads are generally open and fully carpeted. Near the resort there’s a small water crossing; our team provides free 4×4 jeep assist for elderly guests. In case of heavy rain or landslides, message us on WhatsApp for the latest update and best travel timing: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY}).`;
+    const msg = lang === 'ur' ? baseUR : lang === 'roman-ur' ? baseRU : baseEN;
+    return sanitizeVoice(`${msg}${wxLine()}`);
+  }
+
   const intent = {
     rates: /\b(pric(?:e|ing)|rate|cost|charges?|tariff|per\s*night|room|rooms)\b/i.test(t),
     location: /\b(location|where|address|map|pin|directions?|google\s*maps|reach)\b/i.test(t),
@@ -765,7 +786,7 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
     enrich.wx = await currentWeather(resortLat, resortLon);
   }
 
-  // Distance / road conditions
+  // Distance / road inquiries with origin
   if (intent.distance && resortLat && resortLon) {
     let originName = maybeOrigin ? normalizeOriginName(maybeOrigin) : null;
     let originGeo = originName ? await geocodePlace(originName) : null;
