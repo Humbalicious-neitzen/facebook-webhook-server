@@ -1,8 +1,8 @@
-// server.js — Roameo Resorts omni-channel bot (deterministic)
-// FB DMs + FB comments + IG DMs + IG comments
-// No GPT. Brand-first. WhatsApp-first. Prices only in DMs (as discounted).
-// Self-reply guards (IG/FB). Road conditions: fixed text (handles "cloud brust").
-// Language-aware (EN / Urdu / Roman-Ur).
+// server.js — Roameo Resorts omni-channel bot (FB + IG)
+// Deterministic intents for public replies; optional GPT for DMs only.
+// Public: no numeric prices (policy). DM: send discounted prices.
+// Brand-first voice (we/us/our). WhatsApp-first contact routing.
+// Self-reply guard so the bot never replies to its own comments.
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -20,59 +20,89 @@ const APP_SECRET = process.env.APP_SECRET;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'verify_dev';
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 
-// IG token (can reuse PAGE token if scoped)
+// OpenAI (optional; used only for general DMs)
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+
+// IG token (re-uses PAGE token if not set)
 const IG_MANAGE_TOKEN = process.env.IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
 
-// Admin (optional)
+// Admin
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
-// Optional enrichment (kept minimal)
-const RESORT_COORDS = (process.env.RESORT_COORDS || '').trim(); // "lat,lon"
+// Feature toggles
+const AUTO_REPLY_ENABLED = String(process.env.AUTO_REPLY_ENABLED || 'true').toLowerCase() === 'true';
+const ALLOW_REPLY_IN_STANDBY = String(process.env.ALLOW_REPLY_IN_STANDBY || 'true').toLowerCase() === 'true';
+const AUTO_TAKE_THREAD_CONTROL = String(process.env.AUTO_TAKE_THREAD_CONTROL || 'false').toLowerCase() === 'true';
+
+// BUSINESS FACTS (edit here)
+const BRAND_NAME = 'Roameo Resorts';
+const SITE_URL = 'https://www.roameoresorts.com/';
+const MAPS_LINK = 'https://maps.app.goo.gl/Y49pQPd541p1tvUf6';
+const CHECKIN_TIME = process.env.CHECKIN_TIME || '3:00 pm';
+const CHECKOUT_TIME = process.env.CHECKOUT_TIME || '12:00 pm';
+
+// Contact (NO new envs required, hard-coded as requested)
+const WHATSAPP_LINK = 'https://wa.me/923558000078';
+
+// To avoid self-replies on IG/FB comments (adjust if needed)
+const SELF_IG_USERNAMES = ['roameoresorts']; // your IG handle(s)
+const SELF_FB_PAGE_IDS = []; // optional: your FB page IDs (string)
 
 // Guards
 if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
-  console.warn('⚠️ Missing required env vars: APP_SECRET, VERIFY_TOKEN, PAGE_ACCESS_TOKEN');
+  console.warn('⚠️ Missing env vars: APP_SECRET, VERIFY_TOKEN, PAGE_ACCESS_TOKEN');
 }
 
 /* =========================
-   BUSINESS FACTS
+   REPLY TEMPLATES
    ========================= */
-const BRAND = 'Roameo Resorts';
-const SITE_URL = 'https://www.roameoresorts.com/';
-const WHATSAPP_LINK = 'https://wa.me/923558000078';
-const MAPS_LINK = 'https://maps.app.goo.gl/Y49pQPd541p1tvUf6';
+const REPLY_TEMPLATES = {
+  // DMs only (include discounted prices)
+  dm_prices_en: `
+Here are our **discounted** soft-launch prices:
 
-const FACTS = {
-  brand: BRAND,
-  site: SITE_URL,
-  whatsapp: WHATSAPP_LINK,
-  map: MAPS_LINK,
-  region: 'Kashmir',
-  river: 'Neelam River',
-  location_label: 'our riverfront resort in Kashmir',
-  // Pricing (DM only)
-  rates: {
-    deluxe:    { base: 30000, n1: 27000, n2: 25500, n3: 24000 },
-    executive: { base: 50000, n1: 45000, n2: 42500, n3: 40000 }
-  },
-  checkin:  '3:00 pm',
-  checkout: '12:00 pm',
-  facilities: [
-    'Private riverfront huts',
-    'Heaters, inverters & insulated huts',
-    'In-house kitchen (local & desi)',
-    'Private internet + SCOM',
-    'Spacious rooms, artistic interiors',
-    'Family-friendly atmosphere',
-    'Luggage assistance from private parking',
-    'Free 4×4 jeep assist (elderly / water crossing)',
-    'Bonfire & outdoor seating on request'
-  ],
-  travel_tips: [
-    'Carpeted roads for a smooth, scenic drive',
-    'Small water crossing near the resort; sedans can use private parking (1-minute walk)',
-    'Free jeep transfer for elderly guests'
-  ]
+• Deluxe Hut — PKR 30,000/night  
+  • 1st Night 10% → PKR 27,000  
+  • 2nd Night 15% → PKR 25,500  
+  • 3rd Night 20% → PKR 24,000
+
+• Executive Hut — PKR 50,000/night  
+  • 1st Night 10% → PKR 45,000  
+  • 2nd Night 15% → PKR 42,500  
+  • 3rd Night 20% → PKR 40,000
+
+T&Cs: taxes included • breakfast for 4 • 50% advance to confirm.
+
+For the fastest help, please WhatsApp us: ${WHATSAPP_LINK}  
+Or you can visit: ${SITE_URL}
+`.trim(),
+
+  // Public comments: never include numeric prices
+  public_prices_note_en: `We’ve sent you our **discounted prices** via DM. For quick help, please WhatsApp us: ${WHATSAPP_LINK}`,
+
+  // Road condition (public or DM)
+  road_en: `
+Roads to ${BRAND_NAME} are generally open and fully carpeted. Near the resort there’s a small water crossing; our team provides free 4×4 jeep assist for elderly guests. After heavy rain or landslides, please ping us on WhatsApp for a quick status update before you travel: ${WHATSAPP_LINK}
+`.trim(),
+
+  // Contact line
+  contact_en: `For details, please WhatsApp our team: ${WHATSAPP_LINK}`,
+
+  // General fallback (public)
+  public_default_en: `Thanks! If you have any questions about ${BRAND_NAME}, just ask. For quick assistance: ${WHATSAPP_LINK}`,
+
+  // General fallback (DM)
+  dm_default_en: `
+Thanks for reaching out to ${BRAND_NAME}! We’re a boutique riverside escape with cozy riverfront huts, warm hospitality, and beautiful mountain scenery.  
+If you’d like help with dates, routes, or choosing a hut, just tell us how we can help.  
+Quickest support: ${WHATSAPP_LINK} • More info: ${SITE_URL}
+`.trim(),
+
+  // Influencer (DM)
+  influencer_dm_en: `
+Thanks for reaching out! For collaborations, PR, or shoots, please contact our team on WhatsApp: ${WHATSAPP_LINK}
+`.trim()
 };
 
 /* =========================
@@ -80,17 +110,12 @@ const FACTS = {
    ========================= */
 app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 const dedupe = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 }); // 1h
-const igAccountCache = new LRUCache({ max: 100, ttl: 1000 * 60 * 60 }); // username per pageId
-const convo = new LRUCache({ max: 5000, ttl: 1000 * 60 * 30 }); // 30m per user
+const convo = new LRUCache({ max: 5000, ttl: 1000 * 60 * 30 });   // 30m/session
 
 /* =========================
-   BASIC ROUTES
+   BASIC / VERIFY
    ========================= */
-app.get('/', (_req, res) => res.send('Roameo Omni Bot (deterministic) running'));
-
-/* =========================
-   VERIFY
-   ========================= */
+app.get('/', (_req, res) => res.send('Roameo Omni Bot running'));
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -130,20 +155,17 @@ app.post('/webhook', async (req, res) => {
 
         if (Array.isArray(entry.messaging)) {
           for (const ev of entry.messaging) {
-            console.log('📨 FB MESSAGING:', JSON.stringify(ev));
-            await routeMessengerEvent(ev, { source: 'messaging', pageId: entry.id }).catch(logErr);
+            await routeMessengerEvent(ev, { source: 'messaging' }).catch(logErr);
           }
         }
         if (Array.isArray(entry.changes)) {
           for (const change of entry.changes) {
-            console.log('📰 FB FEED CHANGE:', JSON.stringify(change));
-            await routePageChange(change, entry.id).catch(logErr);
+            await routePageChange(change).catch(logErr);
           }
         }
         if (Array.isArray(entry.standby)) {
           for (const ev of entry.standby) {
-            console.log('⏸️ FB STANDBY:', JSON.stringify(ev));
-            await routeMessengerEvent(ev, { source: 'standby', pageId: entry.id }).catch(logErr);
+            await routeMessengerEvent(ev, { source: 'standby' }).catch(logErr);
           }
         }
       }
@@ -153,19 +175,17 @@ app.post('/webhook', async (req, res) => {
     // Instagram (DMs + comments)
     if (body.object === 'instagram') {
       for (const entry of body.entry || []) {
-        const pageId = entry.id; // IG user id
+        const pageId = entry.id; // needed to private-reply to IG comments
         const key = `ig:${entry.id}:${entry.time || Date.now()}`;
         if (dedupe.has(key)) continue; dedupe.set(key, true);
 
         if (Array.isArray(entry.messaging)) {
           for (const ev of entry.messaging) {
-            console.log('📨 IG DM:', JSON.stringify(ev));
             await routeInstagramMessage(ev).catch(logErr);
           }
         }
         if (Array.isArray(entry.changes)) {
           for (const change of entry.changes) {
-            console.log('🖼️ IG CHANGE:', JSON.stringify(change));
             await routeInstagramChange(change, pageId).catch(logErr);
           }
         }
@@ -178,55 +198,39 @@ app.post('/webhook', async (req, res) => {
 });
 
 function logErr(err) {
-  console.error('💥 Handler error:', err?.response?.data || err.where || err.message || err);
+  const payload = err?.response?.data || err?.message || err;
+  console.error('💥 Handler error:', payload);
 }
 
 /* =========================
-   HELPERS: LANGUAGE
-   ========================= */
-function detectLanguage(text = '') {
-  const t = (text || '').trim();
-  const urdu = /[\u0600-\u06FF\u0750-\u077F]/.test(t);
-  if (urdu) return 'ur';
-  const roman = [
-    /\b(aap|ap|apka|apki|apke|tum|tm|bhai|plz|pls)\b/i,
-    /\b(kia|kya|kyun|kaise|krna|karna|raha|rha|rhe|rahe|gi|ga|hain|hy|hai)\b/i,
-    /\b(mein|mai|mujhe|yahan|wahan|acha|accha|bohat|bahut)\b/i
-  ].some(rx => rx.test(t));
-  if (roman) return 'roman-ur';
-  return 'en';
-}
-
-/* =========================
-   HELPERS: INTENTS
+   INTENT DETECTORS
    ========================= */
 function isPricingIntent(text = '') {
-  const t = (text || '').toLowerCase();
-  return /\b(rate|price|prices|cost|charges?|tariff|per\s*night|room|rooms|how much|kitna|kitni)\b/i.test(t);
-}
-function isInfluencerIntent(text = '') {
-  const t = (text || '').toLowerCase();
-  return /\b(influencer|creator|content\s*creator|blogger|vlogger|collab|collaboration|barter|pr|sponsor|ambassador|review|shoot)\b/i.test(t);
+  const t = text.toLowerCase();
+  return /\b(rate|price|prices|cost|charges?|tariff|per\s*night|room|rooms|kitna|kitni)\b/i.test(t);
 }
 function isRoadConditionIntent(text = '') {
-  const t = (text || '').toLowerCase();
-  const road = /\b(road|roads|highway|route|rasta|raasta|travel)\b/.test(t);
-  const cond = /\b(condition|status|halaat|flood|floods|barish|rain|landslide|cloud\s*burst|cloudburst|cloud\s*brust|cloudbrust|washout|damage)\b/.test(t);
-  return road && cond;
+  const t = text.toLowerCase();
+  return /\b(road|roads|route|rasta|raasta)\b/.test(t) &&
+         /\b(condition|status|flood|barish|rain|landslide|cloud\s*burst|cloudburst|cloud\s*brust|cloudbrust)\b/.test(t);
+}
+function isInfluencerIntent(text = '') {
+  const t = text.toLowerCase();
+  return /\b(influencer|creator|blogger|vlogger|collab|barter|pr|sponsor|ambassador|review|shoot)\b/.test(t);
+}
+function isContactIntent(text = '') {
+  const t = text.toLowerCase();
+  return /\b(whatsapp|contact|number|phone|ping|reach|call|dm|inbox|message)\b/.test(t) ||
+         /واٹس\s*ایپ|رابطہ|نمبر|کال/i.test(text);
 }
 function isQuestionLike(text = '') {
-  const t = (text || '').toLowerCase();
+  const t = text.toLowerCase();
   if (/\?/.test(t)) return true;
-  return /\b(how|where|when|what|which|can|do|does|are|is|distance|weather|available|availability|book|booking|road|roads|condition|conditions|flood|cloud\s*burst|cloudburst|cloud\s*brust|cloudbrust)\b/i.test(t);
-}
-function isGreetingSmallTalk(raw = '') {
-  const t = (raw || '').trim().toLowerCase();
-  return /\b(hi|hello|hey|salaam|assalam[\s-]*o[\s-]*alaikum|how\s*are\s*you|salam)\b/i.test(t)
-      || /آپ کیسے ہیں|حال چال|سلام/iu.test(raw);
+  return /\b(how|where|when|what|which|can|do|does|are|is|distance|weather|available|availability|book|booking)\b/i.test(t);
 }
 
 /* =========================
-   HELPERS: BRAND-SAFE SANITIZERS
+   SANITIZERS / HELPERS
    ========================= */
 function sanitizeVoice(text = '') {
   return (text || '')
@@ -238,308 +242,142 @@ function sanitizeVoice(text = '') {
     .replace(/\bI\b/gi, 'we')
     .replace(/\bme\b/gi, 'us')
     .replace(/\bmy\b/gi, 'our')
-    .replace(/\bmine\b/gi, 'ours')
-    .replace(/\bRoameo\s+Resort\b/gi, BRAND);
+    .replace(/\bmine\b/gi, 'ours');
 }
-function sanitizeCommentNoPrices(text = '', lang = 'en') {
-  let out = sanitizeVoice(text || '');
-  // Strip money-like content in public
-  const lines = out.split(/\r?\n/).filter(Boolean).filter(line => {
-    const l = line.toLowerCase();
-    const hasCurrency = /(?:pkr|rs\.?|rupees|price|rate|per\s*night)/i.test(l);
-    const hasMoneyish = /\b\d{1,3}(?:[ ,.]?\d{3})+\b/.test(l); // 10,000 etc
-    return !(hasCurrency || hasMoneyish);
-  });
-  out = lines.join('\n');
-  if (!out.trim()) {
-    if (lang === 'ur') return 'شکریہ! مزید معلومات یا رہنمائی کے لیے ہمیں WhatsApp کریں: ' + WHATSAPP_LINK;
-    if (lang === 'roman-ur') return 'Shukriya! Details ke liye WhatsApp karein: ' + WHATSAPP_LINK;
-    return 'Thanks! For details, please WhatsApp us: ' + WHATSAPP_LINK;
-  }
+function sanitizeBrand(text = '') {
+  if (!text) return text;
+  let out = String(text);
+  out = out.replace(/\bRoameo\s+Resort\b/gi, BRAND_NAME);
+  out = out.replace(/\b(see\s*(?:you)?\s*at|welcome\s*to)\s*Tehjian\s+Valley\b/gi, '$1 ' + BRAND_NAME);
   return out;
 }
+// Public: keep WhatsApp/phone lines, strip pricing lines only
+function sanitizeCommentNoPrices(text = '', lang = 'en') {
+  let out = sanitizeVoice(sanitizeBrand(text || ''));
 
-/* =========================
-   HELPERS: CONTACT LINES
-   ========================= */
-function contactLineByLang(lang = 'en') {
-  if (lang === 'ur')   return `فوری رابطہ/بکنگ: WhatsApp ${WHATSAPP_LINK} — یا ہماری ویب سائٹ ${SITE_URL}`;
-  if (lang === 'roman-ur') return `Booking/assistance ke liye WhatsApp: ${WHATSAPP_LINK} — ya website: ${SITE_URL}`;
-  return `Bookings/assistance: WhatsApp ${WHATSAPP_LINK} — or visit ${SITE_URL}`;
-}
+  const hasCurrencyWord = (s) => /(pkr|rs\.?|rupees|price|prices|rate|rates|tariff|per\s*night|\/night\b)/i.test(s);
+  const looksLikeMoney = (s) => /\b\d{1,3}(?:[ ,.]?\d{3})+\b/.test(s); // 30,000 / 30000
+  const isWhatsAppLine = (s) => /wa\.me|whatsapp/.test(s);
+  const isPhoneLine   = (s) => /(\+?\d[\d\s\-()]{6,})/.test(s);
 
-/* =========================
-   BUILDERS: DETERMINISTIC REPLIES
-   ========================= */
-function buildRoadReply(lang = 'en', surface = 'comment') {
-  const tail = (surface === 'dm')
-    ? '\n' + contactLineByLang(lang)
-    : `\n${lang === 'ur'
-        ? `تازہ صورتحال کے لیے WhatsApp کریں: ${WHATSAPP_LINK}`
-        : lang === 'roman-ur'
-          ? `Latest update ke liye WhatsApp karein: ${WHATSAPP_LINK}`
-          : `For latest updates, WhatsApp us: ${WHATSAPP_LINK}`}`;
+  const safe = [];
+  for (const raw of out.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const l = line.toLowerCase();
 
-  if (lang === 'ur') {
-    return (
-      `${BRAND} تک سڑکیں عموماً کارپٹڈ اور کھلی رہتی ہیں۔ ریزورٹ کے قریب ایک چھوٹا پانی کراسنگ ہے؛ بزرگ مہمانوں کے لیے ہماری 4×4 جیپ مفت معاونت دیتی ہے۔ ` +
-      `تیز بارش یا لینڈ سلائیڈ کے بعد روانگی سے پہلے ہم سے مختصر اپڈیٹ لے لیں۔` + tail
-    );
+    // Keep contact lines unless they explicitly mention price keywords
+    if ((isWhatsAppLine(l) || isPhoneLine(l)) && !hasCurrencyWord(l)) {
+      safe.push(line);
+      continue;
+    }
+    // Drop explicit price/currency context
+    if (hasCurrencyWord(l)) continue;
+
+    // Big numbers without currency context are fine
+    if (looksLikeMoney(l)) {
+      safe.push(line);
+      continue;
+    }
+
+    safe.push(line);
   }
-  if (lang === 'roman-ur') {
-    return (
-      `${BRAND} tak roads aam tor par carpeted aur open hoti hain. Resort ke qareeb chhota pani crossing hai; buzurg mehmaanon ke liye 4×4 jeep free assist available hai. ` +
-      `Heavy rain/landslide ke baad nikalne se pehle humein quick update ke liye msg karein.` + tail
-    );
-  }
-  return (
-    `Roads to ${BRAND} are generally open and fully carpeted. Near the resort there’s a small water crossing; our team provides free 4×4 jeep assist for elderly guests. ` +
-    `After heavy rain/landslides, ping us for a quick status update before you travel.` + tail
-  );
-}
 
-function buildPriceDM(lang = 'en') {
-  const r = FACTS.rates;
-  if (lang === 'ur') {
-    return sanitizeVoice(
-      `آپ کے لیے *ڈسکاؤنٹڈ پرائسز*:\n\n` +
-      `Deluxe Hut — PKR ${r.deluxe.base.toLocaleString()}/night\n` +
-      `• 1st Night 10% → PKR ${r.deluxe.n1.toLocaleString()}\n` +
-      `• 2nd Night 15% → PKR ${r.deluxe.n2.toLocaleString()}\n` +
-      `• 3rd Night 20% → PKR ${r.deluxe.n3.toLocaleString()}\n\n` +
-      `Executive Hut — PKR ${r.executive.base.toLocaleString()}/night\n` +
-      `• 1st Night 10% → PKR ${r.executive.n1.toLocaleString()}\n` +
-      `• 2nd Night 15% → PKR ${r.executive.n2.toLocaleString()}\n` +
-      `• 3rd Night 20% → PKR ${r.executive.n3.toLocaleString()}\n\n` +
-      `مزید مدد یا ریزرویشن کے لیے WhatsApp: ${WHATSAPP_LINK}\n` +
-      `Website: ${SITE_URL}`
-    );
-  }
-  if (lang === 'roman-ur') {
-    return sanitizeVoice(
-      `*Discounted prices* for you:\n\n` +
-      `Deluxe Hut — PKR ${r.deluxe.base.toLocaleString()}/night\n` +
-      `• 1st Night 10% → PKR ${r.deluxe.n1.toLocaleString()}\n` +
-      `• 2nd Night 15% → PKR ${r.deluxe.n2.toLocaleString()}\n` +
-      `• 3rd Night 20% → PKR ${r.deluxe.n3.toLocaleString()}\n\n` +
-      `Executive Hut — PKR ${r.executive.base.toLocaleString()}/night\n` +
-      `• 1st Night 10% → PKR ${r.executive.n1.toLocaleString()}\n` +
-      `• 2nd Night 15% → PKR ${r.executive.n2.toLocaleString()}\n` +
-      `• 3rd Night 20% → PKR ${r.executive.n3.toLocaleString()}\n\n` +
-      `Booking/help: WhatsApp ${WHATSAPP_LINK}\n` +
-      `Website: ${SITE_URL}`
-    );
-  }
-  return sanitizeVoice(
-    `Here are our *discounted prices*:\n\n` +
-    `Deluxe Hut — PKR ${r.deluxe.base.toLocaleString()}/night\n` +
-    `• 1st Night 10% → PKR ${r.deluxe.n1.toLocaleString()}\n` +
-    `• 2nd Night 15% → PKR ${r.deluxe.n2.toLocaleString()}\n` +
-    `• 3rd Night 20% → PKR ${r.deluxe.n3.toLocaleString()}\n\n` +
-    `Executive Hut — PKR ${r.executive.base.toLocaleString()}/night\n` +
-    `• 1st Night 10% → PKR ${r.executive.n1.toLocaleString()}\n` +
-    `• 2nd Night 15% → PKR ${r.executive.n2.toLocaleString()}\n` +
-    `• 3rd Night 20% → PKR ${r.executive.n3.toLocaleString()}\n\n` +
-    `For booking or questions: WhatsApp ${WHATSAPP_LINK}\n` +
-    `Website: ${SITE_URL}`
-  );
-}
-
-function buildPricePublicLine(text = '') {
-  const lang = detectLanguage(text);
-  if (lang === 'ur')   return 'ہم نے آپ کو *ڈسکاؤنٹڈ* قیمتیں پیغام میں بھیج دی ہیں—براہِ کرم اپنے ان باکس/DM چیک کریں۔ فوری رابطہ: ' + WHATSAPP_LINK;
-  if (lang === 'roman-ur') return 'Hum ne *discounted* prices DM kar di hain—apna inbox check karein. Quick help: ' + WHATSAPP_LINK;
-  return 'We’ve sent you our *discounted* prices via DM—please check your inbox. For quick help: ' + WHATSAPP_LINK;
-}
-
-function buildInfluencerDM(lang = 'en') {
-  if (lang === 'ur')   return sanitizeVoice(`انفلوئنسر/کولیب کے لیے براہِ راست ہماری ٹیم سے WhatsApp پر بات کریں: ${WHATSAPP_LINK}`);
-  if (lang === 'roman-ur') return sanitizeVoice(`Influencer/collab ke liye hamari team se directly WhatsApp par baat karein: ${WHATSAPP_LINK}`);
-  return sanitizeVoice(`For influencer/collab opportunities, please contact our team on WhatsApp: ${WHATSAPP_LINK}`);
-}
-
-function buildSmallTalk(lang = 'en') {
-  if (lang === 'ur')   return sanitizeVoice(`ہم بہت اچھے ہیں—شکریہ! ${FACTS.region} کے دلکش مناظر میں ${BRAND} آپ کا خیر مقدم کرتا ہے۔ ${contactLineByLang('ur')}`);
-  if (lang === 'roman-ur') return sanitizeVoice(`Hum theek hain—shukriya! ${FACTS.region} ke scenic manazir mein ${BRAND} aap ka intezar kar raha hai. ${contactLineByLang('roman-ur')}`);
-  return sanitizeVoice(`We’re doing great—thanks! ${BRAND} welcomes you amid the mountain views of ${FACTS.region}. ${contactLineByLang('en')}`);
-}
-
-function buildDefault(lang = 'en') {
-  if (lang === 'ur')   return sanitizeVoice(`ہم ${BRAND} سے ہیں—کشمیر کے پہاڑی مناظر میں آپ کے لیے پُرسکون قیام۔ ${contactLineByLang('ur')}`);
-  if (lang === 'roman-ur') return sanitizeVoice(`Hum ${BRAND} se hain—Kashmir ki scenic beauty mein sukoon bhara stay. ${contactLineByLang('roman-ur')}`);
-  return sanitizeVoice(`We’re ${BRAND}—a peaceful riverside escape in Kashmir. ${contactLineByLang('en')}`);
+  out = safe.join('\n').trim();
+  if (!out) return `Thanks! For details, please WhatsApp us: ${WHATSAPP_LINK}`;
+  return out;
 }
 
 /* =========================
    FB MESSENGER (DMs)
    ========================= */
-async function routeMessengerEvent(event, ctx = { source: 'messaging', pageId: '' }) {
+async function routeMessengerEvent(event, ctx = { source: 'messaging' }) {
   if (event.delivery || event.read || event.message?.is_echo) return;
-
   if (event.message && event.sender?.id) {
-    const psid = event.sender.id;
-    const text = event.message.text || '';
-    return handleDirectMessage(psid, text, { channel: 'messenger' });
+    if (ctx.source === 'standby' && !ALLOW_REPLY_IN_STANDBY) return;
+    if (ctx.source === 'standby' && AUTO_TAKE_THREAD_CONTROL) await takeThreadControl(event.sender.id).catch(() => {});
+    return handleTextMessage(event.sender.id, event.message.text || '', { channel: 'messenger' });
   }
   if (event.postback?.payload && event.sender?.id) {
-    return handleDirectMessage(event.sender.id, 'help', { channel: 'messenger' });
+    return handleTextMessage(event.sender.id, 'help', { channel: 'messenger' });
   }
-  console.log('ℹ️ Messenger event (unhandled):', JSON.stringify(event));
 }
 
 /* =========================
    FB PAGE COMMENTS (feed)
    ========================= */
-async function routePageChange(change, pageId) {
-  if (change.field !== 'feed') return;
-  const v = change.value || {};
-  if (v.item !== 'comment' || !v.comment_id) return;
-  if (v.verb && v.verb !== 'add') return;
-
-  // Skip if we ourselves commented (from.id == pageId)
-  if (String(v.from?.id || '') === String(pageId || '')) {
-    console.log('🚫 Skip self FB comment');
-    return;
-  }
-
-  const text = (v.message || '').trim();
-  const lang = detectLanguage(text);
-
-  try {
-    if (isPricingIntent(text)) {
-      // Try to DM discounted prices; then public "check inbox" line
-      try {
-        const dm = buildPriceDM(lang);
-        await fbPrivateReplyToComment(v.comment_id, dm);
-      } catch (e) { logErr({ where: 'FB price DM', err: e }); }
-      const publicLine = buildPricePublicLine(text);
-      await replyToFacebookComment(v.comment_id, sanitizeCommentNoPrices(publicLine, lang));
-      return;
-    }
-
-    if (isRoadConditionIntent(text)) {
-      const msg = buildRoadReply(lang, 'comment');
-      await replyToFacebookComment(v.comment_id, sanitizeCommentNoPrices(msg, lang));
-      return;
-    }
-
-    // General question → one concise public reply
-    if (isQuestionLike(text)) {
-      const reply = buildDefault(lang);
-      await replyToFacebookComment(v.comment_id, sanitizeCommentNoPrices(reply, lang));
-      return;
-    }
-
-    // Non-question appreciation etc.
-    const nice = lang === 'ur'
-      ? `محبت کا شکریہ! ${BRAND} میں آپ کا استقبال ہے۔ ${contactLineByLang('ur')}`
-      : lang === 'roman-ur'
-        ? `Shukriya! ${BRAND} mein aap ka khair maqdam hai. ${contactLineByLang('roman-ur')}`
-        : `Thank you! ${BRAND} looks forward to hosting you. ${contactLineByLang('en')}`;
-    await replyToFacebookComment(v.comment_id, sanitizeCommentNoPrices(nice, lang));
-  } catch (e) { logErr(e); }
-}
-
-// FB public reply
 async function replyToFacebookComment(commentId, message) {
   const url = `https://graph.facebook.com/v19.0/${commentId}/comments`;
   await axios.post(url, { message }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
 }
-// FB private reply to a comment
 async function fbPrivateReplyToComment(commentId, message) {
   const url = `https://graph.facebook.com/v19.0/${commentId}/private_replies`;
   const params = { access_token: PAGE_ACCESS_TOKEN };
   await axios.post(url, { message }, { params, timeout: 10000 });
 }
 
+async function routePageChange(change) {
+  if (change.field !== 'feed') return;
+  const v = change.value || {};
+  if (v.item !== 'comment' || !v.comment_id) return;
+
+  // Self-reply guard (FB): skip if commenter is page itself
+  if (v.from?.id && SELF_FB_PAGE_IDS.includes(String(v.from.id))) return;
+
+  const text = (v.message || '').trim();
+  if (v.verb && v.verb !== 'add') return;
+
+  try {
+    // Pricing asked publicly → DM + public note w/ WhatsApp
+    if (isPricingIntent(text)) {
+      let dmOk = false;
+      try {
+        await fbPrivateReplyToComment(v.comment_id, sanitizeVoice(sanitizeBrand(REPLY_TEMPLATES.dm_prices_en)));
+        dmOk = true;
+      } catch (e) { logErr(e); }
+      const publicMsg = dmOk
+        ? REPLY_TEMPLATES.public_prices_note_en
+        : `Please DM or WhatsApp us for **discounted** prices: ${WHATSAPP_LINK}`;
+      return replyToFacebookComment(v.comment_id, sanitizeCommentNoPrices(publicMsg));
+    }
+
+    // Road conditions → deterministic helpful line
+    if (isRoadConditionIntent(text)) {
+      return replyToFacebookComment(v.comment_id, sanitizeCommentNoPrices(REPLY_TEMPLATES.road_en));
+    }
+
+    // Contact intent → always show WhatsApp
+    if (isContactIntent(text)) {
+      return replyToFacebookComment(v.comment_id, sanitizeCommentNoPrices(REPLY_TEMPLATES.contact_en));
+    }
+
+    // Generic question-like → safe helpful fallback (no prices)
+    if (AUTO_REPLY_ENABLED && isQuestionLike(text)) {
+      return replyToFacebookComment(v.comment_id, sanitizeCommentNoPrices(REPLY_TEMPLATES.public_default_en));
+    }
+
+    // Non-question chatter → brief brand-safe line
+    if (AUTO_REPLY_ENABLED) {
+      return replyToFacebookComment(v.comment_id, sanitizeCommentNoPrices(REPLY_TEMPLATES.public_default_en));
+    }
+  } catch (e) { logErr(e); }
+}
+
 /* =========================
-   INSTAGRAM (DMs)
+   INSTAGRAM (DMs + comments)
    ========================= */
 async function routeInstagramMessage(event) {
   if (event.delivery || event.read || event.message?.is_echo) return;
   if (event.message && event.sender?.id) {
     const igUserId = event.sender.id;
-    return handleDirectMessage(igUserId, event.message.text || '', { channel: 'instagram' });
+    return handleTextMessage(igUserId, event.message.text || '', { channel: 'instagram' });
   }
-  console.log('ℹ️ IG messaging event (unhandled):', JSON.stringify(event));
 }
 
-/* =========================
-   IG COMMENTS
-   ========================= */
-async function routeInstagramChange(change, pageId) {
-  const v = change.value || {};
-  const theField = change.field || '';
-  const isComment = theField === 'comments' || theField.toLowerCase().includes('comment') || (v.item === 'comment');
-  if (!isComment) return;
-
-  const commentId = v.comment_id || v.id;
-  if (!commentId) return;
-  if (v.verb && v.verb !== 'add') return;
-
-  // Skip self: if from.username equals our IG username, or from.id equals pageId
-  try {
-    const acct = await getIGAccountInfo(pageId);
-    if (String(v.from?.id || '') === String(pageId || '') ||
-        (acct?.username && v.from?.username && String(v.from.username).toLowerCase() === String(acct.username).toLowerCase())) {
-      console.log('🚫 Skip self IG comment');
-      return;
-    }
-  } catch (e) { logErr({ where: 'IG self-check', err: e }); }
-
-  const text = (v.text || v.message || '').trim();
-  const lang = detectLanguage(text);
-
-  try {
-    if (isPricingIntent(text)) {
-      let dmSent = false;
-      try {
-        const privateReply = buildPriceDM(lang);
-        await igPrivateReplyToComment(pageId, commentId, privateReply);
-        dmSent = true;
-      } catch (e) {
-        logErr({ where: 'IG price DM', commentId, pageId, err: e });
-      }
-      const publicMsg = dmSent
-        ? buildPricePublicLine(text)
-        : // fallback when app cannot DM comments (#3 capability)
-          (lang === 'ur'
-            ? `برائے مہربانی ہمیں DM/WhatsApp کریں: ${WHATSAPP_LINK} — ہم *ڈسکاؤنٹڈ* قیمتیں شیئر کر دیں گے۔`
-            : lang === 'roman-ur'
-              ? `Meherbani karke DM ya WhatsApp karein: ${WHATSAPP_LINK} — hum *discounted* prices share kar denge.`
-              : `Please DM or WhatsApp us: ${WHATSAPP_LINK} — we’ll share our *discounted* prices right away.`);
-      await replyToInstagramComment(commentId, sanitizeCommentNoPrices(publicMsg, lang));
-      return;
-    }
-
-    if (isRoadConditionIntent(text)) {
-      const msg = buildRoadReply(lang, 'comment');
-      await replyToInstagramComment(commentId, sanitizeCommentNoPrices(msg, lang));
-      return;
-    }
-
-    if (isQuestionLike(text)) {
-      const reply = buildDefault(lang);
-      await replyToInstagramComment(commentId, sanitizeCommentNoPrices(reply, lang));
-      return;
-    }
-
-    // Non-question: appreciation
-    const nice = lang === 'ur'
-      ? `محبت کا شکریہ! ${BRAND} میں آپ کا استقبال ہے۔ ${contactLineByLang('ur')}`
-      : lang === 'roman-ur'
-        ? `Shukriya! ${BRAND} mein aap ka khair maqdam hai. ${contactLineByLang('roman-ur')}`
-        : `Thank you! ${BRAND} looks forward to hosting you. ${contactLineByLang('en')}`;
-    await replyToInstagramComment(commentId, sanitizeCommentNoPrices(nice, lang));
-  } catch (e) { logErr(e); }
-}
-
-// IG public reply
 async function replyToInstagramComment(commentId, message) {
   const url = `https://graph.facebook.com/v19.0/${commentId}/replies`;
   await axios.post(url, { message }, { params: { access_token: IG_MANAGE_TOKEN }, timeout: 10000 });
 }
-// IG private reply to a comment (Messenger API for Instagram)
 async function igPrivateReplyToComment(pageId, commentId, message) {
   const url = `https://graph.facebook.com/v19.0/${pageId}/messages`;
   const params = { access_token: IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN };
@@ -547,40 +385,136 @@ async function igPrivateReplyToComment(pageId, commentId, message) {
   await axios.post(url, payload, { params, timeout: 10000 });
 }
 
-// IG account info (username) to prevent self-replies; cached
-async function getIGAccountInfo(pageId) {
-  const key = `igacct:${pageId}`;
-  if (igAccountCache.has(key)) return igAccountCache.get(key);
-  const url = `https://graph.facebook.com/v19.0/${pageId}`;
-  const params = { access_token: IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN, fields: 'username,name' };
-  const { data } = await axios.get(url, { params, timeout: 10000 });
-  igAccountCache.set(key, data);
-  return data;
+async function routeInstagramChange(change, pageId) {
+  const v = change.value || {};
+  const field = change.field || '';
+  const isComment = field === 'comments' || field.toLowerCase().includes('comment') || (v.item === 'comment');
+  if (!isComment) return;
+
+  const commentId = v.comment_id || v.id;
+  if (!commentId) return;
+
+  // Self-reply guard (IG): skip if our own account posted the comment
+  const fromUsername = (v.from && (v.from.username || v.from.name)) || '';
+  if (fromUsername && SELF_IG_USERNAMES.map(s => s.toLowerCase()).includes(fromUsername.toLowerCase())) return;
+
+  const text = (v.text || v.message || '').trim();
+  if (v.verb && v.verb !== 'add') return;
+
+  try {
+    if (isPricingIntent(text)) {
+      let dmOk = false;
+      try {
+        await igPrivateReplyToComment(pageId, commentId, sanitizeVoice(sanitizeBrand(REPLY_TEMPLATES.dm_prices_en)));
+        dmOk = true;
+      } catch (e) {
+        // Capability error → fallback to public WhatsApp
+        logErr({ where: 'IG private reply failed; falling back to public', err: e?.response?.data || e.message });
+      }
+      const publicMsg = dmOk
+        ? REPLY_TEMPLATES.public_prices_note_en
+        : `Please DM or WhatsApp us for **discounted** prices: ${WHATSAPP_LINK}`;
+      return replyToInstagramComment(commentId, sanitizeCommentNoPrices(publicMsg));
+    }
+
+    if (isRoadConditionIntent(text)) {
+      return replyToInstagramComment(commentId, sanitizeCommentNoPrices(REPLY_TEMPLATES.road_en));
+    }
+
+    if (isContactIntent(text)) {
+      return replyToInstagramComment(commentId, sanitizeCommentNoPrices(REPLY_TEMPLATES.contact_en));
+    }
+
+    if (AUTO_REPLY_ENABLED && isQuestionLike(text)) {
+      return replyToInstagramComment(commentId, sanitizeCommentNoPrices(REPLY_TEMPLATES.public_default_en));
+    }
+
+    if (AUTO_REPLY_ENABLED) {
+      return replyToInstagramComment(commentId, sanitizeCommentNoPrices(REPLY_TEMPLATES.public_default_en));
+    }
+  } catch (e) { logErr(e); }
 }
 
 /* =========================
    SHARED DM HANDLER
    ========================= */
-async function handleDirectMessage(psid, text, opts = { channel: 'messenger' }) {
-  const lang = detectLanguage(text);
+async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
+  if (!AUTO_REPLY_ENABLED) {
+    console.log('🤖 Auto-reply disabled — would send DM.');
+    return;
+  }
 
   try {
+    // Influencer / Collab
     if (isInfluencerIntent(text)) {
-      return sendText(psid, buildInfluencerDM(lang));
+      return sendText(psid, sanitizeVoice(sanitizeBrand(REPLY_TEMPLATES.influencer_dm_en)));
     }
+    // Pricing (DM allowed)
     if (isPricingIntent(text)) {
-      return sendText(psid, buildPriceDM(lang));
+      return sendText(psid, sanitizeVoice(sanitizeBrand(REPLY_TEMPLATES.dm_prices_en)));
     }
+    // Road
     if (isRoadConditionIntent(text)) {
-      return sendText(psid, buildRoadReply(lang, 'dm'));
+      return sendText(psid, sanitizeVoice(sanitizeBrand(REPLY_TEMPLATES.road_en)));
     }
-    if (isGreetingSmallTalk(text)) {
-      return sendText(psid, buildSmallTalk(lang));
+    // Contact
+    if (isContactIntent(text)) {
+      return sendText(psid, sanitizeVoice(sanitizeBrand(REPLY_TEMPLATES.contact_en)));
     }
 
-    // Fallback deterministic help
-    return sendText(psid, buildDefault(lang));
+    // General DM → optional GPT with guardrails; else deterministic fallback
+    if (OPENAI_API_KEY) {
+      const reply = await gptGuardedDM(text);
+      return sendText(psid, sanitizeVoice(sanitizeBrand(reply)));
+    }
+
+    // Fallback deterministic DM
+    return sendText(psid, sanitizeVoice(sanitizeBrand(REPLY_TEMPLATES.dm_default_en)));
   } catch (e) { logErr(e); }
+}
+
+/* =========================
+   GPT (optional, DMs only)
+   ========================= */
+async function gptGuardedDM(userText = '') {
+  try {
+    const systemPrompt = `
+You are ${BRAND_NAME}'s assistant.
+- Always speak as "we/us/our team" (never I/me/my).
+- Do NOT mention numeric prices or currency in public; in DMs it's allowed, but this function is DM-only.
+- Focus on ${BRAND_NAME} (brand-first). Mention Kashmir's scenic beauty when relevant.
+- Helpful, specific, concise. If user asks off-topic (e.g., "Is Earth flat?"), give a short factual answer and softly pivot back to the brand.
+- If user asks how to contact, include the WhatsApp line.
+Return JSON: {"text": string, "requires_whatsapp_cta": boolean}.
+    `.trim();
+
+    const payload = {
+      model: OPENAI_MODEL,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: String(userText).slice(0, 800) }
+      ],
+      temperature: 0.6,
+      max_tokens: 220
+    };
+
+    const { data } = await axios.post('https://api.openai.com/v1/chat/completions', payload, {
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      timeout: 12000
+    });
+
+    let obj = {};
+    try { obj = JSON.parse(data?.choices?.[0]?.message?.content || '{}'); } catch {}
+    let txt = (obj.text || '').trim() || REPLY_TEMPLATES.dm_default_en;
+    if (obj.requires_whatsapp_cta) {
+      txt += (txt.endsWith('\n') ? '' : '\n') + `WhatsApp (fastest): ${WHATSAPP_LINK}`;
+    }
+    return txt;
+  } catch (e) {
+    logErr(e);
+    return REPLY_TEMPLATES.dm_default_en;
+  }
 }
 
 /* =========================
@@ -594,7 +528,17 @@ async function sendText(psid, text) {
 }
 
 /* =========================
-   ADMIN HELPERS (optional)
+   HANDOVER (optional)
+   ========================= */
+async function takeThreadControl(psid) {
+  const url = 'https://graph.facebook.com/v19.0/me/take_thread_control';
+  const params = { access_token: PAGE_ACCESS_TOKEN };
+  try { await axios.post(url, { recipient: { id: psid } }, { params, timeout: 10000 }); }
+  catch (e) { logErr(e); }
+}
+
+/* =========================
+   ADMIN HELPERS
    ========================= */
 function requireAdmin(req, res, next) {
   const hdr = req.headers.authorization || '';
@@ -618,28 +562,34 @@ app.post('/admin/subscribe', requireAdmin, async (_req, res) => {
     const { data } = await axios.post(url, { subscribed_fields }, { params, timeout: 10000 });
     res.json({ ok: true, data, subscribed_fields });
   } catch (e) {
-    console.error('subscribe error:', e?.response?.data || e.message);
     res.status(500).json({ ok: false, error: e?.response?.data || e.message });
   }
 });
 
 app.get('/admin/status', requireAdmin, async (_req, res) => {
   try {
+    const url = `https://graph.facebook.com/v19.0/me/subscribed_apps`;
+    const params = { access_token: PAGE_ACCESS_TOKEN, fields: 'subscribed_fields' };
+    const { data } = await axios.get(url, { params, timeout: 10000 });
     res.json({
       ok: true,
+      subscribed_apps: data,
       env: {
-        PAGE_ACCESS_TOKEN: Boolean(PAGE_ACCESS_TOKEN),
-        IG_MANAGE_TOKEN: Boolean(IG_MANAGE_TOKEN),
-        RESORT_COORDS
+        AUTO_REPLY_ENABLED,
+        ALLOW_REPLY_IN_STANDBY,
+        AUTO_TAKE_THREAD_CONTROL,
+        OPENAI_ENABLED: Boolean(OPENAI_API_KEY),
+        CHECKIN: CHECKIN_TIME,
+        CHECKOUT: CHECKOUT_TIME,
+        BRAND: BRAND_NAME,
+        SITE_URL,
+        MAPS_LINK,
+        WHATSAPP_LINK
       }
     });
   } catch (e) {
-    console.error('status error:', e?.response?.data || e.message);
     res.status(500).json({ ok: false, error: e?.response?.data || e.message });
   }
 });
 
-/* =========================
-   START
-   ========================= */
-app.listen(PORT, () => console.log(`🚀 ${BRAND} Bot listening on :${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Listening on :${PORT}`));
