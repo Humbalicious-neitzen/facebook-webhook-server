@@ -215,6 +215,9 @@ const dedupe = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 }); // 1h
 const tinyCache = new LRUCache({ max: 200, ttl: 1000 * 60 * 10 }); // 10m
 const convo = new LRUCache({ max: 5000, ttl: 1000 * 60 * 30 }); // 30m per user
 
+// Track comments we ourselves post so we can ignore their echo webhooks
+const selfAuthoredComments = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 }); // 1h
+
 /* =========================
    BASIC ROUTES
    ========================= */
@@ -267,9 +270,10 @@ app.post('/webhook', async (req, res) => {
           }
         }
         if (Array.isArray(entry.changes)) {
-          for (const change of entry.changes) {
+          for (const change of entry.changes)) {
             console.log('📰 FEED CHANGE:', JSON.stringify(change));
-            await routePageChange(change).catch(logErr);
+            // pass pageId (entry.id) so we can detect our own page in handler
+            await routePageChange(change, entry.id).catch(logErr);
           }
         }
         if (Array.isArray(entry.standby)) {
@@ -296,7 +300,7 @@ app.post('/webhook', async (req, res) => {
           }
         }
         if (Array.isArray(entry.changes)) {
-          for (const change of entry.changes) {
+          for (const change of entry.changes)) {
             console.log('🖼️ IG CHANGE:', JSON.stringify(change));
             await routeInstagramChange(change, pageId).catch(logErr);
           }
@@ -310,7 +314,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 function logErr(err) {
-  console.error('💥 Handler error:', err?.response?.data || err.message || err);
+  console.error('💥 Handler error:', err?.where ? err : (err?.response?.data || err.message || err));
 }
 
 /* =========================
@@ -342,10 +346,12 @@ function isQuestionLike(text = '') {
   return /\b(how|where|when|what|which|can|do|does|are|is|distance|weather|available|availability|book|booking|road|roads|condition|conditions|flood|cloud\s*burst|cloudburst)\b/i.test(t);
 }
 
-// Public FB reply
+// Public FB reply (record our own comment ID to avoid echo loops)
 async function replyToFacebookComment(commentId, message) {
   const url = `https://graph.facebook.com/v19.0/${commentId}/comments`;
-  await axios.post(url, { message }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
+  const { data } = await axios.post(url, { message }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
+  if (data?.id) selfAuthoredComments.set(`fb:${data.id}`, true);
+  return data;
 }
 
 // FB private reply to a comment
@@ -361,7 +367,6 @@ function pickLangAwarePublicLine(text = '') {
   if (lang === 'roman-ur') return 'Hum ne aap ko prices DM kar di hain, meherbani karke apne messages check karein. 😊';
   return 'We have sent you the prices in a private message. Please check your inbox. 😊';
 }
-
 function pickLangAwarePromptDM(text = '') {
   const lang = detectLanguage(text);
   if (lang === 'ur') return `براہِ مہربانی ہمیں WhatsApp پر پیغام کریں: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY}) — ہم فوراً قیمتیں شیئر کر دیں گے۔ 😊`;
@@ -369,11 +374,18 @@ function pickLangAwarePromptDM(text = '') {
   return `Please WhatsApp us at ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY}) and we will share the prices right away. 😊`;
 }
 
-async function routePageChange(change) {
+async function routePageChange(change, pageId) {
   if (change.field !== 'feed') return;
   const v = change.value || {};
   if (v.item === 'comment' && v.comment_id) {
     const text = (v.message || '').trim();
+
+    // 1) Ignore the echo of a comment we just posted
+    if (selfAuthoredComments.has(`fb:${v.comment_id}`)) return;
+
+    // 2) Ignore comments authored by our own Page (entry.id == pageId)
+    if (pageId && v.from?.id && String(v.from.id) === String(pageId)) return;
+
     console.log('💬 FB comment event:', { verb: v.verb, commentId: v.comment_id, text, post_id: v.post_id, from: v.from });
     if (v.verb !== 'add') return;
 
@@ -434,14 +446,15 @@ async function routeInstagramMessage(event) {
 /* =========================
    INSTAGRAM COMMENTS
    ========================= */
-// Public IG reply
+// Public IG reply (record our own reply id to avoid echo loops)
 async function replyToInstagramComment(commentId, message) {
   const url = `https://graph.facebook.com/v19.0/${commentId}/replies`;
-  await axios.post(url, { message }, { params: { access_token: IG_MANAGE_TOKEN }, timeout: 10000 });
+  const { data } = await axios.post(url, { message }, { params: { access_token: IG_MANAGE_TOKEN }, timeout: 10000 });
+  if (data?.id) selfAuthoredComments.set(`ig:${data.id}`, true);
+  return data;
 }
 
 // IG private reply to a comment — NOT USED (restricted capability)
-// Keeping function in case IG expands capability later
 async function igPrivateReplyToComment(pageId, commentId, message) {
   const url = `https://graph.facebook.com/v19.0/${pageId}/messages`;
   const params = { access_token: IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN };
@@ -456,10 +469,17 @@ async function routeInstagramChange(change, pageId) {
   if (isComment && (v.comment_id || v.id)) {
     const commentId = v.comment_id || v.id;
     const text = (v.text || v.message || '').trim();
+
+    // 1) Ignore the echo of our own comment
+    if (selfAuthoredComments.has(`ig:${commentId}`)) return;
+
+    // 2) Ignore comments authored by our own IG account (entry.id == pageId)
+    if (pageId && v.from?.id && String(v.from.id) === String(pageId)) return;
+
     console.log('💬 IG comment event:', { field: theField, verb: v.verb, commentId, text, media_id: v.media_id, from: v.from });
     if (v.verb && v.verb !== 'add') return;
 
-    // IG: Pricing -> PUBLIC prompt to WhatsApp/DM (do not attempt DM — capability error)
+    // IG: Pricing -> PUBLIC prompt to WhatsApp (do not attempt DM — capability errors)
     if (isPricingIntent(text)) {
       try {
         const publicMsg = pickLangAwarePromptDM(text);
@@ -469,7 +489,7 @@ async function routeInstagramChange(change, pageId) {
     }
 
     // IG: Question-like -> PUBLIC reply only (avoid (#3) capability errors)
-    if (AUTO_REPLY_ENABLED && isQuestionLike(text)) {
+    if ( AUTO_REPLY_ENABLED && isQuestionLike(text)) {
       try {
         let publicReply = await decideReply(text, { surface: 'comment', platform: 'instagram' });
         publicReply = sanitizeComment(sanitizeBrand(publicReply), detectLanguage(text));
@@ -713,7 +733,7 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
   if (!asComment && isInfluencerInquiry(text)) {
     return sanitizeVoice(
       lang === 'ur'
-        ? `براہِ کرم تعاون/کولیبریشـن کے لیے WhatsApp پر رابطہ کریں: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY}). ہماری ٹیم جلد جواب دے گی۔`
+        ? `براہِ کرم تعاون/کولیب کے لیے WhatsApp پر رابطہ کریں: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY}). ہماری ٹیم جلد جواب دے گی۔`
         : lang === 'roman-ur'
           ? `Please collab ke liye WhatsApp par rabta karein: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY}). Hamari team jald respond karegi.`
           : `For collaborations/PR, please contact us on WhatsApp: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY}). Our team will respond quickly.`
