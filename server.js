@@ -3,7 +3,7 @@
 // Unique GPT replies (EN/Urdu/Roman-Ur) + positivity + Weather (OpenWeather) + Distance/ETA (Geoapify)
 // PRICES IN COMMENTS: FORBIDDEN (DM-only).
 // Voice: never use first-person singular — always "we/us/our team".
-// Pricing-in-comments -> private reply + public "check inbox" note (fail-open if DM fails)
+// Pricing-in-comments: FB -> DM + public note (fail-open). IG -> public note only.
 // Lightweight conversation state for CTA follow-up (dates/guests)
 // Admin helpers (subscribe/status)
 
@@ -48,16 +48,21 @@ const RESORT_REGION_NAME = process.env.RESORT_REGION_NAME || 'Kashmir'; // broad
 // Behavior toggles
 const DISABLE_SOFT_CTAS = String(process.env.DISABLE_SOFT_CTAS || 'true').toLowerCase() === 'true';
 
-// Geocoding bias (helps disambiguate places in Pakistan)
+// Geocoding bias
 const GEO_COUNTRY_BIAS = process.env.GEO_COUNTRY_BIAS || 'pk';
 
-// Optional CTA rotation (empty by default to avoid awkward prompts)
+// Contact routing (PRIMARY)
+const PHONE_E164 = (process.env.PHONE_E164 || '923558000078').replace(/[^\d]/g, '');
+const WHATSAPP_LINK = `https://wa.me/${PHONE_E164}`;
+const PUBLIC_PHONE_DISPLAY = process.env.PUBLIC_PHONE_DISPLAY || '+92 355 8000078';
+
+// Optional CTA rotation (kept empty by default)
 const CTA_ROTATION = (process.env.CTA_ROTATION || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
-// Checkin/out via env (defaults per your request)
+// Checkin/out
 const CHECKIN_TIME = process.env.CHECKIN_TIME || '3:00 pm';
 const CHECKOUT_TIME = process.env.CHECKOUT_TIME || '12:00 pm';
 
@@ -80,9 +85,9 @@ const FACTS = {
   brand: BRAND_NAME,
   site: SITE_URL,
   map: MAPS_LINK,
-  resort_coords: RESORT_COORDS, // "lat,lon"
-  location_name: RESORT_LOCATION_NAME, // valley/area name
-  region_name: RESORT_REGION_NAME,     // broader region (Kashmir)
+  resort_coords: RESORT_COORDS,
+  location_name: RESORT_LOCATION_NAME,
+  region_name: RESORT_REGION_NAME,
   river_name: 'Neelam River',
   checkin: CHECKIN_TIME,
   checkout: CHECKOUT_TIME,
@@ -119,26 +124,47 @@ const FACTS = {
   ]
 };
 
-// Fallback templates (short = comments, long = DMs)
+/* =========================
+   CONTACT UTILITIES
+   ========================= */
+function contactLineByLang(lang = 'en') {
+  if (lang === 'ur') {
+    return `بکنگ یا معلومات کے لیے WhatsApp پر رابطہ کریں: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY})  
+یا ہماری ویب سائٹ ملاحظہ کریں: ${SITE_URL}`;
+  } else if (lang === 'roman-ur') {
+    return `Booking ya info ke liye WhatsApp par rabta karein: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY})  
+Ya hamari website par jayein: ${SITE_URL}`;
+  }
+  return `For bookings or info, WhatsApp us: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY})  
+Or visit our website: ${SITE_URL}`;
+}
+
+/* =========================
+   FALLBACK TEMPLATES
+   ========================= */
 const REPLY_TEMPLATES = {
   rates_short: `We have sent you the latest prices in a private message. Please check your inbox. 😊`,
+  // NOTE: explicitly mark discounted prices in DMs
   rates_long: `
-Soft launch rates:
+Discounted soft-launch rates (limited time):
 
-Deluxe Hut - PKR 30,000/night
-• 1st Night 10% -> PKR 27,000
-• 2nd Night 15% -> PKR 25,500
-• 3rd Night 20% -> PKR 24,000
+Deluxe Hut — PKR 30,000/night
+• 1st Night 10% → PKR 27,000
+• 2nd Night 15% → PKR 25,500
+• 3rd Night 20% → PKR 24,000
 
-Executive Hut - PKR 50,000/night
-• 1st Night 10% -> PKR 45,000
-• 2nd Night 15% -> PKR 42,500
-• 3rd Night 20% -> PKR 40,000
+Executive Hut — PKR 50,000/night
+• 1st Night 10% → PKR 45,000
+• 2nd Night 15% → PKR 42,500
+• 3rd Night 20% → PKR 40,000
 
-T&Cs: taxes included, breakfast for 4, 50% advance to confirm.
-Availability and booking: ${SITE_URL}`.trim(),
+Note: These are discounted prices.  
+T&Cs: taxes included • breakfast for 4 • 50% advance to confirm.
+Bookings/queries on WhatsApp: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY})  
+Website: ${SITE_URL}`.trim(),
   loc_short: `Location pin: ${MAPS_LINK}
-Roads are fully carpeted. There is a small water crossing near the resort. Sedans can use our private parking (1 minute walk). Luggage help plus free jeep for elderly guests.`,
+Roads are fully carpeted. Small water crossing near the resort; sedans can use our private parking (1 minute walk). Luggage help + free jeep for elderly guests.
+${contactLineByLang('en')}`,
   loc_long: `
 Here is our Google Maps pin:
 > ${MAPS_LINK}
@@ -146,32 +172,39 @@ Here is our Google Maps pin:
 Good to know:
 • Roads are fully carpeted for a smooth, scenic drive
 • Small water crossing near the resort; sedans can park at our private parking (1 minute walk)
-• Luggage assistance plus free jeep transfer for elderly guests
+• Luggage assistance + free jeep transfer for elderly guests
 
-We will make your arrival easy and comfortable!`.trim(),
-  fac_short: `Facilities: riverfront huts, heaters and inverters, in-house kitchen, internet plus SCOM, spacious rooms, family friendly vibe, luggage help, free jeep assist, bonfire on request.`,
+${contactLineByLang('en')}`.trim(),
+  fac_short: `Facilities: riverfront huts, heaters/inverters, in-house kitchen, internet + SCOM, spacious rooms, family-friendly vibe, luggage help, free jeep assist, bonfire on request.
+${contactLineByLang('en')}`,
   fac_long: `
-We are a peaceful, boutique riverside resort with:
+We are a boutique riverside escape with:
 • Private riverfront huts facing the ${FACTS.river_name}
 • Heaters, inverters and insulated huts
-• In-house kitchen with local and desi options
-• Private internet plus SCOM support
+• In-house kitchen (local & desi)
+• Private internet + SCOM support
 • Spacious rooms, modern interiors
-• Family friendly atmosphere
+• Family-friendly atmosphere
 • Luggage assistance from private parking
-• Free 4x4 jeep assist for elderly or water crossing
-• Bonfire and outdoor seating on request`.trim(),
-  book_short: `Check in ${FACTS.checkin} • Check out ${FACTS.checkout}
+• Free 4x4 jeep assist (elderly / water crossing)
+• Bonfire & outdoor seating on request
+
+${contactLineByLang('en')}`.trim(),
+  book_short: `Check-in ${FACTS.checkin} • Check-out ${FACTS.checkout}
 50% advance to confirm. Breakfast for 4 included.
-Availability and booking: ${SITE_URL}`,
+${contactLineByLang('en')}`,
   book_long: `
-Check in: ${FACTS.checkin} • Check out: ${FACTS.checkout}
+Check-in: ${FACTS.checkin} • Check-out: ${FACTS.checkout}
 Bookings are confirmed with a 50% advance. Breakfast for 4 is included.
-See live availability and book: ${SITE_URL}`.trim(),
-  default_short: `Thanks for the love! If you would like directions or facilities info, just ask. For availability: ${SITE_URL}`,
+
+${contactLineByLang('en')}`.trim(),
+  default_short: `Thanks for the love! Need directions, facilities, or timings?
+${contactLineByLang('en')}`,
   default_long: `
-Thanks for reaching out. We are ${FACTS.brand}, a boutique riverfront escape in ${FACTS.location_name}, within the scenic ${FACTS.region_name} region — known for mountain views, pleasant weather, and beautiful drives by the ${FACTS.river_name}.
-We can help with facilities, directions and travel timings here. For live availability, please use: ${SITE_URL}`.trim()
+Thanks for reaching out. We are ${FACTS.brand} — a boutique riverfront escape by the ${FACTS.river_name} in the scenic ${FACTS.region_name}.
+We can help with facilities, directions and travel timings here.
+
+${contactLineByLang('en')}`.trim()
 };
 
 /* =========================
@@ -252,7 +285,7 @@ app.post('/webhook', async (req, res) => {
     // Instagram (DMs + comments)
     if (body.object === 'instagram') {
       for (const entry of body.entry || []) {
-        const pageId = entry.id; // required for IG private replies
+        const pageId = entry.id; // required for IG
         const key = `ig:${entry.id}:${entry.time || Date.now()}`;
         if (dedupe.has(key)) continue; dedupe.set(key, true);
 
@@ -306,7 +339,7 @@ function isPricingIntent(text = '') {
 function isQuestionLike(text = '') {
   const t = (text || '').toLowerCase();
   if (/\?/.test(t)) return true;
-  return /\b(how|where|when|what|which|can|do|does|are|is|distance|weather|available|availability|book|booking)\b/i.test(t);
+  return /\b(how|where|when|what|which|can|do|does|are|is|distance|weather|available|availability|book|booking|road|roads|condition|conditions|flood|cloud\s*burst|cloudburst)\b/i.test(t);
 }
 
 // Public FB reply
@@ -324,17 +357,16 @@ async function fbPrivateReplyToComment(commentId, message) {
 
 function pickLangAwarePublicLine(text = '') {
   const lang = detectLanguage(text);
-  if (lang === 'ur') return 'ہم نے آپ کو قیمتیں پیغام میں بھیج دی ہیں، براہ کرم اپنے میسجز چیک کریں۔ 😊';
+  if (lang === 'ur') return 'ہم نے آپ کو قیمتیں پیغام میں بھیج دی ہیں، براہِ کرم اپنے میسجز چیک کریں۔ 😊';
   if (lang === 'roman-ur') return 'Hum ne aap ko prices DM kar di hain, meherbani karke apne messages check karein. 😊';
   return 'We have sent you the prices in a private message. Please check your inbox. 😊';
 }
 
-// NEW: public fallback when DM fails
 function pickLangAwarePromptDM(text = '') {
   const lang = detectLanguage(text);
-  if (lang === 'ur') return 'برائے مہربانی ہمیں DM کریں، ہم فوراً قیمتیں شیئر کر دیں گے۔ 😊';
-  if (lang === 'roman-ur') return 'Meherbani karke humein DM karein, hum foran prices share kar denge. 😊';
-  return 'Please DM us and we will share the prices right away. 😊';
+  if (lang === 'ur') return `براہِ مہربانی ہمیں WhatsApp پر پیغام کریں: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY}) — ہم فوراً قیمتیں شیئر کر دیں گے۔ 😊`;
+  if (lang === 'roman-ur') return `Meherbani karke humein WhatsApp par msg karein: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY}) — hum foran prices share kar denge. 😊`;
+  return `Please WhatsApp us at ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY}) and we will share the prices right away. 😊`;
 }
 
 async function routePageChange(change) {
@@ -345,7 +377,7 @@ async function routePageChange(change) {
     console.log('💬 FB comment event:', { verb: v.verb, commentId: v.comment_id, text, post_id: v.post_id, from: v.from });
     if (v.verb !== 'add') return;
 
-    // Pricing asked publicly -> try DM, then always public note
+    // Pricing asked publicly -> try DM, then public note
     if (isPricingIntent(text)) {
       let dmOk = false;
       try {
@@ -364,7 +396,7 @@ async function routePageChange(change) {
       return;
     }
 
-    // For question-like comments: keep flow by sending both
+    // For question-like comments: DM + public (FB supports comment->DM)
     if (AUTO_REPLY_ENABLED && isQuestionLike(text)) {
       try {
         let dmReply = await decideReply(text, { surface: 'dm', platform: 'facebook' });
@@ -379,7 +411,7 @@ async function routePageChange(change) {
       return;
     }
 
-    // Non-question comments -> usual flow (public only, sanitized)
+    // Non-question comments -> public only
     if (!AUTO_REPLY_ENABLED) return console.log('🤖 Auto-reply disabled — would reply to FB comment.');
     let reply = await decideReply(text, { surface: 'comment', platform: 'facebook' });
     reply = sanitizeComment(sanitizeBrand(reply), detectLanguage(text));
@@ -408,7 +440,8 @@ async function replyToInstagramComment(commentId, message) {
   await axios.post(url, { message }, { params: { access_token: IG_MANAGE_TOKEN }, timeout: 10000 });
 }
 
-// IG private reply to a comment (Messenger API for Instagram)
+// IG private reply to a comment — NOT USED (restricted capability)
+// Keeping function in case IG expands capability later
 async function igPrivateReplyToComment(pageId, commentId, message) {
   const url = `https://graph.facebook.com/v19.0/${pageId}/messages`;
   const params = { access_token: IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN };
@@ -426,36 +459,22 @@ async function routeInstagramChange(change, pageId) {
     console.log('💬 IG comment event:', { field: theField, verb: v.verb, commentId, text, media_id: v.media_id, from: v.from });
     if (v.verb && v.verb !== 'add') return;
 
-    // Pricing asked publicly -> try DM, then always public note
+    // IG: Pricing -> PUBLIC prompt to WhatsApp/DM (do not attempt DM — capability error)
     if (isPricingIntent(text)) {
-      let dmOk = false;
       try {
-        const privateReply = await decideReply(text, { surface: 'dm', platform: 'instagram' });
-        await igPrivateReplyToComment(pageId, commentId, privateReply);
-        dmOk = true;
-      } catch (e) {
-        logErr({ where: 'IG pricing DM', commentId, pageId, err: e?.response?.data || e.message }); // Threads/permissions can fail
-      }
-
-      try {
-        const publicMsg = dmOk ? pickLangAwarePublicLine(text) : pickLangAwarePromptDM(text);
+        const publicMsg = pickLangAwarePromptDM(text);
         await replyToInstagramComment(commentId, publicMsg);
       } catch (e) { logErr({ where: 'IG pricing public reply', commentId, pageId, err: e?.response?.data || e.message }); }
-
       return;
     }
 
-    // For question-like comments: both private and public to keep flow
+    // IG: Question-like -> PUBLIC reply only (avoid (#3) capability errors)
     if (AUTO_REPLY_ENABLED && isQuestionLike(text)) {
       try {
-        let dmReply = await decideReply(text, { surface: 'dm', platform: 'instagram' });
-        dmReply = sanitizeBrand(dmReply);
-        await igPrivateReplyToComment(pageId, commentId, dmReply);
-
         let publicReply = await decideReply(text, { surface: 'comment', platform: 'instagram' });
         publicReply = sanitizeComment(sanitizeBrand(publicReply), detectLanguage(text));
         await replyToInstagramComment(commentId, publicReply);
-      } catch (e) { logErr({ where: 'IG question-like dual reply', commentId, pageId, err: e?.response?.data || e.message }); }
+      } catch (e) { logErr({ where: 'IG question-like public reply', commentId, pageId, err: e?.response?.data || e.message }); }
       return;
     }
 
@@ -478,27 +497,23 @@ function isAffirmative(text = '') {
 }
 
 function askForDetailsByLang(lang = 'en') {
+  const tail = '\n' + contactLineByLang(lang);
   if (lang === 'ur') {
-    return `زبردست! براہ کرم اپنی *تاریخیں* اور *مہمانوں کی تعداد* بتا دیں۔ اگر چاہیں تو *کس شہر سے آرہے ہیں* بھی بتا دیں تاکہ ہم سفر کا وقت بتا سکیں۔
-بکنگ کی تصدیق ہمیشہ ویب سائٹ سے ہوتی ہے: ${SITE_URL}`;
+    return `زبردست! براہِ کرم اپنی *تاریخیں* اور *مہمانوں کی تعداد* بتا دیں۔ اگر چاہیں تو *کس شہر سے آرہے ہیں* بھی بتا دیں تاکہ ہم سفر کا وقت بتا سکیں۔` + tail;
   } else if (lang === 'roman-ur') {
-    return `Great! Barah e mehrbani apni *dates* aur *guests ki tadaad* bata dein. Agar chahein to *kis sheher se aa rahe hain* bhi likh dein taake hum route time bata saken.
-Booking ki tasdeeq website se hoti hai: ${SITE_URL}`;
+    return `Great! Barah-e-mehrbani apni *dates* aur *guests ki tadaad* bata dein. Agar chahein to *kis sheher se aa rahe hain* bhi likh dein taake hum route time bata saken.` + tail;
   }
-  return `Awesome! Please share your *travel dates* and *number of guests*. If you like, also tell us *which city you will start from* so we can estimate drive time.
-To confirm the booking, please use the website: ${SITE_URL}`;
+  return `Awesome! Please share your *travel dates* and *number of guests*. If you like, also tell us *which city you’ll start from* so we can estimate drive time.` + tail;
 }
 
 function confirmAfterDetailsByLang(lang = 'en') {
+  const tail = '\n' + contactLineByLang(lang);
   if (lang === 'ur') {
-    return `شکریہ! معلومات مل گئیں۔ بکنگ کی تصدیق کے لیے براہ راست ویب سائٹ استعمال کریں: ${SITE_URL}
-راستے یا ہٹ کے انتخاب میں رہنمائی چاہیے ہو تو بتائیں۔ ہماری ٹیم موجود ہے۔`;
+    return `شکریہ! معلومات مل گئیں۔ بکنگ کی تصدیق کے لیے براہِ راست WhatsApp/کال کریں یا ویب سائٹ استعمال کریں.` + tail;
   } else if (lang === 'roman-ur') {
-    return `Shukriya! Maloomat mil gain. Booking ki tasdeeq ke liye seedha website use karein: ${SITE_URL}
-Route help ya hut choose karne mein rehnumai chahiye ho to batayein. Hum yahin hain.`;
+    return `Shukriya! Maloomat mil gain. Booking ki tasdeeq ke liye WhatsApp/call karein ya website use karein.` + tail;
   }
-  return `Thanks! Got your details. To confirm your booking, please use the website: ${SITE_URL}
-If you would like route help or hut suggestions, just tell us. Our team is here.`;
+  return `Thanks! Got your details. To confirm your booking, reach us on WhatsApp/call or use the website.` + tail;
 }
 
 async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
@@ -551,7 +566,6 @@ function hhmm(seconds) {
   return `${h}h ${m}m`;
 }
 
-// Common origin aliases to disambiguate quickly
 const ORIGIN_ALIASES = {
   'kahna kacha': 'Kahna Kacha, Lahore',
   'kahna kaacha': 'Kahna Kacha, Lahore',
@@ -559,26 +573,17 @@ const ORIGIN_ALIASES = {
   'kacha': 'Kahna Kacha, Lahore'
 };
 
-// Extract origin from user text: "from X", "X se/sy", Urdu "سے"
 function extractOrigin(raw = '') {
   const t = (raw || '').trim();
-
-  // English: "from <place>"
   let m = t.match(/\bfrom\s+([a-z][a-z0-9\s\-']{2,40})/i);
   if (m) return m[1].trim();
-
-  // Roman Urdu: "<place> se/sy" or "se/sy <place>"
   m = t.match(/\b([a-z][a-z0-9\s\-']{2,40})\s+s[ey]\b/i) || t.match(/\bs[ey]\s+([a-z][a-z0-9\s\-']{2,40})\b/i);
   if (m) return m[1].trim();
-
-  // Urdu script around "سے"
   m = t.match(/([\u0600-\u06FF\s]{2,40})\s*سے/);
   if (m) return m[1].trim();
-
   return null;
 }
 
-// Normalize user-written origin using aliases
 function normalizeOriginName(name = '') {
   const key = name.toLowerCase().replace(/\s+/g, ' ').trim();
   if (/\bkahna\b/i.test(key) && /\bkach/i.test(key)) return 'Kahna Kacha, Lahore';
@@ -647,7 +652,6 @@ async function currentWeather(lat, lon) {
 /* =========================
    LANGUAGE DETECTION
    ========================= */
-// Urdu script spans Arabic block (0600–06FF, 0750–077F)
 function detectLanguage(text = '') {
   const t = (text || '').trim();
   const hasUrduScript = /[\u0600-\u06FF\u0750-\u077F]/.test(t);
@@ -669,11 +673,7 @@ function detectLanguage(text = '') {
 }
 
 /* =========================
-   GPT REPLY LOGIC
-   - language-aware + positivity
-   - small-talk friendly, not pushy
-   - off-topic Qs: brief factual answer then pivot
-   - Kashmir region flavor when describing scenery
+   REPLY LOGIC (GPT + rules)
    ========================= */
 function isGreetingSmallTalk(raw = '') {
   const t = (raw || '').trim().toLowerCase();
@@ -684,27 +684,40 @@ function isOffTopicScience(raw = '') {
   const t = (raw || '').toLowerCase();
   return /\b(earth).*(flat|round)\b/.test(t) || /\bflat\s*earth\b/.test(t);
 }
+function isInfluencerInquiry(raw = '') {
+  const t = (raw || '').toLowerCase();
+  return /\b(influencer|collab|collaboration|barter|pr|gift(?:ing)?|review|creator|blogger|vlogger|media|shoot|photoshoot|content\s*partnership)\b/.test(t);
+}
 
 async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) {
   const t = (text || '').toLowerCase();
   const lang = detectLanguage(text);
   const asComment = ctx.surface === 'comment';
 
-  // 0) Small talk: be human, not salesy
+  // 0) Small talk
   if (isGreetingSmallTalk(text)) {
-    if (lang === 'ur') return 'ہم بہت اچھے ہیں، شکریہ! آپ کیسے ہیں؟ اگر کبھی ' + FACTS.brand + ' کے بارے میں معلومات یا سفر ٹپس چاہئیں تو ضرور بتائیے۔';
-    if (lang === 'roman-ur') return 'Hum theek hain, shukriya! Aap kaise hain? Agar kabhi ' + FACTS.brand + ' ke baare mein info ya travel tips chahiyen to batayein.';
-    return 'We are doing great, thank you! How are you? If you ever want tips or details about ' + FACTS.brand + ', just let us know.';
+    return sanitizeVoice(`We are great—thanks for asking! How can ${FACTS.brand} help today?\n${contactLineByLang(lang)}`);
   }
 
-  // 0.1) Off-topic factual Qs (e.g., Earth flat/round)
+  // 0.1) Off-topic short fact then pivot
   if (isOffTopicScience(text)) {
-    if (lang === 'ur') {
-      return sanitizeVoice(`زمین گول ہے۔ ویسے ${FACTS.region_name} کے پہاڑی مناظر اور خوشگوار موسم کے ساتھ ${FACTS.location_name} کا علاقہ انتہائی دلکش ہے — ${FACTS.brand} دریا کنارے پرسکون قیام فراہم کرتا ہے۔`);
-    } else if (lang === 'roman-ur') {
-      return sanitizeVoice(`Zameen gol hai. Waise ${FACTS.region_name} ke pahari manazir, pleasant weather aur ${FACTS.location_name} ki scenic beauty bohat mashhoor hai — ${FACTS.brand} riverside par sukoon bhara stay deta hai.`);
-    }
-    return sanitizeVoice(`The Earth is round. Closer to home, the ${FACTS.region_name} region offers mountain views, pleasant weather, and scenic drives around ${FACTS.location_name} — with ${FACTS.brand} right by the ${FACTS.river_name}.`);
+    const fact = lang === 'ur'
+      ? 'زمین گول ہے.'
+      : lang === 'roman-ur'
+        ? 'Zameen gol hai.'
+        : 'The Earth is round.';
+    return sanitizeVoice(`${fact} If you are planning a peaceful riverside escape, ${FACTS.brand} is here to help.\n${contactLineByLang(lang)}`);
+  }
+
+  // 0.2) Influencers in DMs -> route to WhatsApp/phone
+  if (!asComment && isInfluencerInquiry(text)) {
+    return sanitizeVoice(
+      lang === 'ur'
+        ? `براہِ کرم تعاون/کولیبریشـن کے لیے WhatsApp پر رابطہ کریں: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY}). ہماری ٹیم جلد جواب دے گی۔`
+        : lang === 'roman-ur'
+          ? `Please collab ke liye WhatsApp par rabta karein: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY}). Hamari team jald respond karegi.`
+          : `For collaborations/PR, please contact us on WhatsApp: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY}). Our team will respond quickly.`
+    );
   }
 
   const intent = {
@@ -713,39 +726,38 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
     facilities: /\b(facilit(y|ies)|amenit(y|ies)|wifi|internet|kitchen|food|meal|heater|bonfire|family|kids|parking|jeep|inverter)\b/i.test(t),
     booking: /\b(book|booking|reserve|reservation|check[-\s]?in|checkin|check[-\s]?out|checkout|advance|payment)\b/i.test(t),
     availability: /\b(availability|available|dates?|calendar)\b/i.test(t),
-    distance: /\b(distance|far|how\s*far|hours|drive|time\s*from|eta|route|rasta|raasta)\b/i.test(t),
+    distance: /\b(distance|far|how\s*far|hours|drive|time\s*from|eta|route|rasta|raasta|road|roads|condition|conditions|flood|cloud\s*burst|cloudburst)\b/i.test(t),
     weather: /\b(weather|temperature|cold|hot|forecast|rain)\b/i.test(t)
   };
 
-  // Extract and normalize origin
+  // Extract origin for routing, if any
   const maybeOrigin = extractOrigin(text);
 
-  const enrich = { wx: null, eta: null, origin: maybeOrigin };
+  const enrich = { wx: null, origin: maybeOrigin };
 
-  // Resort coords
   let resortLat = null, resortLon = null;
   if (FACTS.resort_coords && FACTS.resort_coords.includes(',')) {
     const [lat, lon] = FACTS.resort_coords.split(',').map(s => s.trim());
     resortLat = parseFloat(lat); resortLon = parseFloat(lon);
   }
 
-  // Weather if relevant
   if ((intent.weather || intent.location || intent.rates || intent.booking) && resortLat && resortLon) {
     enrich.wx = await currentWeather(resortLat, resortLon);
   }
 
-  // Distance and ETA if asked or "from X"
-  if ((intent.distance || maybeOrigin) && resortLat && resortLon) {
+  // Distance / road conditions
+  if (intent.distance && resortLat && resortLon) {
     let originName = maybeOrigin ? normalizeOriginName(maybeOrigin) : null;
     let originGeo = originName ? await geocodePlace(originName) : null;
 
+    // Safety ask if ambiguous
     if (!originGeo && originName) {
       const ask =
         lang === 'ur'
-          ? `کیا آپ کی مراد "کہنا کاچہ، لاہور" ہے؟ اگر ہاں تو ہم فاصلہ اور ڈرائیو ٹائم بتا دیں گے۔`
+          ? `کیا آپ "کہنا کاچہ، لاہور" کی بات کر رہے ہیں؟ تصدیق کریں تو ہم فاصلے اور ڈرائیو ٹائم بتا دیں گے۔\n${contactLineByLang(lang)}`
           : lang === 'roman-ur'
-            ? `Kya aap ki muraad "Kahna Kacha, Lahore" hai? Agar haan, to hum distance aur drive time bata denge.`
-            : `Do you mean "Kahna Kacha, Lahore"? Reply yes and we will share distance and drive time.`;
+            ? `Kya aap "Kahna Kacha, Lahore" ki baat kar rahe hain? Confirm kar dein to hum distance aur drive time bata denge.\n${contactLineByLang(lang)}`
+            : `Do you mean "Kahna Kacha, Lahore"? Confirm and we’ll share distance and drive time.\n${contactLineByLang(lang)}`;
       return sanitizeVoice(ask);
     }
 
@@ -754,26 +766,18 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
       if (route) {
         const line =
           lang === 'ur'
-            ? `• فاصلہ: تقریباً ${km(route.meters)} کلومیٹر • وقت: تقریباً ${hhmm(route.seconds)}\nMaps pin: ${MAPS_LINK}`
+            ? `• فاصلہ: تقریباً ${km(route.meters)} کلومیٹر • وقت: تقریباً ${hhmm(route.seconds)}\nMaps pin: ${MAPS_LINK}\n${contactLineByLang(lang)}`
             : lang === 'roman-ur'
-              ? `• Distance: taqreeban ${km(route.meters)} km • Time: taqreeban ${hhmm(route.seconds)}\nMaps pin: ${MAPS_LINK}`
-              : `• Distance: ~${km(route.meters)} km • Drive time: ~${hhmm(route.seconds)}\nMaps pin: ${MAPS_LINK}`;
+              ? `• Distance: taqreeban ${km(route.meters)} km • Time: taqreeban ${hhmm(route.seconds)}\nMaps pin: ${MAPS_LINK}\n${contactLineByLang(lang)}`
+              : `• Distance: ~${km(route.meters)} km • Drive time: ~${hhmm(route.seconds)}\nMaps pin: ${MAPS_LINK}\n${contactLineByLang(lang)}`;
         return sanitizeVoice(line);
       }
     }
   }
 
-  // Availability ALWAYS to website
-  if (intent.availability) {
-    if (lang === 'ur') {
-      const msg = `کمرے کی دستیابی اور بکنگ کی تصدیق کے لیے براہ راست ہماری ویب سائٹ ملاحظہ کریں: ${SITE_URL}`;
-      return asComment ? sanitizeVoice(msg) : sanitizeVoice(`${msg}\n${FACTS.region_name} کے پہاڑی مناظر اور خوشگوار موسم کے ساتھ ${FACTS.location_name} تک سفر بھی نہایت دلکش ہے۔`);
-    } else if (lang === 'roman-ur') {
-      const msg = `Rooms ki availability aur booking ki tasdeeq ke liye hamari website par jayein: ${SITE_URL}`;
-      return asComment ? sanitizeVoice(msg) : sanitizeVoice(`${msg}\n${FACTS.region_name} ki mountain views aur pleasant weather ke sath ${FACTS.location_name} ka safar bohat scenic hota hai.`);
-    }
-    const msg = `To check live room availability and confirm your dates, please visit: ${SITE_URL}`;
-    return asComment ? sanitizeVoice(msg) : sanitizeVoice(`${msg}\nThe ${FACTS.region_name} drive toward ${FACTS.location_name} is scenic with mountain views and pleasant weather in season.`);
+  // Availability / booking — route to WhatsApp + website
+  if (intent.availability || intent.booking) {
+    return sanitizeVoice(contactLineByLang(lang));
   }
 
   // Fallback if GPT not configured
@@ -785,7 +789,7 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
     return asComment ? sanitizeComment(REPLY_TEMPLATES.default_short, lang) : sanitizeVoice(sanitizeBrand(REPLY_TEMPLATES.default_long));
   }
 
-  // Build system prompt
+  // Build system prompt — brand-first, region as flavor only
   const langGuide = {
     'en': `Write in natural English.`,
     'ur': `Write in fluent Urdu using Urdu script. Avoid romanization.`,
@@ -798,7 +802,7 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
 
   const cta = (!DISABLE_SOFT_CTAS && CTA_ROTATION.length)
     ? CTA_ROTATION[Math.floor(Math.random() * CTA_ROTATION.length)]
-    : ''; // no CTA by default
+    : '';
   const maxChars = asComment ? 700 : 1000;
 
   const positivityRule = `
@@ -809,20 +813,18 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
 `.trim();
 
   const ratesBlock = asComment ? `Prices are shared privately only.` : `
-Soft launch rates (share only if directly relevant in DM):
+Discounted soft-launch rates (share in DMs only when relevant):
 • Deluxe Hut: PKR 30,000/night; 1N 27,000; 2N 25,500; 3N 24,000
 • Executive Hut: PKR 50,000/night; 1N 45,000; 2N 42,500; 3N 40,000
+(Always note: these are discounted prices.)
 `;
-
-  const publicPriceRule = asComment
-    ? `ABSOLUTE RULE: Do not mention numeric prices, discounts, or currency in public comments. If asked publicly, say we have sent prices in DM.`
-    : `You may include prices in DMs when relevant.`;
 
   const brandPhrasingRule = `
 BRAND AND PHRASING:
-- Brand name: ${FACTS.brand}. Prefer "${FACTS.brand}" when expressing welcome or excitement.
+- Brand-first: say "${FACTS.brand}" when expressing welcome or excitement (not "Tehjian Valley").
 - If you would say "excited to see you at ${FACTS.location_name}", instead say "excited to see you at ${FACTS.brand}".
-- Reference the broader region "${FACTS.region_name}" when describing scenery (mountain views, pleasant weather, scenic drives), without overusing it.
+- Reference the broader region "${FACTS.region_name}" only to color the scenery (mountain views, pleasant weather, scenic drives).
+- Primary contact: WhatsApp ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY}); secondary: ${SITE_URL}
 `.trim();
 
   const systemPrompt = `
@@ -839,35 +841,30 @@ ABSOLUTE VOICE RULE:
 
 ${brandPhrasingRule}
 
-CORE FACTS (do not alter numbers or policies):
-- Website (availability and booking only): ${SITE_URL}
+CORE FACTS:
+- Website: ${SITE_URL}
+- WhatsApp: ${WHATSAPP_LINK} (${PUBLIC_PHONE_DISPLAY})
 - Google Maps pin: ${MAPS_LINK}
-- Location: ${FACTS.location_name} in the ${FACTS.region_name} region (by the ${FACTS.river_name})
+- Location: by the ${FACTS.river_name} in ${FACTS.region_name}
 - Check in ${FACTS.checkin}; Check out ${FACTS.checkout}
 - ${ratesBlock.trim()}
 - T&Cs: taxes included; breakfast for 4; 50% advance to confirm
 - Facilities: ${FACTS.facilities.join('; ')}
 - Travel tips: ${FACTS.travel_tips.join('; ')}
-- Region highlights to optionally reference: ${FACTS.region_highlights.join('; ')}
+- Region highlights (optional): ${FACTS.region_highlights.join('; ')}
 
-ENRICHMENT (add only if relevant to the user's message):
+ENRICHMENT (add only if relevant):
 ${enrich.wx ? `• Current weather near resort: ${enrich.wx.temp}°C (feels ${enrich.wx.feels}°C), ${enrich.wx.desc}` : '• Weather: N/A'}
-${(() => {
-  if (maybeOrigin && maybeOrigin.trim()) return '• Origin provided by user: ' + normalizeOriginName(maybeOrigin);
-  return '• Origin: not provided';
-})()}
-
-AVAILABILITY POLICY:
-- Never claim availability in chat; ALWAYS direct availability to ${SITE_URL}.
+${maybeOrigin ? `• Origin provided by user: ${normalizeOriginName(maybeOrigin)}` : '• Origin: not provided'}
 
 PUBLIC PRICE POLICY:
-- ${publicPriceRule}
+- Do NOT mention numeric prices in public comments. DM-only.
 
 STYLE:
-- Be genuinely helpful. If the user is just making small talk, keep it light and do not push a booking.
+- Be helpful. If the user is just making small talk, keep it light; avoid pushy CTAs.
 - Prefer short bullets for dense info; friendly, clear, specific.
-- If a CTA is provided ("${cta}"), use it once. Otherwise, end naturally without add-ons.
-- Hard limit about ${maxChars} characters.
+- If a CTA is provided ("${cta}"), use it once; otherwise end naturally.
+- Hard limit ~${maxChars} characters.
 `.trim();
 
   const userMsg = (text || '').slice(0, 1000);
@@ -894,6 +891,12 @@ STYLE:
       }
       ai = sanitizeBrand(ai);
       if (asComment) return sanitizeComment(ai, lang);
+      // Pricing in DMs: ensure "discounted" note present if the AI generated custom pricing text
+      if (/\b(pkr|rs\.?|rupees|\d{2,3}(?:[, ]?\d{3}))/i.test(ai) && /price|rate/i.test(userMsg)) {
+        if (!/discount(ed|)\b/i.test(ai)) ai = `Note: These are discounted prices.\n` + ai;
+      }
+      // Always attach contact line in DMs
+      ai = ai + '\n\n' + contactLineByLang(lang);
       return sanitizeVoice(ai);
     }
   } catch (e) { console.error('🧠 OpenAI error:', e?.response?.data || e.message); }
@@ -907,7 +910,7 @@ STYLE:
 }
 
 /* =========================
-   SANITIZERS (no I/me/my; no prices in comments; brand phrasing)
+   SANITIZERS
    ========================= */
 function sanitizeVoice(text = '') {
   return (text || '')
@@ -924,6 +927,7 @@ function sanitizeVoice(text = '') {
 
 function sanitizeComment(text = '', lang = 'en') {
   let out = sanitizeVoice(sanitizeBrand(text || ''));
+  // Strip pricing from public comments
   const lines = out.split(/\r?\n/).filter(Boolean).filter(line => {
     const l = line.toLowerCase();
     const hasCurrency = /(?:pkr|rs\.?|rupees|price|rate|per\s*night)/i.test(l);
@@ -932,9 +936,9 @@ function sanitizeComment(text = '', lang = 'en') {
   });
   out = lines.join('\n');
   if (!out.trim()) {
-    if (lang === 'ur') return 'محبت اور حمایت کا شکریہ۔ مزید معلومات یا رہنمائی کے لیے ہمیں بتائیں۔';
-    if (lang === 'roman-ur') return 'Shukriya. Agar kisi cheez ki maloomat chahiye ho to batayein.';
-    return 'Thanks so much. If you would like more details or directions, just let us know.';
+    if (lang === 'ur') return 'محبت اور حمایت کا شکریہ۔ مزید معلومات یا رہنمائی کے لیے WhatsApp کریں: ' + WHATSAPP_LINK;
+    if (lang === 'roman-ur') return 'Shukriya. Info ke liye WhatsApp karein: ' + WHATSAPP_LINK;
+    return 'Thanks so much. For details, WhatsApp us: ' + WHATSAPP_LINK;
   }
   return out;
 }
@@ -949,7 +953,7 @@ function sanitizeBrand(text = '') {
 }
 
 /* =========================
-   SEND API (Messenger + IG DMs)
+   SEND API
    ========================= */
 async function sendText(psid, text) {
   const url = 'https://graph.facebook.com/v19.0/me/messages';
@@ -1020,6 +1024,8 @@ app.get('/admin/status', requireAdmin, async (_req, res) => {
         REGION: FACTS.region_name,
         RIVER: FACTS.river_name,
         BRAND: FACTS.brand,
+        WHATSAPP_LINK,
+        PUBLIC_PHONE_DISPLAY,
         DISABLE_SOFT_CTAS,
         CTA_ROTATION: CTA_ROTATION.length
       }
