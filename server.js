@@ -257,18 +257,108 @@ function stripPublicPricesKeepContact(text='') {
     .trim();
 }
 
-function enforceIntent(reply, { pricing, road }, surface, platform, lang) {
-  let out = sanitizeVoice(reply || '');
-  const isComment = surface === 'comment';
-  const contact = (platform === 'instagram' && isComment) ? IG_PUBLIC_NUMBER : WA_LINK;
+// -----------------------------------------------------------------------------
+// INTENT ENFORCER (NO RECURSION)
+// Centralizes hard rules for public comments vs DMs, channel-specific CTAs,
+// language-matched copy, and WhatsApp/phone routing.
+// -----------------------------------------------------------------------------
+function enforceIntent(
+  text,
+  intent,                // { pricing, road, availability, influencer, ... }
+  surface,               // 'comment' | 'dm'
+  platform,              // 'instagram' | 'facebook'
+  lang,                  // 'en' | 'ur' | 'roman-ur'
+  contact                // already prepared by caller (either number or wa.me link)
+) {
+  const BRAND = FACTS.brand || 'Roameo Resorts';
 
-  // If NOT pricing: remove any accidental price talk
-  if (!pricing) {
-    out = out.replace(PRICE_WORD, '').replace(CURRENCY_NUM, '');
-    if (isComment) out = stripPublicPricesKeepContact(out);
-    // If we stripped too much or it still hints prices, replace with topical help
-    if (/dm.*price|discount/i.test(out)) out = '';
+  // Helpers for language-matched strings
+  const L = {
+    pricing_comment() {
+      // Public comments must *not* show numeric prices. CTA varies by platform.
+      if (lang === 'ur') {
+        return `اس وقت رعایتی قیمتیں لاگو ہیں — براہِ کرم ہمیں DM کریں تاکہ ہم آپ کے ساتھ تفصیل فوراً شیئر کر سکیں۔`;
+      }
+      if (lang === 'roman-ur') {
+        return `Abhi discounted prices chal rahi hain — meherbani karke humein DM karein taa ke hum foran detail share kar saken.`;
+      }
+      return `Discounted prices are live — please DM us and we’ll share the details right away.`;
+    },
+    pricing_dm() {
+      // DM can mention that these are discounted prices (numerics can come from your GPT branch if you choose)
+      if (lang === 'ur') {
+        return `یہ رعایتی قیمتیں ہیں۔ اگر چاہیں تو ہم آپ کو اختیار کے مطابق ہٹ کی اقسام اور تاریخوں کی رہنمائی بھی کر دیں گے۔ مزید مدد یا بکنگ کے لیے رابطہ: ${contact}\nWebsite: ${SITE_URL}`;
+      }
+      if (lang === 'roman-ur') {
+        return `Yeh discounted prices hain. Agar chahein to hum aap ki dates aur hut selection mein bhi madad kar dein ge. Madad/booking ke liye rabta: ${contact}\nWebsite: ${SITE_URL}`;
+      }
+      return `These are discounted prices. We can also help you pick the right hut and dates. For help/booking: ${contact}\nWebsite: ${SITE_URL}`;
+    },
+    road_comment() {
+      // Concise public answer about conditions, *no recursion*
+      if (lang === 'ur') {
+        return `${BRAND} تک سڑکیں عموماً کھلی اور کارپٹڈ ہوتی ہیں۔ ریزورٹ کے قریب ایک چھوٹا سا واٹر کراسنگ ہے؛ بزرگ مہمانوں کے لیے ہماری 4×4 مدد دستیاب ہے۔ بارش/سلائیڈز کے بعد تازہ صورتحال کے لیے براہِ کرم ہم سے رابطہ کریں: ${contact}`;
+      }
+      if (lang === 'roman-ur') {
+        return `Roads to ${BRAND} aam tor par open aur fully carpeted hoti hain. Resort ke qareeb chhota sa water crossing hai; barha se mehmaanon ke liye 4×4 assist milti hai. Heavy rain/landslide ke baad latest update ke liye rabta karein: ${contact}`;
+      }
+      return `Roads to ${BRAND} are generally open and fully carpeted. Near the resort there’s a small water crossing; our team provides 4×4 assist for elderly guests. After heavy rain/landslides, please contact us for a quick status update: ${contact}`;
+    },
+    availability_any() {
+      if (lang === 'ur') {
+        return `دستیابی/بکنگ کے لیے ہم WhatsApp/کال پر مدد کر دیں گے: ${contact} — یا آپ ہماری ویب سائٹ بھی دیکھ سکتے ہیں: ${SITE_URL}`;
+      }
+      if (lang === 'roman-ur') {
+        return `Availability/booking ke liye hum WhatsApp/call par madad kar dein ge: ${contact} — ya aap website bhi dekh sakte hain: ${SITE_URL}`;
+      }
+      return `For availability/booking, we can assist on WhatsApp/call: ${contact} — or you can also use our website: ${SITE_URL}`;
+    },
+    influencer_dm() {
+      if (lang === 'ur') {
+        return `کولیب یا پارٹنرشپ کے لیے براہِ کرم اسی نمبر پر رابطہ کریں: ${contact} — ہماری ٹیم جلد جواب دے گی۔`;
+      }
+      if (lang === 'roman-ur') {
+        return `Collab/partnership ke liye barah-e-mehrbani isi number par rabta karein: ${contact} — hamari team jald respond karegi.`;
+      }
+      return `For collaborations/partnerships, please contact us on: ${contact} — our team will get back to you shortly.`;
+    }
+  };
+
+  // Channel-specific contact presentation:
+  // - Instagram comments: show plain number (non-clickable links look bad)
+  // - Facebook comments & all DMs: wa.me link is OK if you prefer
+  // Caller should already pass correct 'contact', but this keeps it safe:
+  if (surface === 'comment' && platform === 'instagram') {
+    // Force to plain phone for IG comments
+    contact = '03558000078';
   }
+
+  // ----- HARD INTENT RULES (no loops) -----
+  if (intent?.pricing) {
+    // Public comments: never print numbers; push to DM with a strong discount hook
+    if (surface === 'comment') {
+      return L.pricing_comment();
+    }
+    // DMs: mention “discounted prices”, plus contact + site
+    return L.pricing_dm();
+  }
+
+  if (intent?.road) {
+    // Give the road status snippet directly (no recursion)
+    return L.road_comment();
+  }
+
+  if (intent?.availability) {
+    return L.availability_any();
+  }
+
+  if (intent?.influencer && surface === 'dm') {
+    return L.influencer_dm();
+  }
+
+  // No hard rule matched — let the GPT reply pass through.
+  return null;
+}
 
   // Road topic: ensure a solid, relevant answer
   if (road) {
