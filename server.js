@@ -300,7 +300,7 @@ app.post('/webhook', async (req, res) => {
           }
         }
         if (Array.isArray(entry.changes)) {
-          for (const change of entry.changes)) {
+          for (const change of entry.changes) {
             console.log('🖼️ IG CHANGE:', JSON.stringify(change));
             await routeInstagramChange(change, pageId).catch(logErr);
           }
