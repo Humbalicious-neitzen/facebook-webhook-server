@@ -3,7 +3,7 @@
 // Unique GPT replies (EN/Urdu/Roman-Ur) + positivity + Weather (OpenWeather) + Distance/ETA (Geoapify)
 // PRICES IN COMMENTS: FORBIDDEN (DM-only).
 // Voice: never use first-person singular — always "we/us/our team".
-// Pricing-in-comments -> private reply + public "check inbox" note
+// Pricing-in-comments -> private reply + public "check inbox" note (fail-open if DM fails)
 // Lightweight conversation state for CTA follow-up (dates/guests)
 // Admin helpers (subscribe/status)
 
@@ -43,7 +43,7 @@ const GEOAPIFY_API_KEY = process.env.GEOAPIFY_API_KEY || '';
 const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY || '';
 const RESORT_COORDS = (process.env.RESORT_COORDS || '').trim(); // "lat,lon"
 const RESORT_LOCATION_NAME = process.env.RESORT_LOCATION_NAME || 'Tehjian Valley';
-const RESORT_REGION_NAME = process.env.RESORT_REGION_NAME || 'Kashmir'; // NEW: broader region mention
+const RESORT_REGION_NAME = process.env.RESORT_REGION_NAME || 'Kashmir'; // broader region mention
 
 // Behavior toggles
 const DISABLE_SOFT_CTAS = String(process.env.DISABLE_SOFT_CTAS || 'true').toLowerCase() === 'true';
@@ -82,7 +82,7 @@ const FACTS = {
   map: MAPS_LINK,
   resort_coords: RESORT_COORDS, // "lat,lon"
   location_name: RESORT_LOCATION_NAME, // valley/area name
-  region_name: RESORT_REGION_NAME,     // NEW: broader region (Kashmir)
+  region_name: RESORT_REGION_NAME,     // broader region (Kashmir)
   river_name: 'Neelam River',
   checkin: CHECKIN_TIME,
   checkout: CHECKOUT_TIME,
@@ -301,7 +301,7 @@ async function routeMessengerEvent(event, ctx = { source: 'messaging' }) {
    ========================= */
 function isPricingIntent(text = '') {
   const t = (text || '').toLowerCase();
-  return /\b(rate|price|cost|charges?|tariff|per\s*night|room|rooms|rates?)\b/i.test(t);
+  return /\b(pric(?:e|ing)|rate|cost|charges?|tariff|per\s*night|room|rooms)\b/i.test(t);
 }
 function isQuestionLike(text = '') {
   const t = (text || '').toLowerCase();
@@ -329,6 +329,14 @@ function pickLangAwarePublicLine(text = '') {
   return 'We have sent you the prices in a private message. Please check your inbox. 😊';
 }
 
+// NEW: public fallback when DM fails
+function pickLangAwarePromptDM(text = '') {
+  const lang = detectLanguage(text);
+  if (lang === 'ur') return 'برائے مہربانی ہمیں DM کریں، ہم فوراً قیمتیں شیئر کر دیں گے۔ 😊';
+  if (lang === 'roman-ur') return 'Meherbani karke humein DM karein, hum foran prices share kar denge. 😊';
+  return 'Please DM us and we will share the prices right away. 😊';
+}
+
 async function routePageChange(change) {
   if (change.field !== 'feed') return;
   const v = change.value || {};
@@ -337,13 +345,22 @@ async function routePageChange(change) {
     console.log('💬 FB comment event:', { verb: v.verb, commentId: v.comment_id, text, post_id: v.post_id, from: v.from });
     if (v.verb !== 'add') return;
 
-    // Pricing asked publicly -> private reply + short public note
+    // Pricing asked publicly -> try DM, then always public note
     if (isPricingIntent(text)) {
+      let dmOk = false;
       try {
         const privateReply = await decideReply(text, { surface: 'dm', platform: 'facebook' });
         await fbPrivateReplyToComment(v.comment_id, privateReply);
-        await replyToFacebookComment(v.comment_id, pickLangAwarePublicLine(text));
-      } catch (e) { logErr(e); }
+        dmOk = true;
+      } catch (e) {
+        logErr({ where: 'FB pricing DM', commentId: v.comment_id, err: e?.response?.data || e.message });
+      }
+
+      try {
+        const publicMsg = dmOk ? pickLangAwarePublicLine(text) : pickLangAwarePromptDM(text);
+        await replyToFacebookComment(v.comment_id, publicMsg);
+      } catch (e) { logErr({ where: 'FB pricing public reply', commentId: v.comment_id, err: e?.response?.data || e.message }); }
+
       return;
     }
 
@@ -358,7 +375,7 @@ async function routePageChange(change) {
         publicReply = sanitizeComment(publicReply, detectLanguage(text));
         publicReply = sanitizeBrand(publicReply);
         await replyToFacebookComment(v.comment_id, publicReply);
-      } catch (e) { logErr(e); }
+      } catch (e) { logErr({ where: 'FB question-like dual reply', commentId: v.comment_id, err: e?.response?.data || e.message }); }
       return;
     }
 
@@ -409,12 +426,22 @@ async function routeInstagramChange(change, pageId) {
     console.log('💬 IG comment event:', { field: theField, verb: v.verb, commentId, text, media_id: v.media_id, from: v.from });
     if (v.verb && v.verb !== 'add') return;
 
+    // Pricing asked publicly -> try DM, then always public note
     if (isPricingIntent(text)) {
+      let dmOk = false;
       try {
         const privateReply = await decideReply(text, { surface: 'dm', platform: 'instagram' });
         await igPrivateReplyToComment(pageId, commentId, privateReply);
-        await replyToInstagramComment(commentId, pickLangAwarePublicLine(text));
-      } catch (e) { logErr(e); }
+        dmOk = true;
+      } catch (e) {
+        logErr({ where: 'IG pricing DM', commentId, pageId, err: e?.response?.data || e.message }); // Threads/permissions can fail
+      }
+
+      try {
+        const publicMsg = dmOk ? pickLangAwarePublicLine(text) : pickLangAwarePromptDM(text);
+        await replyToInstagramComment(commentId, publicMsg);
+      } catch (e) { logErr({ where: 'IG pricing public reply', commentId, pageId, err: e?.response?.data || e.message }); }
+
       return;
     }
 
@@ -428,7 +455,7 @@ async function routeInstagramChange(change, pageId) {
         let publicReply = await decideReply(text, { surface: 'comment', platform: 'instagram' });
         publicReply = sanitizeComment(sanitizeBrand(publicReply), detectLanguage(text));
         await replyToInstagramComment(commentId, publicReply);
-      } catch (e) { logErr(e); }
+      } catch (e) { logErr({ where: 'IG question-like dual reply', commentId, pageId, err: e?.response?.data || e.message }); }
       return;
     }
 
@@ -681,7 +708,7 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
   }
 
   const intent = {
-    rates: /\b(rate|price|cost|charges?|tariff|per\s*night|room|rooms|rates?)\b/i.test(t),
+    rates: /\b(pric(?:e|ing)|rate|cost|charges?|tariff|per\s*night|room|rooms)\b/i.test(t),
     location: /\b(location|where|address|map|pin|directions?|google\s*maps|reach)\b/i.test(t),
     facilities: /\b(facilit(y|ies)|amenit(y|ies)|wifi|internet|kitchen|food|meal|heater|bonfire|family|kids|parking|jeep|inverter)\b/i.test(t),
     booking: /\b(book|booking|reserve|reservation|check[-\s]?in|checkin|check[-\s]?out|checkout|advance|payment)\b/i.test(t),
@@ -751,11 +778,11 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
 
   // Fallback if GPT not configured
   if (!OPENAI_API_KEY) {
-    if (intent.rates)      return asComment ? sanitizeComment(REPLY_TEMPLATES.rates_short, lang) : sanitizeVoice(REPLY_TEMPLATES.rates_long);
-    if (intent.location)   return asComment ? sanitizeComment(REPLY_TEMPLATES.loc_short, lang)   : sanitizeVoice(REPLY_TEMPLATES.loc_long);
-    if (intent.facilities) return asComment ? sanitizeComment(REPLY_TEMPLATES.fac_short, lang)   : sanitizeVoice(REPLY_TEMPLATES.fac_long);
-    if (intent.booking)    return asComment ? sanitizeComment(REPLY_TEMPLATES.book_short, lang)  : sanitizeVoice(REPLY_TEMPLATES.book_long);
-    return asComment ? sanitizeComment(REPLY_TEMPLATES.default_short, lang) : sanitizeVoice(REPLY_TEMPLATES.default_long);
+    if (intent.rates)      return asComment ? sanitizeComment(REPLY_TEMPLATES.rates_short, lang) : sanitizeVoice(sanitizeBrand(REPLY_TEMPLATES.rates_long));
+    if (intent.location)   return asComment ? sanitizeComment(REPLY_TEMPLATES.loc_short, lang)   : sanitizeVoice(sanitizeBrand(REPLY_TEMPLATES.loc_long));
+    if (intent.facilities) return asComment ? sanitizeComment(REPLY_TEMPLATES.fac_short, lang)   : sanitizeVoice(sanitizeBrand(REPLY_TEMPLATES.fac_long));
+    if (intent.booking)    return asComment ? sanitizeComment(REPLY_TEMPLATES.book_short, lang)  : sanitizeVoice(sanitizeBrand(REPLY_TEMPLATES.book_long));
+    return asComment ? sanitizeComment(REPLY_TEMPLATES.default_short, lang) : sanitizeVoice(sanitizeBrand(REPLY_TEMPLATES.default_long));
   }
 
   // Build system prompt
