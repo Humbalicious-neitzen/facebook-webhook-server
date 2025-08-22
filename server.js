@@ -1,9 +1,8 @@
-// server.js — Roameo Resorts omni-channel bot (AI-first, intent-aware)
+// server.js — Roameo Resorts omni-channel bot (v2: 800-char chunking + Urdu prices)
 // FB DMs + FB comments + IG DMs + IG comments
 // Unique GPT replies (EN/Urdu/Roman-Ur) + humor + Weather (OpenWeather) + ETA (Geoapify)
 // PUBLIC PRICES: FORBIDDEN. Pricing → DM with numbers (+ fresh hook).
-// WhatsApp rules: IG comments = number only; FB comments & DMs = wa.me link.
-// CTAs are intent-aware (not always). Never say “Shall we pencil you in?”.
+// WhatsApp rules: IG comments = number only; FB comments & all DMs = wa.me link.
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -18,7 +17,7 @@ const PORT = process.env.PORT || 10000;
    ENV & CONSTANTS
    ========================= */
 const APP_SECRET = process.env.APP_SECRET;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'verify_dev';
+const VERIFY_TOKEN = process.env.verify_token || process.env.VERIFY_TOKEN || 'verify_dev';
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 
 // OpenAI
@@ -43,17 +42,18 @@ const RESORT_COORDS = (process.env.RESORT_COORDS || '').trim(); // "lat,lon"
 const RESORT_LOCATION_NAME = process.env.RESORT_LOCATION_NAME || 'Tehjian Valley';
 
 // ==== Brand constants (not env-scoped; safe for multi-page) ====
-const BRAND_USERNAME = 'roameoresorts';                // used to avoid self-replies
-const WHATSAPP_NUMBER = '03558000078';                 // show in IG comments
-const WHATSAPP_LINK   = 'https://wa.me/923558000078';  // OK in FB comments & DMs
+const BRAND_USERNAME = 'roameoresorts';                // avoid self-replies
+const WHATSAPP_NUMBER = '03558000078';                 // IG comments
+const WHATSAPP_LINK   = 'https://wa.me/923558000078';  // FB comments & all DMs
 const SITE_URL   = 'https://www.roameoresorts.com/';
 const SITE_SHORT = 'roameoresorts.com';
-
-// Always this Google Maps pin:
-const MAPS_LINK  = 'https://maps.app.goo.gl/Y49pQPd541p1tvUf6';
+const MAPS_LINK  = 'https://maps.app.goo.gl/Y49pQPd541p1tvUf6'; // always this
 
 const CHECKIN_TIME  = process.env.CHECKIN_TIME  || '3:00 pm';
 const CHECKOUT_TIME = process.env.CHECKOUT_TIME || '12:00 pm';
+
+// Outgoing message limits (Messenger hard cap ~1000)
+const MAX_OUT_CHAR = 800;
 
 if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
   console.warn('⚠️ Missing required env vars: APP_SECRET, VERIFY_TOKEN, PAGE_ACCESS_TOKEN');
@@ -101,11 +101,23 @@ const FACTS = {
 };
 
 /* =========================
+   STYLE / EMOJI
+   ========================= */
+const EMOJI = {
+  hello: ['💚','🌿','👋','😊'],
+  bullet_ok: ['✅','☑️','🟢'],
+  travel: ['🚙','🛣️','🌄'],
+  tip: ['💡','✨','📍'],
+  close: ['🏞️','🌲','🌊','⭐']
+};
+function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
+
+/* =========================
    MIDDLEWARE & CACHES
    ========================= */
 app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 const dedupe = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 }); // 1h
-const tinyCache = new LRUCache({ max: 200, ttl: 1000 * 60 * 10 }); // 10m (weather/geo)
+const tinyCache = new LRUCache({ max: 200, ttl: 1000 * 60 * 10 }); // 10m
 const convo = new LRUCache({ max: 5000, ttl: 1000 * 60 * 30 }); // DM state
 
 /* =========================
@@ -118,9 +130,9 @@ app.get('/', (_req, res) => res.send('Roameo Omni Bot running'));
    ========================= */
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
+  const token = req.query['hub.verify_token'] || req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
+  if (mode === 'subscribe' && (token === VERIFY_TOKEN)) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
 
@@ -139,30 +151,12 @@ function verifySignature(req) {
 }
 
 /* =========================
-   HELPERS
+   HELPERS — language, chunking, sanitize
    ========================= */
-function isSelfComment(v = {}, platform = 'facebook') {
-  const from = v.from || {};
-  if (platform === 'instagram') {
-    if (from.username && from.username.toLowerCase() === BRAND_USERNAME.toLowerCase()) return true;
-  } else {
-    if (from.name && from.name.toLowerCase().includes('roameo')) return true;
-  }
-  return false;
-}
-
-// URL-safe voice sanitizer (does NOT alter wa.me etc.)
 function sanitizeVoice(text = '') {
-  let s = text || '';
-
-  // Protect URLs
+  // Protect URLs first
   const urls = [];
-  s = s.replace(/https?:\/\/\S+/gi, (m) => {
-    urls.push(m);
-    return `__URL${urls.length - 1}__`;
-  });
-
-  // Voice cleanup
+  let s = (text || '').replace(/https?:\/\/\S+/gi, (m) => { urls.push(m); return `__URL${urls.length - 1}__`; });
   s = s
     .replace(/Shall we pencil you in\??/gi, '')
     .replace(/\bI\'m\b/gi, 'we’re')
@@ -174,12 +168,9 @@ function sanitizeVoice(text = '') {
     .replace(/\bmine\b/gi, 'ours')
     .replace(/\s{2,}/g, ' ')
     .trim();
-
-  // Restore URLs
   s = s.replace(/__URL(\d+)__/g, (_, i) => urls[Number(i)]);
   return s;
 }
-
 function stripPricesFromPublic(text = '') {
   const lines = (text || '').split(/\r?\n/).filter(Boolean).filter(l => {
     const s = l.toLowerCase();
@@ -189,98 +180,104 @@ function stripPricesFromPublic(text = '') {
   });
   return lines.join(' ');
 }
-
-// Language detection
 function detectLanguage(text = '') {
   const t = (text || '').trim();
   const hasUrduScript = /[\u0600-\u06FF\u0750-\u077F]/.test(t);
   if (hasUrduScript) return 'ur';
-
   const romanUrduHits = [
     /\b(aap|ap|apka|apki|apke|tum|tm|bhai|plz|pls)\b/i,
     /\b(kia|kya|kyun|kyon|kaise|kese|krna|karna|krdo|kardo|raha|rha|rhe|rahe|gi|ga|hain|hy|hai)\b/i,
     /\b(mein|mai|mujhe|yahan|wahan|acha|accha|bohat|bahut)\b/i,
-    /\b(kitna|kitni|din|rat|room|booking|rate|price|mausam|kiraya|rent|rental)\b/i
+    /\b(kitna|kitni|room|booking|rate|price|mausam|kiraya|rent|rental)\b/i
   ].reduce((a, rx) => a + (rx.test(t) ? 1 : 0), 0);
-
   const englishHits = [/\b(the|and|is|are|you|we|from|how|where|price|rate|book|available|distance|weather|rent|rental)\b/i]
     .reduce((a, rx) => a + (rx.test(t) ? 1 : 0), 0);
-
   if (romanUrduHits >= 1 && englishHits <= 3) return 'roman-ur';
   return 'en';
 }
-
-// Pricing intent (now includes rent/rental/kiraya)
 function isPricingIntent(text = '') {
   const t = (text || '').toLowerCase();
   return /\b(price|prices|rate|rates|cost|costs|charge|charges|tariff|per\s*night|rent|rental)\b/i.test(t)
-      || /\b(kiraya|qeemat|keemat|kimat|kimatain|qeematein|rate\s*kya|price\s*kya|rates\s*kya)\b/i.test(t)
+      || /\b(kiraya|qeemat|keemat|kimat|qeematein|rate\s*kya|price\s*kya|rates\s*kya)\b/i.test(t)
       || /\b(kitna|kitni)\s*(per\s*night|room|hut|d\b)/i.test(t);
 }
-
-/* =========================
-   CTA logic
-   ========================= */
-function shouldAttachCTA(intent, surface) {
-  if (surface === 'comment' && intent === 'rates') return false; // NO CTA for price comments
-  return ['booking','availability','location','facilities','distance','weather','rates','general'].includes(intent);
+function isPlayful(text='') {
+  const t = text.toLowerCase();
+  return /awesome|🔥|😂|😅|😜|😉|mausam.*awesome|weather.*awesome|party|vibes/.test(t);
 }
 
-function attachCTA(body, intent, platform, surface) {
-  if (!shouldAttachCTA(intent, surface)) return body;
-
-  const compact = (body || '').replace(/\s*\n+\s*/g, ' ').trim();
-  const already = /WhatsApp:|roameoresorts\.com/i.test(compact);
-  if (already) return compact;
-
-  const cta = platform === 'instagram'
-    ? `WhatsApp: ${WHATSAPP_NUMBER} • Website: ${SITE_SHORT}`
-    : `WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`;
-
-  return `${compact}\n${cta}`.trim();
+// Chunk text into <= MAX_OUT_CHAR parts, preferring breaks
+function splitToChunks(s, limit = MAX_OUT_CHAR) {
+  const out = [];
+  let str = (s || '').trim();
+  while (str.length > limit) {
+    let cut = Math.max(
+      str.lastIndexOf('\n', limit),
+      str.lastIndexOf('. ', limit),
+      str.lastIndexOf('•', limit),
+      str.lastIndexOf('—', limit),
+      str.lastIndexOf('!', limit),
+      str.lastIndexOf('?', limit)
+    );
+    if (cut <= 0) cut = limit;
+    out.push(str.slice(0, cut).trim());
+    str = str.slice(cut).trim();
+  }
+  if (str) out.push(str);
+  return out;
+}
+async function sendBatched(psid, textOrArray) {
+  const parts = Array.isArray(textOrArray) ? textOrArray : [textOrArray];
+  for (const p of parts) {
+    for (const chunk of splitToChunks(p, MAX_OUT_CHAR)) {
+      await sendText(psid, chunk);
+    }
+  }
+}
+function trimForComment(s, limit = MAX_OUT_CHAR) {
+  if ((s || '').length <= limit) return s;
+  return s.slice(0, limit - 1).trim() + '…';
 }
 
 /* =========================
-   PRICE NUDGE (comments only, NO CTA)
+   EMOJI/HOOKS
    ========================= */
 const HOOKS = {
   en: [
-    'discounted prices inside!',
-    'special launch discounts await!',
-    'exclusive DM-only deals!',
-    'limited-time savings available!',
-    'bundle discounts for 2+ nights!'
+    'discounted prices inside! ✨',
+    'special launch discounts await! 🎉',
+    'exclusive DM-only deals! 🔒',
+    'limited-time savings available! ⏳',
+    'bundle discounts for 2+ nights! 🛖'
   ],
   'roman-ur': [
-    'discounted prices andar!',
-    'launch discounts tayyar!',
-    'sirf DM mein deals!',
-    'limited-time bachat!',
-    '2+ nights par extra off!'
+    'discounted prices andar! ✨',
+    'launch discounts tayyar! 🎉',
+    'sirf DM mein deals! 🔒',
+    'limited-time bachat! ⏳',
+    '2+ nights par extra off! 🛖'
   ],
   ur: [
-    'ڈسکاؤنٹڈ قیمتیں دستیاب!',
-    'لانچ ڈسکاؤنٹس آپ کے لیے!',
-    'DM پر خصوصی آفرز!',
-    'محدود وقت کی بچت!',
-    'دو راتوں سے زائد پر مزید رعایت!'
+    'ڈسکاؤنٹڈ قیمتیں دستیاب! ✨',
+    'لانچ ڈسکاؤنٹس آپ کے لیے! 🎉',
+    'خصوصی آفرز صرف DM میں! 🔒',
+    'محدود وقت کی بچت! ⏳',
+    'دو+ راتوں پر اضافی رعایت! 🛖'
   ]
 };
-
 function priceNudgePublic(lang = 'en') {
   const arr = HOOKS[lang] || HOOKS.en;
   const hook = arr[Math.floor(Math.random() * arr.length)];
-  if (lang === 'ur') return `براہِ کرم ریٹس کے لیے DM کریں — ${hook}`;
-  if (lang === 'roman-ur') return `Rates ke liye DM karein — ${hook}`;
-  return `Please DM us for rates — ${hook}`;
+  if (lang === 'ur') return trimForComment(`براہِ کرم ریٹس کے لیے DM کریں — ${hook}`);
+  if (lang === 'roman-ur') return trimForComment(`Rates ke liye DM karein — ${hook}`);
+  return trimForComment(`Please DM us for rates — ${hook}`);
 }
 
 /* =========================
-   Enrichment helpers
+   ENRICHMENT
    ========================= */
 function km(meters) { return (meters / 1000).toFixed(0); }
 function hhmm(seconds) { const h = Math.floor(seconds/3600); const m = Math.round((seconds%3600)/60); return `${h}h ${m}m`; }
-
 async function geocodePlace(place) {
   if (!GEOAPIFY_API_KEY || !place) return null;
   const key = `geo:${place.toLowerCase()}`;
@@ -296,7 +293,6 @@ async function geocodePlace(place) {
     return res;
   } catch (e) { console.error('geoapify geocode error', e?.response?.data || e.message); return null; }
 }
-
 async function routeDrive(originLat, originLon, destLat, destLon) {
   if (!GEOAPIFY_API_KEY) return null;
   const key = `route:${originLat},${originLon}->${destLat},${destLon}`;
@@ -307,12 +303,9 @@ async function routeDrive(originLat, originLon, destLat, destLon) {
     const { data } = await axios.get(url, { params: { waypoints, mode: 'drive', apiKey: GEOAPIFY_API_KEY }, timeout: 12000 });
     const ft = data?.features?.[0]?.properties;
     if (!ft) return null;
-    const res = { meters: ft.distance, seconds: ft.time };
-    tinyCache.set(key, res);
-    return res;
+    return { meters: ft.distance, seconds: ft.time };
   } catch (e) { console.error('geoapify routing error', e?.response?.data || e.message); return null; }
 }
-
 async function currentWeather(lat, lon) {
   if (!OPENWEATHER_API_KEY || !lat || !lon) return null;
   const key = `wx:${lat},${lon}`;
@@ -320,119 +313,94 @@ async function currentWeather(lat, lon) {
   try {
     const url = 'https://api.openweathermap.org/data/2.5/weather';
     const { data } = await axios.get(url, { params: { lat, lon, units: 'metric', appid: OPENWEATHER_API_KEY }, timeout: 10000 });
-    const res = {
+    return {
       temp: Math.round(data?.main?.temp ?? 0),
       feels: Math.round(data?.main?.feels_like ?? 0),
       desc: (data?.weather?.[0]?.description || '').replace(/\b\w/g, c => c.toUpperCase())
     };
-    tinyCache.set(key, res);
-    return res;
   } catch (e) { console.error('openweather error', e?.response?.data || e.message); return null; }
 }
 
 /* =========================
-   LOCATION MESSAGE (by language) — always uses MAPS_LINK
+   LOCATION MESSAGE (by language)
    ========================= */
 function locationMessageByLang(lang = 'en') {
   if (lang === 'ur') {
-    return `*لوکیشن کا لنک آسان نیویگیشن کے لیے:*\n\n👉 ${MAPS_LINK}\n\n*اہم معلومات:*\n🚗 نیلم ویلی کی سڑکیں مکمل طور پر کارپیٹڈ ہیں — سفر ہموار اور دلکش رہتا ہے۔\n\n🅿️ ریزورٹ کے قریب ایک چھوٹا سا واٹر کراسنگ ہے؛ سیڈان/لو کلیرنس گاڑیاں ہماری پرائیویٹ پارکنگ میں کھڑی کی جا سکتی ہیں (صرف 1 منٹ واک)۔\n\n💼 ہمارا عملہ سامان میں مدد کرتا ہے، اور بزرگ مہمانوں کے لیے آخری حصے پر *مفت جیپ ٹرانسفر* بھی موجود ہے تاکہ آمد آرام دہ رہے۔\n\nاگر راستے، ٹائمنگز یا پلاننگ میں مدد چاہیے ہو تو بتائیں—آپ کی آمد کو ہم یادگار اور آسان بناتے ہیں!`;
+    return `*لوکیشن کا لنک آسان نیویگیشن کے لیے:*\n\n👉 ${MAPS_LINK}\n\n*اہم معلومات:*\n🚙 نیلم ویلی کی سڑکیں مکمل طور پر کارپیٹڈ ہیں — سفر ہموار اور دلکش رہتا ہے۔\n\n🅿️ ریزورٹ کے قریب ایک چھوٹا سا واٹر کراسنگ ہے؛ سیڈان/لو کلیرنس گاڑیاں ہماری پرائیویٹ پارکنگ میں کھڑی کی جا سکتی ہیں (صرف 1 منٹ واک)۔\n\n💼 ہمارا عملہ سامان میں مدد کرتا ہے، اور بزرگ مہمانوں کے لیے آخری حصے پر *مفت جیپ ٹرانسفر* بھی موجود ہے تاکہ آمد آرام دہ رہے۔\n\nاگر راستے یا پلاننگ میں مدد چاہیے ہو تو بتائیں—ہم آپ کی آمد کو یادگار اور آسان بناتے ہیں!`;
   }
   if (lang === 'roman-ur') {
-    return `*Location link for easy navigation:*\n\n👉 ${MAPS_LINK}\n\n*Good to know:*\n🚗 Neelum Valley ki roads fully carpeted hain—ride smooth aur scenic rehti hai.\n\n🅿️ Resort ke qareeb chhota sa water crossing hota hai; agar sedan/low-clearance car hai to aap hamari private parking (sirf 1-minute walk) use kar sakte hain.\n\n💼 Hamari team luggage mein madad karti hai, aur buzurg mehmanon ke liye last stretch par *free jeep transfer* bhi available hai.\n\nDirections ya planning mein help chahiye ho to batayein—hum aapki arrival smooth aur memorable banate hain!`;
+    return `*Location link for easy navigation:*\n\n👉 ${MAPS_LINK}\n\n*Good to know:*\n🚙 Neelum Valley ki roads fully carpeted hain—ride smooth aur scenic rehti hai.\n\n🅿️ Resort ke qareeb chhota sa water crossing hota hai; agar sedan/low-clearance car hai to private parking (sirf 1-minute walk) use kar sakte hain.\n\n💼 Team luggage mein madad karti hai, aur buzurg mehmanon ke liye last stretch par *free jeep transfer* available hai.\n\nDirections ya planning mein help chahiye ho to batayein—arrival smooth aur memorable banate hain!`;
   }
-  // English
-  return `*Here’s the location link for easy navigation:*\n\n👉 ${MAPS_LINK}\n\n*Good to know:*\n🚗 The road conditions in Neelum Valley are excellent. All routes are fully carpeted for a smooth and scenic drive.\n\n🅿️ There’s a small water crossing near the resort. If you’re in a sedan/low-clearance vehicle, you can park at our private resort parking just a 1-minute walk away.\n\n💼 Our team will happily assist with luggage, and for elderly guests we also offer a *free jeep transfer* to make the final stretch comfortable and hassle-free.\n\nIf you need directions or trip planning help, just say the word—we’ll make your arrival smooth and memorable!`;
+  return `*Here’s the location link for easy navigation:*\n\n👉 ${MAPS_LINK}\n\n*Good to know:*\n🚙 Roads in Neelum Valley are fully carpeted for a smooth, scenic drive.\n\n🅿️ There’s a small water crossing near the resort. Sedans/low-clearance cars can use our private parking (1-minute walk).\n\n💼 Our team gladly helps with luggage, and for elderly guests we offer a *free jeep transfer* for the final stretch.\n\nNeed directions or trip planning help? We’ll make your arrival smooth and memorable!`;
 }
 
 /* =========================
-   OPENAI — UNIQUE REPLIES
+   GPT reply composer
    ========================= */
-function systemRules(asComment, lang) {
-  const surface = asComment ? 'COMMENT (public)' : 'DM (private)';
+function systemRules(asComment, lang, playful) {
   const langGuide = lang === 'ur'
-    ? 'Write in fluent Urdu script. No romanization.'
+    ? 'Write in fluent Urdu script.'
     : lang === 'roman-ur'
-      ? 'Write in natural Roman Urdu (ASCII letters only).'
+      ? 'Write in natural Roman Urdu (ASCII letters).'
       : 'Write in natural English.';
+  const humor = playful ? '- The user is playful; add a light one-liner.' : '- Warm and friendly; a little charm is fine.';
+  const surface = asComment ? 'COMMENT' : 'DM';
   return `
 You are Roameo Resorts' assistant in Tehjian Valley (by the Neelam River).
+Surface: ${surface}.
 - Match the user's language. ${langGuide}
-- Answer-first (even for general questions), then connect to Roameo Resorts naturally.
-- Use light humor only if the user is playful.
-- Voice: never use first-person singular. Use “we/us/our team”.
-- Public price policy: NEVER post numeric prices/discounts in comments.
-- Availability: never claim availability; direct users to the website.
-- Do NOT include links or phone numbers; system adds CTA when appropriate.
-- BAN the phrase “Shall we pencil you in?”.
-- Useful facts you may reference: check-in ${FACTS.checkin}; check-out ${FACTS.checkout}; facilities include ${FACTS.facilities.join(', ')}; travel tips: ${FACTS.travel_tips.join(', ')}.
+- Answer the question FIRST (even if general knowledge), then relate softly to Roameo.
+- ${humor}
+- Voice: use “we/us/our team”; never first-person singular.
+- PUBLIC price policy: NEVER post numeric prices/discounts in comments.
+- Don't include URLs or phone numbers; the app adds CTAs/links.
+- Ban the phrase “Shall we pencil you in?”.
+Use a concise, emoji-friendly style (2–5 short lines or bullets).
 `.trim();
 }
 
-async function generateReply({ intent, userText, lang, asComment, enrich }) {
-  const rulesByIntent = {
-    rates: `Public: say prices are shared privately (DM), no numbers. DM: you may share numbers.`,
-    weather: `Give a short, informative answer; add a playful twist if the user is playful.`,
-    location: `Acknowledge and be helpful; mention our Google Maps pin in spirit (system will append real block when needed).`,
-    distance: `DO NOT quote drive time unless origin is confirmed; ask to confirm the city if unclear.`,
-    general: `Answer the user’s actual question first (even non-travel), then tie back to Roameo Resorts only if relevant.`
-  };
+async function generateReply({ intent, userText, lang, asComment, playful, enrich }) {
+  const wx = enrich?.wx ? (
+    lang === 'ur'
+      ? `درجۂ حرارت ${enrich.wx.temp}°C (محسوس ${enrich.wx.feels}°C) — ${enrich.wx.desc}`
+      : `~${enrich.wx.temp}°C (feels ${enrich.wx.feels}°C) — ${enrich.wx.desc}`
+  ) : '';
 
-  const wx = enrich?.wx ? (lang === 'ur'
-    ? `درجۂ حرارت ${enrich.wx.temp}°C (محسوس ${enrich.wx.feels}°C) — ${enrich.wx.desc}`
-    : lang === 'roman-ur'
-      ? `~${enrich.wx.temp}°C (feels ${enrich.wx.feels}°C) — ${enrich.wx.desc}`
-      : `~${enrich.wx.temp}°C (feels ${enrich.wx.feels}°C) — ${enrich.wx.desc}`) : '';
+  const needOriginConfirm = enrich?.needOriginConfirm ? (
+    lang === 'ur' ? 'کیا آپ روانگی کا شہر بتا سکتے ہیں؟ پھر ہم ڈرائیو ٹائم بتا دیں گے۔'
+    : lang === 'roman-ur' ? 'Ap apni rawangi ka shehar confirm kar dein? Phir hum drive time share kar dein ge.'
+    : 'Could you confirm your departure city? Then we’ll share drive time.'
+  ) : '';
 
-  const originNote = enrich?.needOriginConfirm ? (
-    lang === 'ur' ? 'کیا آپ اپنی روانگی کا شہر بتا سکتے ہیں؟ پھر ہم روٹ/ڈرائیو ٹائم بتا دیں گے۔'
-    : lang === 'roman-ur' ? 'Ap apni rawangi ka shehar confirm kar dein? Phir hum route/drive time de dein ge.'
-    : 'Could you confirm your departure city? Then we’ll share route/drive time.') : '';
-
-  const system = systemRules(asComment, lang);
-  const intentRules = rulesByIntent[intent] || rulesByIntent.general;
-
-  const messages = [
-    { role: 'system', content: system },
-    { role: 'user', content:
-`User text: "${userText}"
-
-Intent: ${intent}
-Extra context:
-- Weather: ${wx || 'N/A'}
-- Origin confirmation needed: ${enrich?.needOriginConfirm ? 'Yes' : 'No'}
-
-Write a unique reply (no canned lines). Do not include phone numbers or URLs.
-` }
-  ];
-
+  const system = systemRules(asComment, lang, playful);
   const headers = { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' };
   const payload = {
     model: OPENAI_MODEL,
-    temperature: 0.95,
-    top_p: 0.95,
-    presence_penalty: 0.4,
-    frequency_penalty: 0.2,
-    max_tokens: asComment ? 350 : 600,
-    messages
+    temperature: 0.98, top_p: 0.95,
+    presence_penalty: 0.4, frequency_penalty: 0.2,
+    max_tokens: asComment ? 320 : 620, // we chunk anyway; keep concise
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content:
+`User text: "${userText}"
+Intent: ${intent}
+Weather now: ${wx || 'N/A'}
+Need origin confirm: ${enrich?.needOriginConfirm ? 'Yes' : 'No'}
+Write a UNIQUE reply. No URLs or phone numbers.` }
+    ]
   };
 
   try {
     const { data } = await axios.post('https://api.openai.com/v1/chat/completions', payload, { headers, timeout: 12000 });
     let out = data?.choices?.[0]?.message?.content?.trim() || '';
-    if (asComment) out = out.replace(/\s*\n+\s*/g, ' ').trim();
+    if (asComment) out = out.replace(/\s*\n+\s*/g, '\n').trim();
     if (lang === 'roman-ur') out = out.replace(/[\u0600-\u06FF\u0750-\u077F]+/g, '').replace(/\s{2,}/g, ' ').trim();
     out = sanitizeVoice(out);
     if (asComment) out = stripPricesFromPublic(out);
+    if (needOriginConfirm) out += `\n${pick(EMOJI.tip)} ${needOriginConfirm}`;
     return out;
   } catch (e) {
     console.error('🧠 OpenAI error:', e?.response?.data || e.message);
-    if (intent === 'rates') {
-      return lang === 'ur'
-        ? 'ریٹس DM میں شیئر کرتے ہیں—تفصیل انباکس میں ملے گی۔'
-        : lang === 'roman-ur'
-          ? 'Rates DM mein share karte hain—details inbox mein milengi.'
-          : 'We’ll share rates in DM—details are on the way.';
-    }
     return lang === 'ur'
       ? 'ہم مدد کے لیے حاضر ہیں—براہِ کرم دوبارہ لکھیں۔'
       : lang === 'roman-ur'
@@ -442,17 +410,32 @@ Write a unique reply (no canned lines). Do not include phone numbers or URLs.
 }
 
 /* =========================
-   CORE DECISION FLOW
+   Decision flow
    ========================= */
+function shouldAttachCTA(intent, surface) {
+  if (surface === 'comment' && intent === 'rates') return false;
+  return true;
+}
+function attachCTA(body, intent, platform, surface) {
+  if (!shouldAttachCTA(intent, surface)) return body;
+  const compact = (body || '').trim();
+  const already = /WhatsApp:|roameoresorts\.com|wa\.me/i.test(compact);
+  if (already) return compact;
+  const cta = platform === 'instagram'
+    ? `WhatsApp: ${WHATSAPP_NUMBER} • Website: ${SITE_SHORT}`
+    : `WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`;
+  return `${compact}\n${cta}`.trim();
+}
+
 async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) {
   const t = (text || '').toLowerCase();
   const lang = detectLanguage(text);
+  const playful = isPlayful(text);
   const asComment = ctx.surface === 'comment';
 
-  // intents (booleans)
-  const wantsLocation = /\b(location|where|address|map|pin|directions?|google\s*maps|reach)\b/i.test(t);
-  const wantsRates    = isPricingIntent(text);
-  const wantsFacilities = /\b(facilit(y|ies)|amenit(y|ies)|wifi|internet|kitchen|food|meal|heater|bonfire|family|kids|parking|jeep|inverter)\b/i.test(t);
+  const wantsLocation   = /\b(location|where|address|map|pin|directions?|google\s*maps|reach)\b/i.test(t);
+  const wantsRates      = isPricingIntent(text);
+  const wantsFacilities = /\b(facilit(y|ies)|amenit(y|ies)|wifi|internet|kitchen|food|meal|heater|bonfire|family|kids|children|parking|jeep|inverter)\b/i.test(t);
   const wantsBooking    = /\b(book|booking|reserve|reservation|check[-\s]?in|checkin|check[-\s]?out|checkout|advance|payment)\b/i.test(t);
   const wantsAvail      = /\b(availability|available|dates?|calendar)\b/i.test(t);
   const wantsDistance   = /\b(distance|far|how\s*far|hours|drive|time\s*from|eta)\b/i.test(t);
@@ -471,68 +454,112 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
   if (!asComment) {
     const blocks = [];
 
-    // If user wants location, include your exact location block
-    if (wantsLocation) {
-      const locBlock = locationMessageByLang(lang);
-      // sanitize FIRST, then optionally append WA link as DM-allowed CTA
-      const cleanLoc = sanitizeVoice(locBlock);
-      blocks.push(`${cleanLoc}\n\nChat on WhatsApp: ${WHATSAPP_LINK}`);
+    if (wantsLocation) blocks.push(sanitizeVoice(locationMessageByLang(lang)) + `\n\nChat on WhatsApp: ${WHATSAPP_LINK}`);
+    if (wantsRates)    blocks.push(await dmPriceMessage(text)); // Urdu/Roman/EN auto inside
+
+    if (blocks.length > 0) return blocks; // return array for batched send
+
+    // Compose unique DM (non-special cases)
+    let wx = null;
+    if ((wantsWeather || wantsLocation || wantsBooking || wantsRates) && FACTS.resort_coords.includes(',')) {
+      const [lat, lon] = FACTS.resort_coords.split(',').map(s => s.trim());
+      wx = await currentWeather(parseFloat(lat), parseFloat(lon));
     }
+    const needOriginConfirm = wantsDistance && !/\bfrom\s+[a-z][a-z\s\-']{2,}/i.test(t);
 
-    // If user wants rates (rent/rental/kiraya), include full DM pricing
-    if (wantsRates) blocks.push(await dmPriceMessage(text));
+    let body = await generateReply({
+      intent: primaryIntent, userText: text, lang, asComment: false, playful,
+      enrich: { wx, needOriginConfirm }
+    });
 
-    // If neither flagged, fall back to unique GPT reply (helpful first, then Roameo)
-    if (blocks.length === 0) {
-      const body = await generateReply({
-        intent: primaryIntent, userText: text, lang, asComment: false, enrich: {}
-      });
-      // Gentle CTA in DMs only when useful
-      const withCTA = shouldAttachCTA(primaryIntent, 'dm') ? `${body}\n\nChat on WhatsApp: ${WHATSAPP_LINK}` : body;
-      return withCTA;
-    }
-
-    return blocks.join('\n\n');
+    if (shouldAttachCTA(primaryIntent, 'dm')) body += `\n\nChat on WhatsApp: ${WHATSAPP_LINK}`;
+    return body; // string
   }
 
   // === COMMENTS ===
-  // Price comments → fixed short nudge (NO CTA, NO numbers)
-  if (asComment && wantsRates) {
-    return priceNudgePublic(lang);
-  }
+  if (asComment && wantsRates) return priceNudgePublic(lang);
 
-  // Other comments → generate unique reply, then attach CTA where it makes sense
-  // Enrichment (weather when helpful)
   let wx = null;
   if ((wantsWeather || wantsLocation || wantsBooking || wantsRates) && FACTS.resort_coords.includes(',')) {
     const [lat, lon] = FACTS.resort_coords.split(',').map(s => s.trim());
     wx = await currentWeather(parseFloat(lat), parseFloat(lon));
   }
-
-  // Distance: require origin confirm
   const needOriginConfirm = wantsDistance && !/\bfrom\s+[a-z][a-z\s\-']{2,}/i.test(t);
 
   let body = await generateReply({
-    intent: primaryIntent, userText: text, lang, asComment: true,
+    intent: primaryIntent, userText: text, lang, asComment: true, playful,
     enrich: { wx, needOriginConfirm }
   });
 
-  // For location comments, also include the maps link upfront
   if (wantsLocation) {
     const locLine = (lang === 'ur')
       ? `لوکیشن لنک: ${MAPS_LINK}`
       : (lang === 'roman-ur')
         ? `Location link: ${MAPS_LINK}`
         : `Location link: ${MAPS_LINK}`;
-    body = `${locLine} — ${body}`;
+    body = `${locLine}\n${body}`;
   }
 
   const withCTA = attachCTA(body, primaryIntent, ctx.platform === 'instagram' ? 'instagram' : 'facebook', 'comment');
-  return withCTA;
+  return trimForComment(withCTA, MAX_OUT_CHAR); // keep public short & scannable
 }
 
 /* =========================
-   WEBHOOKS
+   DM price message — Urdu / Roman-Urdu / English
+   ========================= */
+function formatRatesEN() {
+  const r = FACTS.rates;
+  return `Deluxe Hut — PKR ${r.deluxe.base.toLocaleString()}
+• 1st Night 10% → PKR ${r.deluxe.n1.toLocaleString()}
+• 2nd Night 15% → PKR ${r.deluxe.n2.toLocaleString()}
+• 3rd Night 20% → PKR ${r.deluxe.n3.toLocaleString()}
+
+Executive Hut — PKR ${r.executive.base.toLocaleString()}
+• 1st Night 10% → PKR ${r.executive.n1.toLocaleString()}
+• 2nd Night 15% → PKR ${r.executive.n2.toLocaleString()}
+• 3rd Night 20% → PKR ${r.executive.n3.toLocaleString()}`;
+}
+function formatRatesRoman() {
+  const r = FACTS.rates;
+  return `Deluxe Hut — PKR ${r.deluxe.base.toLocaleString()}
+• 1st Night 10% → PKR ${r.deluxe.n1.toLocaleString()}
+• 2nd Night 15% → PKR ${r.deluxe.n2.toLocaleString()}
+• 3rd Night 20% → PKR ${r.deluxe.n3.toLocaleString()}
+
+Executive Hut — PKR ${r.executive.base.toLocaleString()}
+• 1st Night 10% → PKR ${r.executive.n1.toLocaleString()}
+• 2nd Night 15% → PKR ${r.executive.n2.toLocaleString()}
+• 3rd Night 20% → PKR ${r.executive.n3.toLocaleString()}`;
+}
+function formatRatesUrdu() {
+  const r = FACTS.rates;
+  return `ڈیلکس ہٹ — PKR ${r.deluxe.base.toLocaleString()}
+• پہلی رات 10% → PKR ${r.deluxe.n1.toLocaleString()}
+• دوسری رات 15% → PKR ${r.deluxe.n2.toLocaleString()}
+• تیسری رات 20% → PKR ${r.deluxe.n3.toLocaleString()}
+
+ایگزیکٹو ہٹ — PKR ${r.executive.base.toLocaleString()}
+• پہلی رات 10% → PKR ${r.executive.n1.toLocaleString()}
+• دوسری رات 15% → PKR ${r.executive.n2.toLocaleString()}
+• تیسری رات 20% → PKR ${r.executive.n3.toLocaleString()}`;
+}
+async function dmPriceMessage(userText = '') {
+  const lang = detectLanguage(userText);
+  let body;
+  if (lang === 'ur') {
+    body = `💚 خوشخبری — ڈسکاؤنٹڈ قیمتیں آپ کے لیے! ✨\n\n${formatRatesUrdu()}\n\nشرائط: ٹیکس شامل • چار مہمانوں کے لیے ناشتہ شامل • کنفرمیشن کے لیے 50% ایڈوانس۔\nدستیابی/بکنگ: ${SITE_URL}`;
+  } else if (lang === 'roman-ur') {
+    body = `💚 Good news — discounted prices for you! ✨\n\n${formatRatesRoman()}\n\nT&Cs: taxes included • breakfast for 4 • 50% advance to confirm.\nAvailability/book: ${SITE_URL}`;
+  } else {
+    body = `💚 Good news — discounted prices for you! ✨\n\n${formatRatesEN()}\n\nT&Cs: taxes included • breakfast for 4 • 50% advance to confirm.\nAvailability/book: ${SITE_URL}`;
+  }
+  body = sanitizeVoice(body);
+  body += `\n\nChat on WhatsApp: ${WHATSAPP_LINK}`;
+  return body;
+}
+
+/* =========================
+   WEBHOOKS & ROUTERS
    ========================= */
 app.post('/webhook', async (req, res) => {
   if (!verifySignature(req)) return res.sendStatus(403);
@@ -546,14 +573,10 @@ app.post('/webhook', async (req, res) => {
         if (dedupe.has(key)) continue; dedupe.set(key, true);
 
         if (Array.isArray(entry.messaging)) {
-          for (const ev of entry.messaging) {
-            await routeMessengerEvent(ev, { source: 'messaging' }).catch(logErr);
-          }
+          for (const ev of entry.messaging) await routeMessengerEvent(ev, { source: 'messaging' }).catch(logErr);
         }
         if (Array.isArray(entry.changes)) {
-          for (const change of entry.changes) {
-            await routePageChange(change).catch(logErr);
-          }
+          for (const change of entry.changes) await routePageChange(change).catch(logErr);
         }
         if (Array.isArray(entry.standby)) {
           for (const ev of entry.standby) {
@@ -568,7 +591,7 @@ app.post('/webhook', async (req, res) => {
 
     if (body.object === 'instagram') {
       for (const entry of (body.entry || [])) {
-        const pageId = entry.id; // for private replies
+        const pageId = entry.id;
         const key = `ig:${entry.id}:${entry.time || Date.now()}`;
         if (dedupe.has(key)) continue; dedupe.set(key, true);
 
@@ -581,8 +604,6 @@ app.post('/webhook', async (req, res) => {
       }
       return;
     }
-
-    console.log('📦 UNKNOWN OBJECT:', JSON.stringify(body));
   } catch (e) { logErr(e); }
 });
 
@@ -610,13 +631,17 @@ async function routeMessengerEvent(event, ctx = { source: 'messaging' }) {
    ========================= */
 async function replyToFacebookComment(commentId, message) {
   const url = `https://graph.facebook.com/v19.0/${commentId}/comments`;
-  await axios.post(url, { message }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
+  await axios.post(url, { message: trimForComment(message) }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
 }
 async function fbPrivateReplyToComment(commentId, message) {
   const url = `https://graph.facebook.com/v19.0/${commentId}/private_replies`;
-  await axios.post(url, { message }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
+  await axios.post(url, { message: splitToChunks(message)[0] }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
 }
-
+function isSelfComment(v = {}, platform = 'facebook') {
+  const from = v.from || {};
+  if (platform === 'instagram') return from.username && from.username.toLowerCase() === BRAND_USERNAME.toLowerCase();
+  return (from.name || '').toLowerCase().includes('roameo');
+}
 async function routePageChange(change) {
   if (change.field !== 'feed') return;
   const v = change.value || {};
@@ -627,15 +652,10 @@ async function routePageChange(change) {
 
     if (AUTO_REPLY_ENABLED) {
       if (isPricingIntent(text)) {
-        try {
-          const dm = await dmPriceMessage(text);
-          await fbPrivateReplyToComment(v.comment_id, dm);
-        } catch (e) { logErr(e); }
-        const pub = priceNudgePublic(detectLanguage(text)); // NO CTA, no numbers
-        await replyToFacebookComment(v.comment_id, pub);
+        try { await fbPrivateReplyToComment(v.comment_id, await dmPriceMessage(text)); } catch (e) { logErr(e); }
+        await replyToFacebookComment(v.comment_id, priceNudgePublic(detectLanguage(text)));
         return;
       }
-
       const reply = await decideReply(text, { surface: 'comment', platform: 'facebook' });
       await replyToFacebookComment(v.comment_id, reply);
     }
@@ -652,22 +672,19 @@ async function routeInstagramMessage(event) {
     return handleTextMessage(igUserId, event.message.text || '', { channel: 'instagram' });
   }
 }
-
 async function replyToInstagramComment(commentId, message) {
   const url = `https://graph.facebook.com/v19.0/${commentId}/replies`;
-  await axios.post(url, { message }, { params: { access_token: IG_MANAGE_TOKEN }, timeout: 10000 });
+  await axios.post(url, { message: trimForComment(message) }, { params: { access_token: IG_MANAGE_TOKEN }, timeout: 10000 });
 }
 async function igPrivateReplyToComment(pageId, commentId, message) {
   const url = `https://graph.facebook.com/v19.0/${pageId}/messages`;
   const params = { access_token: IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN };
-  const payload = { recipient: { comment_id: commentId }, message: { text: message } };
+  const payload = { recipient: { comment_id: commentId }, message: { text: splitToChunks(message)[0] } };
   await axios.post(url, payload, { params, timeout: 10000 });
 }
-
 async function routeInstagramChange(change, pageId) {
   const v = change.value || {};
-  const theField = change.field || '';
-  const isComment = theField === 'comments' || theField.toLowerCase().includes('comment') || (v.item === 'comment');
+  const isComment = (change.field || '').toLowerCase().includes('comment') || (v.item === 'comment');
   if (isComment && (v.comment_id || v.id)) {
     const commentId = v.comment_id || v.id;
     const text = (v.text || v.message || '').trim();
@@ -676,15 +693,10 @@ async function routeInstagramChange(change, pageId) {
 
     if (AUTO_REPLY_ENABLED) {
       if (isPricingIntent(text)) {
-        try {
-          const dm = await dmPriceMessage(text);
-          await igPrivateReplyToComment(pageId, commentId, dm);
-        } catch (e) { logErr(e); }
-        const pub = priceNudgePublic(detectLanguage(text)); // NO CTA, no numbers
-        await replyToInstagramComment(commentId, pub);
+        try { await igPrivateReplyToComment(pageId, commentId, await dmPriceMessage(text)); } catch (e) { logErr(e); }
+        await replyToInstagramComment(commentId, priceNudgePublic(detectLanguage(text)));
         return;
       }
-
       const reply = await decideReply(text, { surface: 'comment', platform: 'instagram' });
       await replyToInstagramComment(commentId, reply);
     }
@@ -713,8 +725,7 @@ async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
       : lang === 'roman-ur'
         ? `Great! Apni *dates* aur *guests ki tadaad* bata dein. Chahein to *kis shehar se aa rahe hain* bhi likh dein.`
         : `Awesome! Please share your *travel dates* and *number of guests*. Also tell us *which city you’ll start from*.`;
-    await sendText(psid, msg);
-    return;
+    return sendBatched(psid, msg);
   }
 
   if (state === 'awaiting_details') {
@@ -724,45 +735,14 @@ async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
       : lang === 'roman-ur'
         ? `Shukriya! Booking ki tasdeeq ke liye website use karein: ${SITE_URL}`
         : `Thanks! To confirm your booking, please use: ${SITE_URL}`;
-    await sendText(psid, msg);
+    await sendBatched(psid, msg);
   }
 
   if (!AUTO_REPLY_ENABLED) return;
   const reply = await decideReply(text, { surface: 'dm', platform: opts.channel === 'instagram' ? 'instagram' : 'facebook' });
-  await sendText(psid, reply);
-}
 
-/* =========================
-   DM Price message (numbers allowed)
-   ========================= */
-function formatRates() {
-  const r = FACTS.rates;
-  return `Deluxe Hut — PKR ${r.deluxe.base.toLocaleString()}
-• 1st Night 10% → PKR ${r.deluxe.n1.toLocaleString()}
-• 2nd Night 15% → PKR ${r.deluxe.n2.toLocaleString()}
-• 3rd Night 20% → PKR ${r.deluxe.n3.toLocaleString()}
-
-Executive Hut — PKR ${r.executive.base.toLocaleString()}
-• 1st Night 10% → PKR ${r.executive.n1.toLocaleString()}
-• 2nd Night 15% → PKR ${r.executive.n2.toLocaleString()}
-• 3rd Night 20% → PKR ${r.executive.n3.toLocaleString()}`;
-}
-
-async function dmPriceMessage(userText = '') {
-  const lang = detectLanguage(userText);
-  const hook = lang === 'ur'
-    ? 'خوشخبری—ڈسکاؤنٹڈ قیمتیں آپ کے لیے!'
-    : lang === 'roman-ur'
-      ? 'Good news—discounted prices for you!'
-      : 'Good news—discounted prices for you!';
-
-  const body = `${hook}\n\n${formatRates()}
-
-T&Cs: taxes included • breakfast for 4 • 50% advance to confirm.
-Availability/book: ${SITE_URL}`;
-
-  const clean = sanitizeVoice(body); // sanitize first, then append WA link
-  return `${clean}\n\nChat on WhatsApp: ${WHATSAPP_LINK}`;
+  // reply may be an array (multiple blocks) or a single string
+  await sendBatched(psid, reply);
 }
 
 /* =========================
@@ -794,7 +774,6 @@ function requireAdmin(req, res, next) {
   if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) return res.status(401).json({ error: 'unauthorized' });
   next();
 }
-
 app.post('/admin/subscribe', requireAdmin, async (_req, res) => {
   const subscribed_fields = ['messages','messaging_postbacks','messaging_optins','message_deliveries','message_reads','feed'];
   try {
@@ -806,7 +785,6 @@ app.post('/admin/subscribe', requireAdmin, async (_req, res) => {
     res.status(500).json({ ok: false, error: e?.response?.data || e.message });
   }
 });
-
 app.get('/admin/status', requireAdmin, async (_req, res) => {
   try {
     const url = `https://graph.facebook.com/v19.0/me/subscribed_apps`;
