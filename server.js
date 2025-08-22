@@ -1,9 +1,9 @@
 // server.js — Roameo Resorts omni-channel bot (AI-first, intent-aware)
 // FB DMs + FB comments + IG DMs + IG comments
-// Unique GPT replies (EN/Urdu/Roman-Ur) + humor-aware + Weather (OpenWeather) + Distance/ETA (Geoapify)
-// PUBLIC PRICES: FORBIDDEN. Pricing → DM with numbers.
+// Unique GPT replies (EN/Urdu/Roman-Ur) + humor + Weather (OpenWeather) + ETA (Geoapify)
+// PUBLIC PRICES: FORBIDDEN. Pricing → DM with numbers (+ fresh hook).
 // WhatsApp rules: IG comments = number only; FB comments = link OK; DMs = link OK.
-// CTAs are intent-aware (not always). No “Shall we pencil you in?” ever.
+// CTAs are intent-aware (not always). Never say “Shall we pencil you in?”.
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -149,34 +149,43 @@ function isSelfComment(v = {}, platform = 'facebook') {
   return false;
 }
 
-// IG trims very early; clamp so CTA survives
+function charLen(s) { return Array.from((s || '')).length; }
+
+// IG truncates quickly; clamp so body (and CTA if any) always fits
 function clampForPlatform(text = '', platform = 'instagram') {
-  const MAX = platform === 'instagram' ? 240 : 320;
-  const s = (text || '').replace(/\s{2,}/g, ' ').trim();
-  return s.length > MAX ? s.slice(0, MAX - 1) + '…' : s;
+  const MAX = platform === 'instagram' ? 220 : 320; // conservative to avoid “see more…”
+  let s = (text || '').replace(/\s{2,}/g, ' ').trim();
+  if (charLen(s) > MAX) s = Array.from(s).slice(0, MAX - 1).join('') + '…';
+  return s;
 }
 
-// Add CTA only when it makes sense, and never duplicate
-function shouldAttachCTA(intent) {
-  // Attach CTA for these intents; skip for jokes/off-topic/general factoids unless travel-related
-  return ['rates', 'booking', 'availability', 'location', 'facilities', 'distance', 'weather'].includes(intent);
+// CTA policy — DO NOT add CTA for price comments (per your rule)
+function shouldAttachCTA(intent, surface) {
+  if (surface === 'comment' && intent === 'rates') return false; // << no CTA for price comments
+  return ['booking','availability','location','facilities','distance','weather','rates'].includes(intent);
 }
 
-function attachCTA(body, intent, platform) {
-  let compact = (body || '').replace(/\s*\n+\s*/g, ' ').trim();
+function attachCTA(body, intent, platform, surface) {
+  if (!shouldAttachCTA(intent, surface)) return clampForPlatform(body, platform);
+
+  const compact = (body || '').replace(/\s*\n+\s*/g, ' ').trim();
   const already = /WhatsApp:|roameoresorts\.com/i.test(compact);
-  if (!shouldAttachCTA(intent) || already) return clampForPlatform(compact, platform);
+  if (already) return clampForPlatform(compact, platform);
 
   const cta = platform === 'instagram'
     ? `WhatsApp: ${WHATSAPP_NUMBER} • Website: ${SITE_SHORT}`
     : `WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`;
 
-  // keep body short to avoid clipping CTA
-  const MAX = platform === 'instagram' ? 240 : 320;
+  // Keep body short so CTA doesn't get cut off
+  const MAX = platform === 'instagram' ? 220 : 320;
   const sep = compact ? '\n' : '';
-  const roomForBody = MAX - cta.length - sep.length;
-  if (roomForBody > 0 && compact.length > roomForBody) compact = compact.slice(0, roomForBody - 1) + '…';
-  return `${compact}${sep}${cta}`.trim();
+  const roomForBody = MAX - charLen(cta) - charLen(sep) - 2; // extra buffer
+  const trimmedBody = charLen(compact) > roomForBody
+    ? Array.from(compact).slice(0, Math.max(0, roomForBody - 1)).join('') + '…'
+    : compact;
+
+  const finalMsg = `${trimmedBody}${sep}${cta}`.trim();
+  return clampForPlatform(finalMsg, platform); // final safety clamp
 }
 
 function sanitizeVoice(text = '') {
@@ -194,7 +203,6 @@ function sanitizeVoice(text = '') {
 }
 
 function stripPricesFromPublic(text = '') {
-  // Remove any money-like info from comments
   const lines = (text || '').split(/\r?\n/).filter(Boolean).filter(l => {
     const s = l.toLowerCase();
     const hasCurrency = /(?:pkr|rs\.?|rupees|price|prices|rate|rates|tariff|per\s*night)/i.test(s);
@@ -214,7 +222,7 @@ function detectLanguage(text = '') {
     /\b(aap|ap|apka|apki|apke|tum|tm|bhai|plz|pls)\b/i,
     /\b(kia|kya|kyun|kyon|kaise|kese|krna|karna|krdo|kardo|raha|rha|rhe|rahe|gi|ga|hain|hy|hai)\b/i,
     /\b(mein|mai|mujhe|yahan|wahan|acha|accha|bohat|bahut)\b/i,
-    /\b(kitna|kitni|din|rat|room|booking|rate|price|mausam)\b/i
+    /\b(kitna|kitni|din|rat|room|booking|rate|price|mausam|weather)\b/i
   ].reduce((a, rx) => a + (rx.test(t) ? 1 : 0), 0);
 
   const englishHits = [/\b(the|and|is|are|you|we|from|how|where|price|rate|book|available|distance|weather)\b/i]
@@ -286,6 +294,41 @@ async function currentWeather(lat, lon) {
 }
 
 /* =========================
+   PRICE NUDGE (comments only, NO CTA)
+   ========================= */
+const HOOKS = {
+  en: [
+    'discounted prices inside!',
+    'special launch discounts await!',
+    'exclusive DM-only deals!',
+    'limited-time savings available!',
+    'bundle discounts for 2+ nights!'
+  ],
+  'roman-ur': [
+    'discounted prices andar!',
+    'launch discounts ready!',
+    'DM-only deals tayyar!',
+    'limited-time bachat!',
+    '2+ nights par extra off!'
+  ],
+  ur: [
+    'ڈسکاؤنٹڈ قیمتیں دستیاب!',
+    'لانچ ڈسکاؤنٹس آپ کے لیے!',
+    'DM پر خصوصی آفرز!',
+    'محدود وقت کی بچت!',
+    'دو راتوں سے زائد پر مزید رعایت!'
+  ]
+};
+
+function priceNudgePublic(lang = 'en') {
+  const arr = HOOKS[lang] || HOOKS.en;
+  const hook = arr[Math.floor(Math.random() * arr.length)];
+  if (lang === 'ur') return `براہِ کرم ریٹس کے لیے DM کریں — ${hook}`;
+  if (lang === 'roman-ur') return `Rates ke liye DM karein — ${hook}`;
+  return `Please DM us for rates — ${hook}`;
+}
+
+/* =========================
    OPENAI — UNIQUE REPLIES
    ========================= */
 function systemRules(asComment, lang) {
@@ -293,18 +336,18 @@ function systemRules(asComment, lang) {
   const langGuide = lang === 'ur'
     ? 'Write in fluent Urdu script. No romanization.'
     : lang === 'roman-ur'
-      ? 'Write in natural Roman Urdu (ASCII letters only, no Urdu script).'
+      ? 'Write in natural Roman Urdu (ASCII letters only).'
       : 'Write in natural English.';
   return `
 You are Roameo Resorts' assistant in Tehjian Valley (by the Neelam River).
 - Match the user's language. ${langGuide}
-- Answer-first (even if the topic is general science etc.), then bridge naturally to Roameo Resorts if appropriate.
+- Answer-first (even if general science), then bridge naturally to Roameo Resorts if appropriate.
 - Humor-aware: if the user is playful, use light wit; otherwise be clear and warm.
 - Voice: never use first-person singular. Use “we/us/our team”.
 - Public price policy: NEVER post numeric prices/discounts in comments.
 - Availability: never claim availability; direct users to the website.
-- Keep ${surface} replies concise. Prefer one compact paragraph.
-- Do NOT include links or phone numbers; the system will add CTA when appropriate.
+- Keep ${surface} replies concise (<=1 short paragraph).
+- Do NOT include links or phone numbers; system adds CTA when appropriate.
 - BAN the phrase “Shall we pencil you in?”.
 `.trim();
 }
@@ -312,22 +355,22 @@ You are Roameo Resorts' assistant in Tehjian Valley (by the Neelam River).
 async function generateReply({ intent, userText, lang, asComment, enrich }) {
   const rulesByIntent = {
     rates: `
-- Public: say prices are shared privately (DM/WhatsApp), no numbers. Add a short enticing HOOK line (fresh each time) but no links.
-- DM: you may summarize rates if asked.
+- Public: say prices are shared privately (DM), no numbers. Keep it short with a subtle hook. (System will override with a fixed nudge if needed.)
+- DM: you may share numbers.
 `.trim(),
     weather: `
 - Give a short, informative answer; add a playful twist if user is playful.
 - If weather data provided, weave it in naturally.
 `.trim(),
     location: `
-- Provide clear directions info; reference Google Maps pin generally.
+- Provide clear directions info; mention Google Maps pin generally.
 `.trim(),
     distance: `
 - DO NOT quote drive time unless origin is confirmed. Ask to confirm the city if unclear.
 `.trim(),
     general: `
 - Directly answer the question first (even if it's not about travel).
-- Then, only if relevant, mention how Roameo Resorts fits (riverside huts, comfort, directions help).
+- Then, only if relevant, connect to Roameo Resorts naturally.
 `.trim()
   };
 
@@ -355,7 +398,7 @@ Extra context:
 - Weather: ${wx || 'N/A'}
 - Origin confirmation needed: ${enrich?.needOriginConfirm ? 'Yes' : 'No'}
 
-Write a unique reply within ~220 characters if public, ~450 if DM.
+Write a unique reply within ~180 chars if public, ~420 if DM.
 Make it feel human and local to Roameo Resorts in Tehjian Valley, by the Neelam River.
 ${originNote ? `If origin not confirmed, politely ask: "${originNote}".` : ''}
 Rules for this intent:
@@ -369,29 +412,26 @@ ${intentRules}`}
     top_p: 0.95,
     presence_penalty: 0.4,
     frequency_penalty: 0.2,
-    max_tokens: asComment ? 180 : 320,
+    max_tokens: asComment ? 160 : 320,
     messages
   };
 
   try {
     const { data } = await axios.post('https://api.openai.com/v1/chat/completions', payload, { headers, timeout: 12000 });
     let out = data?.choices?.[0]?.message?.content?.trim() || '';
-    // One-line compact for comments
     if (asComment) out = out.replace(/\s*\n+\s*/g, ' ').trim();
-    // Roman-Urdu guard: remove Urdu script if LLM slips
     if (lang === 'roman-ur') out = out.replace(/[\u0600-\u06FF\u0750-\u077F]+/g, '').replace(/\s{2,}/g, ' ').trim();
     out = sanitizeVoice(out);
     if (asComment) out = stripPricesFromPublic(out);
     return out;
   } catch (e) {
     console.error('🧠 OpenAI error:', e?.response?.data || e.message);
-    // Minimal graceful fallback
     if (intent === 'rates') {
       return lang === 'ur'
-        ? 'قیمتیں DM میں شیئر کرتے ہیں—تھوڑی دیر میں آپ کے انباکس میں تفصیل ہوگی۔'
+        ? 'ریٹس DM میں شیئر کرتے ہیں—تفصیل انباکس میں ملے گی۔'
         : lang === 'roman-ur'
-          ? 'Prices DM mein share karte hain—thori dair mein details aapke inbox mein.'
-          : 'We’ll share prices in DM—details landing in your inbox shortly.';
+          ? 'Rates DM mein share karte hain—details inbox mein milengi.'
+          : 'We’ll share rates in DM—details are on the way.';
     }
     return lang === 'ur'
       ? 'ہم مدد کے لیے حاضر ہیں—براہِ کرم دوبارہ لکھیں۔'
@@ -416,9 +456,14 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
     if (/\b(book|booking|reserve|reservation|check[-\s]?in|checkin|check[-\s]?out|checkout|advance|payment)\b/i.test(t)) return 'booking';
     if (/\b(availability|available|dates?|calendar)\b/i.test(t)) return 'availability';
     if (/\b(distance|far|how\s*far|hours|drive|time\s*from|eta)\b/i.test(t)) return 'distance';
-    if (/\b(weather|temperature|cold|hot|forecast|rain|mausam)\b/i.test(t)) return 'weather';
+    if (/\b(weather|temperature|cold|hot|forecast|rain|mausam|kaysa|kaisa)\b/i.test(t)) return 'weather';
     return 'general';
   })();
+
+  // If DM + rates → send full DM price message (numbers allowed)
+  if (!asComment && intent === 'rates') {
+    return await dmPriceMessage(text);
+  }
 
   // Distance: require origin confirmation
   let needOriginConfirm = false;
@@ -434,20 +479,26 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
     wx = await currentWeather(parseFloat(lat), parseFloat(lon));
   }
 
+  // If COMMENT + rates → fixed short nudge (no CTA)
+  if (asComment && intent === 'rates') {
+    return priceNudgePublic(lang); // super short, strong hook, NO CTA
+  }
+
+  // Otherwise generate a unique reply
   const body = await generateReply({
     intent, userText: text, lang, asComment,
     enrich: { wx, needOriginConfirm }
   });
 
   if (asComment) {
-    // Public reply composition with platform-specific CTA logic
-    const withCTA = attachCTA(body, intent, ctx.platform === 'instagram' ? 'instagram' : 'facebook');
+    // Public reply with platform-specific CTA logic (skips for price comments)
+    const withCTA = attachCTA(body, intent, ctx.platform === 'instagram' ? 'instagram' : 'facebook', 'comment');
     return withCTA;
   }
 
-  // DM — we can attach WA link gently
+  // DM — gentle WA link if helpful (not needed for rates; handled above)
   let dm = sanitizeVoice(body);
-  if (WHATSAPP_LINK && shouldAttachCTA(intent)) dm += `\n\nChat on WhatsApp: ${WHATSAPP_LINK}`;
+  if (WHATSAPP_LINK && shouldAttachCTA(intent, 'dm')) dm += `\n\nChat on WhatsApp: ${WHATSAPP_LINK}`;
   return dm;
 }
 
@@ -546,18 +597,17 @@ async function routePageChange(change) {
     if (isSelfComment(v, 'facebook')) return;
 
     if (AUTO_REPLY_ENABLED) {
-      // Pricing in comments → DM with numbers + concise public nudge
       if (isPricingIntent(text)) {
         try {
           const dm = await dmPriceMessage(text);
           await fbPrivateReplyToComment(v.comment_id, dm);
         } catch (e) { logErr(e); }
-        const pub = clampForPlatform(await decideReply(text, { surface: 'comment', platform: 'facebook' }), 'facebook');
+        const pub = clampForPlatform(priceNudgePublic(detectLanguage(text)), 'facebook'); // NO CTA
         await replyToFacebookComment(v.comment_id, pub);
         return;
       }
 
-      const reply = clampForPlatform(await decideReply(text, { surface: 'comment', platform: 'facebook' }), 'facebook');
+      const reply = attachCTA(await decideReply(text, { surface: 'comment', platform: 'facebook' }), 'general', 'facebook', 'comment');
       await replyToFacebookComment(v.comment_id, reply);
     }
   }
@@ -601,12 +651,12 @@ async function routeInstagramChange(change, pageId) {
           const dm = await dmPriceMessage(text);
           await igPrivateReplyToComment(pageId, commentId, dm);
         } catch (e) { logErr(e); }
-        const pub = clampForPlatform(await decideReply(text, { surface: 'comment', platform: 'instagram' }), 'instagram');
+        const pub = clampForPlatform(priceNudgePublic(detectLanguage(text)), 'instagram'); // NO CTA
         await replyToInstagramComment(commentId, pub);
         return;
       }
 
-      const reply = clampForPlatform(await decideReply(text, { surface: 'comment', platform: 'instagram' }), 'instagram');
+      const reply = attachCTA(await decideReply(text, { surface: 'comment', platform: 'instagram' }), 'general', 'instagram', 'comment');
       await replyToInstagramComment(commentId, reply);
     }
   }
@@ -672,10 +722,10 @@ Executive Hut — PKR ${r.executive.base.toLocaleString()}
 async function dmPriceMessage(userText = '') {
   const lang = detectLanguage(userText);
   const hook = lang === 'ur'
-    ? 'خوشخبری—آپ کے لیے بہترین پیکیجز!'
+    ? 'خوشخبری—ڈسکاؤنٹڈ قیمتیں آپ کے لیے!'
     : lang === 'roman-ur'
-      ? 'Good news—aap ke liye behtareen packages!'
-      : 'Good news—great packages for you!';
+      ? 'Good news—discounted prices for you!'
+      : 'Good news—discounted prices for you!';
 
   const body = `${hook}\n\n${formatRates()}
 
