@@ -268,14 +268,13 @@ function enforceIntent(
   surface,               // 'comment' | 'dm'
   platform,              // 'instagram' | 'facebook'
   lang,                  // 'en' | 'ur' | 'roman-ur'
-  contact                // already prepared by caller (either number or wa.me link)
+  contact                // string: either IG number or wa.me link
 ) {
-  const BRAND = FACTS.brand || 'Roameo Resorts';
+  const BRAND = 'Roameo Resorts'; // or FACTS.brand if you have it in scope
 
   // Helpers for language-matched strings
   const L = {
     pricing_comment() {
-      // Public comments must *not* show numeric prices. CTA varies by platform.
       if (lang === 'ur') {
         return `اس وقت رعایتی قیمتیں لاگو ہیں — براہِ کرم ہمیں DM کریں تاکہ ہم آپ کے ساتھ تفصیل فوراً شیئر کر سکیں۔`;
       }
@@ -285,37 +284,35 @@ function enforceIntent(
       return `Discounted prices are live — please DM us and we’ll share the details right away.`;
     },
     pricing_dm() {
-      // DM can mention that these are discounted prices (numerics can come from your GPT branch if you choose)
       if (lang === 'ur') {
-        return `یہ رعایتی قیمتیں ہیں۔ اگر چاہیں تو ہم آپ کو اختیار کے مطابق ہٹ کی اقسام اور تاریخوں کی رہنمائی بھی کر دیں گے۔ مزید مدد یا بکنگ کے لیے رابطہ: ${contact}\nWebsite: ${SITE_URL}`;
+        return `یہ رعایتی قیمتیں ہیں۔ اگر چاہیں تو ہم ہٹ کی اقسام اور تاریخوں پر رہنمائی بھی کر دیں گے۔ مزید مدد یا بکنگ کے لیے رابطہ: ${contact}\nWebsite: ${SITE_URL}`;
       }
       if (lang === 'roman-ur') {
-        return `Yeh discounted prices hain. Agar chahein to hum aap ki dates aur hut selection mein bhi madad kar dein ge. Madad/booking ke liye rabta: ${contact}\nWebsite: ${SITE_URL}`;
+        return `Yeh discounted prices hain. Hum dates aur hut selection mein bhi madad kar sakte hain. Madad/booking ke liye rabta: ${contact}\nWebsite: ${SITE_URL}`;
       }
       return `These are discounted prices. We can also help you pick the right hut and dates. For help/booking: ${contact}\nWebsite: ${SITE_URL}`;
     },
     road_comment() {
-      // Concise public answer about conditions, *no recursion*
       if (lang === 'ur') {
-        return `${BRAND} تک سڑکیں عموماً کھلی اور کارپٹڈ ہوتی ہیں۔ ریزورٹ کے قریب ایک چھوٹا سا واٹر کراسنگ ہے؛ بزرگ مہمانوں کے لیے ہماری 4×4 مدد دستیاب ہے۔ بارش/سلائیڈز کے بعد تازہ صورتحال کے لیے براہِ کرم ہم سے رابطہ کریں: ${contact}`;
+        return `${BRAND} تک سڑکیں عموماً کھلی اور کارپٹڈ ہوتی ہیں۔ ریزورٹ کے قریب ایک چھوٹا سا واٹر کراسنگ ہے؛ بزرگ مہمانوں کے لیے ہماری 4×4 مدد دستیاب ہے۔ بارش/سلائیڈز کے بعد تازہ صورتحال کے لیے براہِ کرم رابطہ کریں: ${contact}`;
       }
       if (lang === 'roman-ur') {
         return `Roads to ${BRAND} aam tor par open aur fully carpeted hoti hain. Resort ke qareeb chhota sa water crossing hai; barha se mehmaanon ke liye 4×4 assist milti hai. Heavy rain/landslide ke baad latest update ke liye rabta karein: ${contact}`;
       }
-      return `Roads to ${BRAND} are generally open and fully carpeted. Near the resort there’s a small water crossing; our team provides 4×4 assist for elderly guests. After heavy rain/landslides, please contact us for a quick status update: ${contact}`;
+      return `Roads to ${BRAND} are generally open and fully carpeted. Near the resort there’s a small water crossing; our team provides 4×4 assist for elderly guests. After heavy rain/landslides, please contact us for the latest status: ${contact}`;
     },
     availability_any() {
       if (lang === 'ur') {
-        return `دستیابی/بکنگ کے لیے ہم WhatsApp/کال پر مدد کر دیں گے: ${contact} — یا آپ ہماری ویب سائٹ بھی دیکھ سکتے ہیں: ${SITE_URL}`;
+        return `دستیابی/بکنگ کے لیے WhatsApp/کال پر مدد حاضر ہے: ${contact} — یا ویب سائٹ ملاحظہ کریں: ${SITE_URL}`;
       }
       if (lang === 'roman-ur') {
-        return `Availability/booking ke liye hum WhatsApp/call par madad kar dein ge: ${contact} — ya aap website bhi dekh sakte hain: ${SITE_URL}`;
+        return `Availability/booking ke liye WhatsApp/call par madad haazir hai: ${contact} — ya website dekh lein: ${SITE_URL}`;
       }
-      return `For availability/booking, we can assist on WhatsApp/call: ${contact} — or you can also use our website: ${SITE_URL}`;
+      return `For availability/booking, message or call us: ${contact} — or use our website: ${SITE_URL}`;
     },
     influencer_dm() {
       if (lang === 'ur') {
-        return `کولیب یا پارٹنرشپ کے لیے براہِ کرم اسی نمبر پر رابطہ کریں: ${contact} — ہماری ٹیم جلد جواب دے گی۔`;
+        return `کولیب/پارٹنرشپ کے لیے براہِ کرم اسی نمبر پر رابطہ کریں: ${contact} — ہماری ٹیم جلد جواب دے گی۔`;
       }
       if (lang === 'roman-ur') {
         return `Collab/partnership ke liye barah-e-mehrbani isi number par rabta karein: ${contact} — hamari team jald respond karegi.`;
@@ -324,28 +321,19 @@ function enforceIntent(
     }
   };
 
-  // Channel-specific contact presentation:
-  // - Instagram comments: show plain number (non-clickable links look bad)
-  // - Facebook comments & all DMs: wa.me link is OK if you prefer
-  // Caller should already pass correct 'contact', but this keeps it safe:
+  // Channel-specific contact presentation safeguard:
   if (surface === 'comment' && platform === 'instagram') {
-    // Force to plain phone for IG comments
-    contact = '03558000078';
+    contact = '03558000078'; // force plain number on IG comments
   }
 
   // ----- HARD INTENT RULES (no loops) -----
   if (intent?.pricing) {
-    // Public comments: never print numbers; push to DM with a strong discount hook
-    if (surface === 'comment') {
-      return L.pricing_comment();
-    }
-    // DMs: mention “discounted prices”, plus contact + site
-    return L.pricing_dm();
+    if (surface === 'comment') return L.pricing_comment(); // no numbers in public
+    return L.pricing_dm(); // DMs can mention discounted prices and include contact + site
   }
 
   if (intent?.road) {
-    // Give the road status snippet directly (no recursion)
-    return L.road_comment();
+    return L.road_comment(); // direct road status snippet
   }
 
   if (intent?.availability) {
@@ -356,9 +344,10 @@ function enforceIntent(
     return L.influencer_dm();
   }
 
-  // No hard rule matched — let the GPT reply pass through.
+  // No hard rule matched: let caller use the GPT reply it already has.
   return null;
 }
+
 
   // Road topic: ensure a solid, relevant answer
   if (road) {
@@ -529,7 +518,13 @@ async function handleTextMessage(psid, text, opts = { channel: 'facebook' }) {
   };
   try {
     const reply = await gptGenerate({ userText: text, lang, surface:'dm', platform: opts.channel, intent });
-    const safe = enforceIntent(reply, intent, 'dm', opts.channel, lang);
+    const contact =
+  (surface === 'comment' && platform === 'instagram')
+    ? '03558000078'
+    : 'https://wa.me/923558000078';
+
+const forced = enforceIntent(reply, intent, surface, platform, lang, contact);
+const finalText = forced || reply;
     await sendText(psid, safe);
   } catch (e) { logErr(e); }
 }
