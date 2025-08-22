@@ -270,7 +270,7 @@ app.post('/webhook', async (req, res) => {
           }
         }
         if (Array.isArray(entry.changes)) {
-          for (const change of entry.changes)) {
+          for (const change of entry.changes) {
             console.log('📰 FEED CHANGE:', JSON.stringify(change));
             // pass pageId (entry.id) so we can detect our own page in handler
             await routePageChange(change, entry.id).catch(logErr);
