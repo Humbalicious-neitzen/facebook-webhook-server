@@ -1,10 +1,10 @@
-// server.js — Roameo Resorts omni-channel bot (updated)
+// server.js — Roameo Resorts omni-channel bot (FINAL updated)
 // FB DMs + FB comment replies + IG DMs + IG comment replies
-// Language-aware replies (EN/Urdu/Roman-Ur), positivity, Weather (OpenWeather) + Distance/ETA (Geoapify)
-// PRICES IN COMMENTS: FORBIDDEN (DM-only). Strong discount hook required publicly.
-// Voice: never use first-person singular — always "we/us/our team".
-// FB price comments: allow WhatsApp LINK; IG price comments: WhatsApp NUMBER only.
-// Short public replies; trim comments. No "Shall we pencil you in?" anywhere.
+// Language-aware replies (EN/Urdu/Roman-Ur) + positivity + Weather (OpenWeather) + Distance/ETA (Geoapify)
+// PUBLIC PRICES FORBIDDEN — use DM with strong discount hook.
+// FB price comments: may use WhatsApp LINK; IG price comments: NUMBER only.
+// Always answer the question first, THEN bridge to Roameo Resorts, THEN soft CTA.
+// Short public replies with CTA; no "Shall we pencil you in?" anywhere.
 // Avoid self-replies (brand username check). IG capability error fallback.
 // Confirm origin before giving route/ETA.
 
@@ -53,7 +53,7 @@ const WHATSAPP_LINK   = 'https://wa.me/923558000078';// link used in FB comments
 // Optional CTA rotation (sanitized; never include "Shall we pencil you in?")
 const CTA_ROTATION = (process.env.CTA_ROTATION || 'Want us to check dates?,Need help choosing a hut?,Prefer the fastest route?,Shall we suggest a plan?,Want a quick availability guide?')
   .split(',')
-  .map(s => s.replace(/Shall we pencil you in\??/gi,'').trim()) // scrub legacy phrase
+  .map(s => s.replace(/Shall we pencil you in\??/gi,'').trim())
   .filter(Boolean);
 
 // Rotating discount hooks for public price replies + DM headers
@@ -83,6 +83,7 @@ if (!OPENAI_API_KEY) {
    BUSINESS FACTS (GROUND TRUTH)
    ========================= */
 const SITE_URL = 'https://www.roameoresorts.com/';
+const SITE_SHORT = 'roameoresorts.com';
 const MAPS_LINK = 'https://maps.app.goo.gl/Y49pQPd541p1tvUf6';
 
 const FACTS = {
@@ -122,7 +123,6 @@ const FACTS = {
 
 // Fallback templates (short = comments, long = DMs)
 const REPLY_TEMPLATES = {
-  // Short public price nudge now handled by shortPublicPriceReply()
   rates_short: `We’ve sent you the latest prices in a private message. Please check your inbox. 😊`,
 
   // DM: long; we prepend a hook + WA link dynamically in decideReply()
@@ -249,6 +249,21 @@ function isSelfComment(v = {}, platform = 'facebook') {
   return false;
 }
 
+// Append a compact CTA to public COMMENTS (not DMs)
+function appendCommentCTA(text = '', platform = 'facebook') {
+  const site = SITE_SHORT; // compact to save characters
+  // FB comments may use WhatsApp LINK; IG must use NUMBER
+  const waPiece = platform === 'instagram'
+    ? `WhatsApp: ${WHATSAPP_NUMBER}`
+    : (WHATSAPP_LINK ? `WhatsApp: ${WHATSAPP_LINK}` : `WhatsApp: ${WHATSAPP_NUMBER}`);
+  const ctaLine = `${waPiece} • Website: ${site}`;
+  const base = (text || '').trim();
+  if (!base) return ctaLine; // if somehow empty, at least show CTA
+  // Avoid duplicate CTAs if already present
+  if (base.includes('WhatsApp:') || base.includes(SITE_SHORT)) return base;
+  return `${base}\n${ctaLine}`;
+}
+
 /* =========================
    WEBHOOK RECEIVE
    ========================= */
@@ -354,16 +369,17 @@ async function fbPrivateReplyToComment(commentId, message) {
   await axios.post(url, { message }, { params, timeout: 10000 });
 }
 
-// Short, channel-aware public price reply with strong hook
+// Short, channel-aware public price reply with strong hook + site
 function shortPublicPriceReply(text = '', platform = 'facebook') {
   const hook = pickPriceHook();
   const lang = detectLanguage(text);
   const fbExtra = (platform === 'facebook' && WHATSAPP_LINK) ? ` • WhatsApp: ${WHATSAPP_LINK}` : '';
   const igExtra = (platform === 'instagram' && WHATSAPP_NUMBER) ? ` • WhatsApp: ${WHATSAPP_NUMBER}` : '';
+  const tail = ` • Website: ${SITE_SHORT}`;
 
-  if (lang === 'ur')   return `قیمتوں کے لیے براہِ کرم DM کریں — ${hook}.${platform==='facebook'?fbExtra:igExtra}`;
-  if (lang === 'roman-ur') return `Prices ke liye DM karein — ${hook}.${platform==='facebook'?fbExtra:igExtra}`;
-  return `Please DM us for rates — ${hook}.${platform==='facebook'?fbExtra:igExtra}`;
+  if (lang === 'ur')   return `قیمتوں کے لیے براہِ کرم DM کریں — ${hook}.${platform==='facebook'?fbExtra:igExtra}${tail}`;
+  if (lang === 'roman-ur') return `Prices ke liye DM karein — ${hook}.${platform==='facebook'?fbExtra:igExtra}${tail}`;
+  return `Please DM us for rates — ${hook}.${platform==='facebook'?fbExtra:igExtra}${tail}`;
 }
 
 async function routePageChange(change) {
@@ -377,22 +393,23 @@ async function routePageChange(change) {
     // Avoid replying to our own FB comments
     if (isSelfComment(v, 'facebook')) return;
 
-    // Pricing asked publicly → private reply + short public note (with hook + WA link)
+    // Pricing asked publicly → private reply + short public note (with hook + WA link + site)
     if (isPricingIntent(text)) {
       try {
         const privateReply = await decideReply(text, { surface: 'dm', platform: 'facebook' });
         await fbPrivateReplyToComment(v.comment_id, privateReply);
       } catch (e) { logErr(e); }
-      // Always post public short reply even if private failed
       const pub = trimForComment(shortPublicPriceReply(text, 'facebook'));
       await replyToFacebookComment(v.comment_id, pub);
       return;
     }
 
-    // Non-pricing comments → usual flow (sanitize + trim)
+    // Non-pricing comments → answer + brand bridge + CTA + trim
     if (!AUTO_REPLY_ENABLED) return console.log('🤖 Auto-reply disabled — would reply to FB comment.');
     let reply = await decideReply(text, { surface: 'comment', platform: 'facebook' });
-    reply = trimForComment(sanitizeComment(reply, detectLanguage(text)));
+    reply = sanitizeComment(reply, detectLanguage(text));
+    reply = appendCommentCTA(reply, 'facebook');
+    reply = trimForComment(reply);
     await replyToFacebookComment(v.comment_id, reply);
   }
 }
@@ -452,7 +469,9 @@ async function routeInstagramChange(change, pageId) {
 
     if (!AUTO_REPLY_ENABLED) return console.log('🤖 Auto-reply disabled — would reply to IG comment.');
     let reply = await decideReply(text, { surface: 'comment', platform: 'instagram' });
-    reply = trimForComment(sanitizeComment(reply, detectLanguage(text)));
+    reply = sanitizeComment(reply, detectLanguage(text));
+    reply = appendCommentCTA(reply, 'instagram');
+    reply = trimForComment(reply);
     await replyToInstagramComment(commentId, reply);
   }
 }
@@ -469,7 +488,7 @@ function isAffirmative(text = '') {
   // Roman-Urdu
   const ru = /\b(haan|han|ji|jee|bilkul|theek(?:\s*hai)?|acha|accha|zaroor|krdo|kardo|kar do|kr den|krden)\b/;
 
-  // Urdu script (جی، جی ہاں، ہاں، بالکل، ٹھیک ہے)
+  // Urdu script
   const ur = /(?:\u062C\u06CC|\u062C\u06CC\u06C1|\u06C1\u0627\u06BA|\u0628\u0644\u06A9\u0644|\u062A\u06BE\u06CC\u06A9\s?\u06C1\u06D2?)/;
 
   return en.test(t) || ru.test(t) || ur.test(t);
@@ -547,7 +566,7 @@ async function geocodePlace(place) {
   if (tinyCache.has(key)) return tinyCache.get(key);
   try {
     const url = 'https://api.geoapify.com/v1/geocode/search';
-    const { data } = await axios.get(url, { params: { text: place, limit: 1, apiKey: GEOAPIFY_API_KEY }, timeout: 10000 });
+       const { data } = await axios.get(url, { params: { text: place, limit: 1, apiKey: GEOAPIFY_API_KEY }, timeout: 10000 });
     const feat = data?.features?.[0];
     if (!feat) return null;
     const [lon, lat] = feat.geometry.coordinates || [];
@@ -615,7 +634,7 @@ function detectLanguage(text = '') {
 }
 
 /* =========================
-   GPT REPLY LOGIC (language-aware + positivity)
+   GPT REPLY LOGIC (language-aware + positivity; ANSWER-FIRST policy)
    ========================= */
 async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) {
   const t = (text || '').toLowerCase();
@@ -685,7 +704,7 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
     return asComment ? sanitizeComment(REPLY_TEMPLATES.default_short, lang) : sanitizeVoice(REPLY_TEMPLATES.default_long);
   }
 
-  // Build system prompt
+  // Build system prompt — ANSWER FIRST, THEN BRIDGE, THEN CTA
   const langGuide = {
     'en': `Write in natural English.`,
     'ur': `Write in fluent Urdu using Urdu script. Avoid romanization.`,
@@ -718,7 +737,12 @@ Soft launch rates (share only if directly relevant in DM):
     : `You may include prices in DMs when relevant. Include the WhatsApp link at the end if present.`;
 
   const systemPrompt = `
-You are Roameo Resorts' assistant. Produce a UNIQUE, positive, on-brand reply (no templates) faithful to these FACTS and matching the user's language.
+You are Roameo Resorts' assistant.
+
+CRITICAL LOGIC:
+1) First provide a direct, accurate answer to the user's question (in their language).
+2) Then add a natural bridge to Roameo Resorts (valley, riverfront huts, comfort, travel help).
+3) Finally, a soft CTA ONLY if appropriate (keep concise; comment CTAs are appended separately).
 
 OUTPUT LANGUAGE:
 - ${langGuide}
@@ -749,9 +773,11 @@ TONE & POSITIVITY:
 ${positivityRule}
 
 STYLE:
-- Prefer short bullets for dense info; friendly, clear, specific.
-- End with a soft CTA like: "${cta}" when appropriate.
-- Hard limit ~${maxChars} characters.
+- Start with the actual answer to the user's question.
+- Then, 1–2 short lines to relate it to Roameo Resorts.
+- Keep it crisp; friendly; limit to ~${maxChars} characters.
+- Avoid filler like "Shall we pencil you in?" entirely.
+- End with a soft CTA only if it naturally fits (comments will get a compact CTA automatically).
 `.trim();
 
   const userMsg = (text || '').slice(0, 1000);
