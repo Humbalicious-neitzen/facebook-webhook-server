@@ -1,6 +1,7 @@
 // server.js — Roameo Resorts omni-channel bot (Facebook + Instagram)
-// Fixed: strict intent lock, language mirroring, no public prices, platform
-// contact routing, influencer handling in DMs, self-reply guards, no recursion.
+// Rules enforced: always reply, price-in-comments forbidden, unique discount hook,
+// language mirroring, brand-forward tone, DM prices, phone (no links) in comments,
+// WA link in DMs only, self-reply guards, IG DM fallback, non-empty guards.
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -36,20 +37,26 @@ const MAPS_LINK = 'https://maps.app.goo.gl/Y49pQPd541p1tvUf6';
 const CHECKIN_TIME = process.env.CHECKIN_TIME || '3:00 pm';
 const CHECKOUT_TIME = process.env.CHECKOUT_TIME || '12:00 pm';
 
-// Contacts
-const WA_LINK = 'https://wa.me/923558000078'; // FB comments + all DMs
-const IG_PUBLIC_NUMBER = '03558000078';       // IG comments only
+// Contacts (comments = number only; DMs = WA link)
+const WA_LINK = 'https://wa.me/923558000078'; // DMs only
+const PUBLIC_NUMBER = '03558000078';           // Use in ALL comments (FB + IG)
 
-// Self-reply guards
-const SELF_IG_USERNAMES = ['roameoresorts']; // add more if needed
-const SELF_FB_PAGE_IDS = [];                  // string ids
+// Self-reply guards (extend if needed)
+const SELF_IG_USERNAMES = ['roameoresorts'];
+const SELF_FB_PAGE_IDS = []; // your FB page id(s) if you want
 
-/* ========================= */
+/* =========================
+   MIDDLEWARE / CACHES
+   ========================= */
 app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 const dedupe = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });
 const convo  = new LRUCache({ max: 5000, ttl: 1000 * 60 * 30 });
 
 app.get('/', (_req, res) => res.send('Roameo Omni Bot running'));
+
+/* =========================
+   VERIFY
+   ========================= */
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -58,6 +65,9 @@ app.get('/webhook', (req, res) => {
   res.sendStatus(403);
 });
 
+/* =========================
+   SECURITY
+   ========================= */
 function verifySignature(req) {
   const sig = req.headers['x-hub-signature-256'];
   if (!sig || !req.rawBody || !APP_SECRET) return false;
@@ -68,9 +78,13 @@ function verifySignature(req) {
   } catch { return false; }
 }
 
+/* =========================
+   WEBHOOK RECEIVE
+   ========================= */
 app.post('/webhook', async (req, res) => {
   if (!verifySignature(req)) return res.sendStatus(403);
   res.sendStatus(200);
+
   const body = req.body || {};
   try {
     if (body.object === 'page') {
@@ -90,6 +104,7 @@ app.post('/webhook', async (req, res) => {
       }
       return;
     }
+
     if (body.object === 'instagram') {
       for (const entry of body.entry || []) {
         const pageId = entry.id;
@@ -105,6 +120,7 @@ app.post('/webhook', async (req, res) => {
       }
       return;
     }
+
     console.log('📦 UNKNOWN OBJECT:', JSON.stringify(body));
   } catch (e) { logErr(e); }
 });
@@ -114,7 +130,7 @@ function logErr(err) {
 }
 
 /* =========================
-   Language detection
+   LANGUAGE / INTENTS
    ========================= */
 function detectLanguage(text = '') {
   const t = (text || '').trim();
@@ -125,22 +141,19 @@ function detectLanguage(text = '') {
     /\b(kia|kya|kyun|kaise|krna|karna|krdo|kardo|raha|rha|rhe|rahe|gi|ga|hain|hy|hai)\b/i,
     /\b(mein|mai|mujhe|acha|accha|bohat|bahut|kitna|kitni|din|rat)\b/i
   ].reduce((n, rx) => n + (rx.test(t) ? 1 : 0), 0);
-  const englishHits = [/\b(the|and|is|are|you|we|from|how|where|price|rate|road|weather)\b/i]
+  const englishHits = [/\b(the|and|is|are|you|we|from|how|where|price|rate|road|weather|distance)\b/i]
     .reduce((n, rx) => n + (rx.test(t) ? 1 : 0), 0);
   if (romanHits >= 1 && englishHits <= 3) return 'roman-ur';
   return 'en';
 }
 
-/* =========================
-   Intents
-   ========================= */
 function isPricingIntent(text = '') {
   const t = text.toLowerCase();
   return /\b(price|prices|rate|rates|cost|charges?|tariff|per\s*night|room|rooms|kitna|kitni)\b/.test(t);
 }
 function isRoadIntent(text = '') {
   const t = text.toLowerCase();
-  const road = /\b(road|roads|route|rasta|raasta)\b/.test(t);
+  const road = /\b(road|roads|route|rasta|raasta|drive|travel\s*time)\b/.test(t);
   const cond = /\b(condition|status|flood|barish|rain|landslide|cloud\s*burst|cloudburst|cloud\s*brust|cloudbrust)\b/.test(t);
   return road || cond;
 }
@@ -155,99 +168,74 @@ function isQuestionLike(text = '') {
 }
 
 /* =========================
-   GPT generator (with strict rules)
+   GPT HELPERS (hooks & replies)
    ========================= */
-async function gptGenerate({ userText, lang, surface, platform, intent }) {
-  const isComment = surface === 'comment';
-  const contactLine = (platform === 'instagram' && isComment)
-    ? IG_PUBLIC_NUMBER
-    : WA_LINK;
-
-  const langGuide = {
-    en: 'Write in natural English.',
-    ur: 'رواں اور شائستہ اردو میں جواب دیں۔',
-    'roman-ur': 'Roman Urdu (Urdu in English letters) mein likhein.'
-  }[lang] || 'Write in natural English.';
-
-  const system = `
-You are ${BRAND}'s assistant. ${langGuide}
-- Mirror the user's language (${lang}). Use "we/us/our", never "I/me/my".
-- Keep it short, friendly, on-brand (focus on ${BRAND}, not generic tourism).
-SURFACE: ${surface} on ${platform}.
-
-HARD RULES:
-- If not a pricing query: DO NOT mention price, discount, PKR, rates, or "DM for prices".
-- In public comments: NEVER include numeric prices.
-- If pricing query in a public comment: open with a unique discount hook (no numbers) and ask them to DM for discounted prices. Include this contact once: ${contactLine}.
-- If pricing query in DM: you may share discounted price table below and add WhatsApp: ${WA_LINK}.
-- For road/status queries: say roads are generally carpeted/open; small water crossing near resort; free 4×4 assist for elderly; invite user to contact at ${contactLine} for latest status.
-- Influencer (DM): thank them, route to ${WA_LINK} / ${IG_PUBLIC_NUMBER}.
-
-DISCOUNTED PRICE TABLE (use only in DMs when relevant):
-• Deluxe Hut — PKR 30,000/night
-  • 1st Night 10% → PKR 27,000
-  • 2nd Night 15% → PKR 25,500
-  • 3rd Night 20% → PKR 24,000
-• Executive Hut — PKR 50,000/night
-  • 1st Night 10% → PKR 45,000
-  • 2nd Night 15% → PKR 42,500
-  • 3rd Night 20% → PKR 40,000
-T&Cs: taxes included • breakfast for 4 • 50% advance to confirm.
-
-OUTPUT: a single short paragraph (no markdown), brand-forward, and comply with the rules above.
-`.trim();
-
-  const user = `User message: "${String(userText).slice(0,800)}"
-Intent: ${JSON.stringify(intent)} | Contact hint: ${contactLine}
-`;
-
+async function gptHook(lang) {
+  // Generate a short unique discount hook (no numbers). Fallback if GPT disabled.
   if (!OPENAI_API_KEY) {
-    // Fallback when OpenAI key missing
-    if (intent.pricing && isComment) {
-      return lang === 'ur'
-        ? 'ڈسکاؤنٹ قیمتیں دستیاب ہیں — براہِ کرم DM کریں تاکہ تفصیل شیئر کر سکیں۔'
-        : (lang === 'roman-ur'
-          ? 'Discounted prices chal rahi hain — DM karein taa ke detail share kar saken.'
-          : 'Discounted prices are live — please DM us and we’ll share details.');
-    }
-    if (intent.road) {
-      return lang === 'ur'
-        ? `${BRAND} تک سڑکیں عمومی طور پر کارپٹڈ اور کھلی رہتی ہیں۔ ریزورٹ کے قریب ایک چھوٹا واٹر کراسنگ ہے؛ بزرگ مہمانوں کے لیے ہماری 4×4 مدد دستیاب ہے۔ تازہ صورتحال کے لیے رابطہ کریں: ${contactLine}`
-        : (lang === 'roman-ur'
-          ? `Roads to ${BRAND} aam tor par open aur carpeted hoti hain. Resort ke qareeb chhota water crossing hai; barha se mehmaanon ke liye 4×4 assist milti hai. Latest update ke liye rabta: ${contactLine}`
-          : `Roads to ${BRAND} are generally open and carpeted. Near the resort there’s a small water crossing; our team provides 4×4 assist for elderly guests. For latest status, contact: ${contactLine}`);
-    }
-    return lang === 'ur'
-      ? `ہم مدد کے لیے موجود ہیں۔ براہ کرم بتائیں کہ کس بارے میں رہنمائی چاہیے؟`
-      : (lang === 'roman-ur'
-        ? `Hum madad ke liye yahan hain. Batayein aap ko kis cheez ki rehnumai chahiye?`
-        : `We’re here to help. Tell us what you’d like to know.`);
+    const fallbacks = {
+      en: [
+        'Limited-time savings just went live!',
+        'Exclusive resort discounts are active now!',
+        'Special seasonal offers are on!',
+        'Great deals running — don’t miss out!'
+      ],
+      ur: [
+        'خصوصی رعایتی آفرز جاری ہیں!',
+        'محدود مدت کے لئے شاندار ڈسکاؤنٹس!',
+        'سیزنل آفرز اس وقت فعال ہیں!',
+        'بہترین ڈیلز دستیاب — موقع ضائع نہ کریں!'
+      ],
+      'roman-ur': [
+        'Limited-time discounts live hain!',
+        'Exclusive resort offers active hain!',
+        'Seasonal deals on hain!',
+        'Great savings chal rahi hain!'
+      ]
+    };
+    const list = fallbacks[lang] || fallbacks.en;
+    return list[Math.floor(Math.random() * list.length)];
   }
 
-  const payload = {
-    model: OPENAI_MODEL,
-    temperature: 0.85,
-    top_p: 0.9,
-    max_tokens: 240,
-    presence_penalty: 0.2,
-    frequency_penalty: 0.2,
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user', content: user }
-    ]
+  const prompts = {
+    en: 'Give one short catchy line (max 12 words) implying resort discounts are active now. No numbers, no links.',
+    ur: 'ایک مختصر اور پرکشش جملہ دیں (زیادہ سے زیادہ 12 الفاظ) جو بتائے کہ ریزورٹ پر ڈسکاؤنٹس جاری ہیں۔ نمبرز یا لنکس نہ ہوں۔',
+    'roman-ur': 'Ek chhoti catchy line dein (max 12 words) jo bataye discounts active hain. Numbers/links na hon.'
   };
+  const system = 'You create ultra-brief promotional hooks. Output one line only.';
+  const user = prompts[lang] || prompts.en;
 
   try {
-    const { data } = await axios.post('https://api.openai.com/v1/chat/completions', payload, {
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-      timeout: 12000
-    });
-    return data?.choices?.[0]?.message?.content?.trim() || '';
-  } catch (e) { logErr(e); return ''; }
+    const { data } = await axios.post('https://api.openai.com/v1/chat/completions', {
+      model: OPENAI_MODEL,
+      temperature: 0.95,
+      max_tokens: 40,
+      messages: [{ role: 'system', content: system }, { role: 'user', content: user }]
+    }, { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } });
+    return (data?.choices?.[0]?.message?.content || '').trim();
+  } catch (e) { logErr({ where: 'hook', err: e }); return ''; }
+}
+
+async function gptGeneric({ userText, lang, surface, platform }) {
+  // Generic brand-forward reply for non-pricing threads.
+  if (!OPENAI_API_KEY) {
+    if (lang === 'ur') return `${BRAND} آپ کی رہنمائی کے لئے حاضر ہے — خوشگوار ماحول اور دریا کنارے قیام کے ساتھ۔ بتائیں کس بارے میں مدد چاہیے؟`;
+    if (lang === 'roman-ur') return `${BRAND} yahan madad ke liye maujood hai — riverside stay aur cozy huts ke sath. Batayein kis cheez ki rehnumai chahiye?`;
+    return `${BRAND} is here to help — cozy riverside huts and a warm team. What can we help you with?`;
+  }
+  const system = `You are ${BRAND}'s assistant. Keep replies short, positive, and brand-forward. Mirror language (${lang}).`;
+  const user = `User message: "${String(userText).slice(0,500)}" | Surface: ${surface} | Platform: ${platform}`;
+  try {
+    const { data } = await axios.post('https://api.openai.com/v1/chat/completions', {
+      model: OPENAI_MODEL, temperature: 0.8, max_tokens: 120,
+      messages: [{ role: 'system', content: system }, { role: 'user', content: user }]
+    }, { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } });
+    return (data?.choices?.[0]?.message?.content || '').trim();
+  } catch (e) { logErr({ where: 'generic', err: e }); return ''; }
 }
 
 /* =========================
-   Post-filters (topic enforcer + price scrub)
+   SANITIZERS / GUARDS
    ========================= */
 function sanitizeVoice(text='') {
   return (text || '')
@@ -263,11 +251,10 @@ function sanitizeVoice(text='') {
     .replace(/\bRoameo\s+Resort\b/gi, BRAND);
 }
 
-// stricter price pattern
 const PRICE_WORD = /\b(price|prices|rate|rates|tariff|per\s*night|discount|PKR|rupees|rs\.?)\b/i;
 const CURRENCY_NUM = /\b\d{1,3}(?:[ ,.]?\d{3})+\b/;
 
-function stripPublicPricesKeepContact(text='') {
+function stripPublicPrices(text='') {
   return text
     .split(/\r?\n/)
     .filter(line => !(PRICE_WORD.test(line) || CURRENCY_NUM.test(line)))
@@ -275,70 +262,104 @@ function stripPublicPricesKeepContact(text='') {
     .trim();
 }
 
-// -----------------------------------------------------------------------------
-// INTENT ENFORCER (NO RECURSION)
-// -----------------------------------------------------------------------------
-function enforceIntent(
-  text,
-  intent,                // { pricing, road, availability, influencer, ... }
-  surface,               // 'comment' | 'dm'
-  platform,              // 'instagram' | 'facebook'
-  lang,                  // 'en' | 'ur' | 'roman-ur'
-  contact                // string: either IG number or wa.me link
-) {
-  const L = {
-    pricing_comment() {
-      if (lang === 'ur') {
-        return `رعایتی قیمتیں دستیاب ہیں — براہِ کرم DM کریں تاکہ ہم تفصیل فوراً شیئر کر سکیں۔`;
-      }
-      if (lang === 'roman-ur') {
-        return `Discounted prices chal rahi hain — meherbani karke humein DM karein taa ke hum foran detail share kar saken.`;
-      }
-      return `Discounted prices are live — please DM us and we’ll share the details right away.`;
-    },
-    pricing_dm() {
-      if (lang === 'ur') {
-        return `یہ رعایتی قیمتیں ہیں۔ ہم ہٹ کے انتخاب اور تاریخوں میں بھی مدد کر دیں گے۔ رابطہ: ${contact}\nWebsite: ${SITE_URL}`;
-      }
-      if (lang === 'roman-ur') {
-        return `Yeh discounted prices hain. Hum hut selection aur dates mein bhi madad kar sakte hain. Rabta: ${contact}\nWebsite: ${SITE_URL}`;
-      }
-      return `These are discounted prices. We can also help you pick the right hut and dates. Contact: ${contact}\nWebsite: ${SITE_URL}`;
-    },
-    road_comment() {
-      if (lang === 'ur') {
-        return `${BRAND} تک سڑکیں عموماً کھلی اور کارپٹڈ ہوتی ہیں۔ ریزورٹ کے قریب ایک چھوٹا سا واٹر کراسنگ ہے؛ بزرگ مہمانوں کے لیے 4×4 مدد دستیاب ہے۔ بارش/لینڈ سلائیڈ کے بعد تازہ صورتحال کے لیے رابطہ کریں: ${contact}`;
-      }
-      if (lang === 'roman-ur') {
-        return `Roads to ${BRAND} aam tor par open aur fully carpeted hoti hain. Resort ke qareeb chhota sa water crossing hai; barha se mehmaanon ke liye 4×4 assist milti hai. Heavy rain/landslide ke baad latest update ke liye rabta: ${contact}`;
-      }
-      return `Roads to ${BRAND} are generally open and fully carpeted. Near the resort there’s a small water crossing; our team provides 4×4 assist for elderly guests. After heavy rain/landslides, contact us for the latest status: ${contact}`;
-    },
-    influencer_dm() {
-      if (lang === 'ur') {
-        return `کولیب/پارٹنرشپ کے لیے براہِ کرم اسی نمبر پر رابطہ کریں: ${contact} — ہماری ٹیم جلد جواب دے گی۔`;
-      }
-      if (lang === 'roman-ur') {
-        return `Collab/partnership ke liye barah-e-mehrbani isi number par rabta karein: ${contact} — hamari team jald respond karegi.`;
-      }
-      return `For collaborations/partnerships, please contact us on: ${contact} — our team will get back to you shortly.`;
-    }
-  };
-
-  // IG comments must show a plain number (links aren't clickable)
-  if (surface === 'comment' && platform === 'instagram') {
-    contact = IG_PUBLIC_NUMBER;
+function ensureNonEmpty(text, lang, fallbackType = 'generic') {
+  const t = (text || '').trim();
+  if (t) return t;
+  if (fallbackType === 'price_comment') {
+    if (lang === 'ur') return `رعایتی قیمتیں جاری ہیں — براہِ کرم DM کریں۔ رابطہ: ${PUBLIC_NUMBER}`;
+    if (lang === 'roman-ur') return `Discounted prices live hain — DM karein. Rabta: ${PUBLIC_NUMBER}`;
+    return `Discounted prices are live — please DM us. Contact: ${PUBLIC_NUMBER}`;
   }
+  if (lang === 'ur') return `مزید معلومات کے لیے رابطہ کریں: ${PUBLIC_NUMBER}`;
+  if (lang === 'roman-ur') return `Mazeed maloomat ke liye rabta: ${PUBLIC_NUMBER}`;
+  return `For details, please contact: ${PUBLIC_NUMBER}`;
+}
 
-  if (intent?.pricing) {
-    if (surface === 'comment') return L.pricing_comment();
-    return L.pricing_dm();
+/* =========================
+   ENFORCER (rules → final copy)
+   ========================= */
+async function buildCommentForPricing(lang) {
+  const hook = await gptHook(lang);
+  const safeHook = stripPublicPrices(sanitizeVoice(hook || ''));
+  if (lang === 'ur') {
+    return ensureNonEmpty(
+      `${safeHook}\nبراہِ کرم ہمیں DM کریں تاکہ رعایتی قیمتیں شیئر کر سکیں۔ رابطہ نمبر: ${PUBLIC_NUMBER}`,
+      lang, 'price_comment'
+    );
   }
-  if (intent?.road) return L.road_comment();
-  if (intent?.influencer && surface === 'dm') return L.influencer_dm();
+  if (lang === 'roman-ur') {
+    return ensureNonEmpty(
+      `${safeHook}\nDM karein taa ke discounted prices share kar saken. Rabta number: ${PUBLIC_NUMBER}`,
+      lang, 'price_comment'
+    );
+  }
+  return ensureNonEmpty(
+    `${safeHook}\nPlease DM us for the discounted prices. Contact: ${PUBLIC_NUMBER}`,
+    lang, 'price_comment'
+  );
+}
 
-  // No hard rule matched → let caller use GPT text
-  return null;
+function buildDMForPricing(lang) {
+  // Always include WA link (DMs only) + discounted price table
+  if (lang === 'ur') {
+    return sanitizeVoice(
+`یہ رعایتی قیمتیں ہیں:
+• Deluxe Hut — PKR 30,000/night
+  • 1st Night 10% → PKR 27,000
+  • 2nd Night 15% → PKR 25,500
+  • 3rd Night 20% → PKR 24,000
+• Executive Hut — PKR 50,000/night
+  • 1st Night 10% → PKR 45,000
+  • 2nd Night 15% → PKR 42,500
+  • 3rd Night 20% → PKR 40,000
+بکنگ/مدد: ${WA_LINK}
+Website: ${SITE_URL}`
+    );
+  }
+  if (lang === 'roman-ur') {
+    return sanitizeVoice(
+`Yeh discounted prices hain:
+• Deluxe Hut — PKR 30,000/night
+  • 1st Night 10% → PKR 27,000
+  • 2nd Night 15% → PKR 25,500
+  • 3rd Night 20% → PKR 24,000
+• Executive Hut — PKR 50,000/night
+  • 1st Night 10% → PKR 45,000
+  • 2nd Night 15% → PKR 42,500
+  • 3rd Night 20% → PKR 40,000
+Booking/help: ${WA_LINK}
+Website: ${SITE_URL}`
+    );
+  }
+  return sanitizeVoice(
+`These are discounted prices:
+• Deluxe Hut — PKR 30,000/night
+  • 1st Night 10% → PKR 27,000
+  • 2nd Night 15% → PKR 25,500
+  • 3rd Night 20% → PKR 24,000
+• Executive Hut — PKR 50,000/night
+  • 1st Night 10% → PKR 45,000
+  • 2nd Night 15% → PKR 42,500
+  • 3rd Night 20% → PKR 40,000
+For booking/help: ${WA_LINK}
+Website: ${SITE_URL}`
+  );
+}
+
+function buildRoadReply(lang) {
+  if (lang === 'ur') {
+    return `${BRAND} تک سڑکیں عمومی طور پر کارپٹڈ اور کھلی رہتی ہیں۔ ریزورٹ کے قریب ایک چھوٹا واٹر کراسنگ ہے؛ بزرگ مہمانوں کے لیے ہماری ٹیم 4×4 مدد فراہم کرتی ہے۔ اگر آپ شہر/آغاز مقام بتا دیں تو ہم راستہ اور ٹائم بہتر بتا دیں گے۔ رابطہ: ${PUBLIC_NUMBER}`;
+  }
+  if (lang === 'roman-ur') {
+    return `Roads to ${BRAND} aam tor par carpeted aur open hoti hain. Resort ke qareeb chhota water crossing hai; barhay mezbanon ke liye 4×4 assist available hai. Aap apna shehar/start batadein to hum route/time better guide kar denge. Rabta: ${PUBLIC_NUMBER}`;
+  }
+  return `Roads to ${BRAND} are generally open and carpeted. Near the resort there’s a small water crossing; our team provides 4×4 assist for elderly guests. Tell us your starting city so we can confirm the best route/time. Contact: ${PUBLIC_NUMBER}`;
+}
+
+function buildInfluencerDM(lang) {
+  if (lang === 'ur') return `کولیب/پارٹنرشپ کے لیے براہِ کرم WhatsApp پر رابطہ کریں: ${WA_LINK} — ہماری ٹیم جلد جواب دے گی۔`;
+  if (lang === 'roman-ur') return `Collab/partnership ke liye barah-e-mehrbani WhatsApp par rabta karein: ${WA_LINK} — hamari team jald respond karegi.`;
+  return `For collaborations/partnerships, please contact us on WhatsApp: ${WA_LINK} — our team will get back to you shortly.`;
 }
 
 /* =========================
@@ -360,12 +381,14 @@ async function routeMessengerEvent(event, ctx = { source: 'messaging' }) {
    FB COMMENTS
    ========================= */
 async function replyToFacebookComment(commentId, message) {
+  const msg = ensureNonEmpty(stripPublicPrices(sanitizeVoice(message || '')), 'en'); // language unknown here; already mirrored upstream
   const url = `https://graph.facebook.com/v19.0/${commentId}/comments`;
-  await axios.post(url, { message }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
+  await axios.post(url, { message: msg }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
 }
 async function fbPrivateReplyToComment(commentId, message) {
+  const msg = ensureNonEmpty(sanitizeVoice(message || ''), 'en');
   const url = `https://graph.facebook.com/v19.0/${commentId}/private_replies`;
-  await axios.post(url, { message }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
+  await axios.post(url, { message: msg }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
 }
 
 async function routePageChange(change) {
@@ -387,22 +410,23 @@ async function routePageChange(change) {
 
   try {
     if (intent.pricing) {
-      // DM with prices
+      // DM with discounted prices
       try {
-        const dm = await gptGenerate({ userText: text, lang, surface: 'dm', platform: 'facebook', intent });
-        const forcedDM = enforceIntent(dm, intent, 'dm', 'facebook', lang, WA_LINK);
-        await fbPrivateReplyToComment(v.comment_id, sanitizeVoice(forcedDM || dm));
+        const dmText = buildDMForPricing(lang);
+        await fbPrivateReplyToComment(v.comment_id, dmText);
       } catch (e) { logErr({ where:'FB price DM', err:e }); }
-      // Public hook (no numbers)
-      const pub = await gptGenerate({ userText: text, lang, surface: 'comment', platform: 'facebook', intent });
-      const forcedPub = enforceIntent(pub, intent, 'comment', 'facebook', lang, WA_LINK);
-      return replyToFacebookComment(v.comment_id, stripPublicPricesKeepContact(sanitizeVoice(forcedPub || pub)));
+      // Public hook (no numbers) + DM prompt + phone number
+      const pubText = await buildCommentForPricing(lang);
+      return replyToFacebookComment(v.comment_id, pubText);
     }
 
-    // Non-price → public only
-    const pub = await gptGenerate({ userText: text, lang, surface: 'comment', platform: 'facebook', intent });
-    const forcedPub = enforceIntent(pub, intent, 'comment', 'facebook', lang, WA_LINK);
-    return replyToFacebookComment(v.comment_id, stripPublicPricesKeepContact(sanitizeVoice(forcedPub || pub)));
+    // Non-price → friendly brand-forward public reply (language-mirrored)
+    const generic = await gptGeneric({ userText: text, lang, surface: 'comment', platform: 'facebook' });
+    let out = sanitizeVoice(generic);
+    if (intent.road) out = buildRoadReply(lang);
+    out = stripPublicPrices(out);
+    out = ensureNonEmpty(out, lang);
+    return replyToFacebookComment(v.comment_id, out);
   } catch (e) { logErr(e); }
 }
 
@@ -417,12 +441,14 @@ async function routeInstagramMessage(event) {
 }
 
 async function replyToInstagramComment(commentId, message) {
+  const msg = ensureNonEmpty(stripPublicPrices(sanitizeVoice(message || '')), 'en');
   const url = `https://graph.facebook.com/v19.0/${commentId}/replies`;
-  await axios.post(url, { message }, { params: { access_token: IG_MANAGE_TOKEN }, timeout: 10000 });
+  await axios.post(url, { message: msg }, { params: { access_token: IG_MANAGE_TOKEN }, timeout: 10000 });
 }
 async function igPrivateReplyToComment(pageId, commentId, message) {
+  const msg = ensureNonEmpty(sanitizeVoice(message || ''), 'en');
   const url = `https://graph.facebook.com/v19.0/${pageId}/messages`;
-  const payload = { recipient: { comment_id: commentId }, message: { text: message } };
+  const payload = { recipient: { comment_id: commentId }, message: { text: msg } };
   await axios.post(url, payload, { params: { access_token: IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN }, timeout: 10000 });
 }
 
@@ -448,22 +474,22 @@ async function routeInstagramChange(change, pageId) {
 
   try {
     if (intent.pricing) {
-      // Try DM (if IG permissions allow)
+      // Try DM with discounted prices (may fail due to IG capability)
       try {
-        const dm = await gptGenerate({ userText:text, lang, surface:'dm', platform:'instagram', intent });
-        const forcedDM = enforceIntent(dm, intent, 'dm', 'instagram', lang, WA_LINK);
-        await igPrivateReplyToComment(pageId, commentId, sanitizeVoice(forcedDM || dm));
+        const dmText = buildDMForPricing(lang);
+        await igPrivateReplyToComment(pageId, commentId, dmText);
       } catch (e) { logErr({ where:'IG price DM fail', err:e }); }
-      // Public hook (no numbers, IG phone only)
-      const pub = await gptGenerate({ userText:text, lang, surface:'comment', platform:'instagram', intent });
-      const forcedPub = enforceIntent(pub, intent, 'comment', 'instagram', lang, IG_PUBLIC_NUMBER);
-      return replyToInstagramComment(commentId, stripPublicPricesKeepContact(sanitizeVoice(forcedPub || pub)));
+      // Public hook (no numbers) + DM prompt + phone number (no links in IG comments)
+      const pubText = await buildCommentForPricing(lang);
+      return replyToInstagramComment(commentId, pubText);
     }
 
-    // Non-price → public
-    const pub = await gptGenerate({ userText:text, lang, surface:'comment', platform:'instagram', intent });
-    const forcedPub = enforceIntent(pub, intent, 'comment', 'instagram', lang, IG_PUBLIC_NUMBER);
-    return replyToInstagramComment(commentId, stripPublicPricesKeepContact(sanitizeVoice(forcedPub || pub)));
+    // Non-price → friendly public reply
+    let out = await gptGeneric({ userText: text, lang, surface: 'comment', platform: 'instagram' });
+    if (intent.road) out = buildRoadReply(lang);
+    out = stripPublicPrices(sanitizeVoice(out));
+    out = ensureNonEmpty(out, lang);
+    return replyToInstagramComment(commentId, out);
   } catch (e) { logErr(e); }
 }
 
@@ -475,42 +501,48 @@ async function handleTextMessage(psid, text, opts = { channel: 'facebook' }) {
 
   const lang = detectLanguage(text);
   const intent = {
-    pricing:    isPricingIntent(text),
-    road:       isRoadIntent(text),
+    pricing: isPricingIntent(text),
+    road: isRoadIntent(text),
     influencer: isInfluencerIntent(text),
     question_like: isQuestionLike(text),
   };
 
   try {
-    const ai = await gptGenerate({
-      userText: text,
-      lang,
-      surface: 'dm',
-      platform: opts.channel === 'instagram' ? 'instagram' : 'facebook',
-      intent
-    });
+    let out = '';
+    if (intent.pricing) {
+      out = buildDMForPricing(lang); // DM: discounted table + WA link
+    } else if (intent.influencer) {
+      out = buildInfluencerDM(lang);
+    } else if (intent.road) {
+      // Ask origin if unclear; keep it positive/brand-forward
+      out = buildRoadReply(lang).replace(PUBLIC_NUMBER, WA_LINK);
+    } else {
+      out = await gptGeneric({
+        userText: text,
+        lang,
+        surface: 'dm',
+        platform: opts.channel === 'instagram' ? 'instagram' : 'facebook'
+      });
+      out = sanitizeVoice(out);
+      // Add WA + site footer softly in DMs
+      const footer = (lang === 'ur')
+        ? `\nرابطہ/مدد: ${WA_LINK}\nWebsite: ${SITE_URL}`
+        : (lang === 'roman-ur')
+          ? `\nRabta/madad: ${WA_LINK}\nWebsite: ${SITE_URL}`
+          : `\nContact/help: ${WA_LINK}\nWebsite: ${SITE_URL}`;
+      out += footer;
+    }
 
-    // DMs always OK to show WhatsApp link
-    const contact = WA_LINK;
-
-    const forced = enforceIntent(
-      ai,
-      intent,
-      'dm',
-      opts.channel === 'instagram' ? 'instagram' : 'facebook',
-      lang,
-      contact
-    );
-
-    const finalText = sanitizeVoice(forced || ai);
-    await sendText(psid, finalText);
+    out = ensureNonEmpty(out, lang);
+    await sendText(psid, out);
   } catch (e) { logErr(e); }
 }
 
 async function sendText(psid, text) {
+  const msg = ensureNonEmpty(text, 'en');
   const url = 'https://graph.facebook.com/v19.0/me/messages';
   const params = { access_token: PAGE_ACCESS_TOKEN };
-  const payload = { recipient: { id: psid }, messaging_type: 'RESPONSE', message: { text } };
+  const payload = { recipient: { id: psid }, messaging_type: 'RESPONSE', message: { text: msg } };
   await axios.post(url, payload, { params, timeout: 10000 });
 }
 
@@ -519,8 +551,9 @@ async function sendText(psid, text) {
    ========================= */
 async function takeThreadControl(psid) {
   const url = 'https://graph.facebook.com/v19.0/me/take_thread_control';
-  try { await axios.post(url, { recipient: { id: psid } }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 }); }
-  catch (e) { logErr(e); }
+  try {
+    await axios.post(url, { recipient: { id: psid } }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
+  } catch (e) { logErr(e); }
 }
 
 function requireAdmin(req, res, next) {
@@ -537,7 +570,9 @@ app.post('/admin/subscribe', requireAdmin, async (_req, res) => {
     const params = { access_token: PAGE_ACCESS_TOKEN };
     const { data } = await axios.post(url, { subscribed_fields }, { params, timeout: 10000 });
     res.json({ ok: true, data, subscribed_fields });
-  } catch (e) { res.status(500).json({ ok:false, error: e?.response?.data || e.message }); }
+  } catch (e) {
+    res.status(500).json({ ok:false, error: e?.response?.data || e.message });
+  }
 });
 
 app.get('/admin/status', requireAdmin, async (_req, res) => {
@@ -552,10 +587,12 @@ app.get('/admin/status', requireAdmin, async (_req, res) => {
         OPENAI: Boolean(OPENAI_API_KEY),
         BRAND, SITE_URL, MAPS_LINK,
         CHECKIN_TIME, CHECKOUT_TIME,
-        WA_LINK, IG_PUBLIC_NUMBER
+        WA_LINK, PUBLIC_NUMBER
       }
     });
-  } catch (e) { res.status(500).json({ ok:false, error: e?.response?.data || e.message }); }
+  } catch (e) {
+    res.status(500).json({ ok:false, error: e?.response?.data || e.message });
+  }
 });
 
 app.listen(PORT, () => console.log(`🚀 Listening on :${PORT}`));
