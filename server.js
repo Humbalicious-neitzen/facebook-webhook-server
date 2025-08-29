@@ -64,6 +64,11 @@ if (!OPENAI_API_KEY) {
   console.warn('ℹ️ OPENAI_API_KEY not set. GPT replies disabled; fallbacks will be used.');
 }
 
+/* =======================================================
+   40% OFF CAMPAIGN (added) — valid till 6th September 2025
+   ======================================================= */
+const DISCOUNT = { percent: 40, validUntilText: '6th September 2025' };
+
 /* =========================
    BUSINESS FACTS (Knowledge Base)
    ========================= */
@@ -77,10 +82,13 @@ const FACTS = {
   checkout: CHECKOUT_TIME,
   tnc: [
     'Rates are inclusive of all taxes',
-    'Complimentary breakfast for 4 guests per booking',
-    '50% advance payment required to confirm the reservation'
+    'Complimentary breakfast for 2 guests per booking',
+    'Additional breakfast charges: PKR 500 per person',
+    '50% advance payment required to confirm the reservation',
+    `Offer valid till ${DISCOUNT.validUntilText}`
   ],
-  // Discount ladder used for totals (night 1, night 2, night 3+)
+  // NOTE: Keeping your previous ladder here (not used during 40% campaign),
+  // base prices are authoritative for discount math.
   rates: {
     deluxe:    { base: 30000, n1: 27000, n2: 25500, n3: 24000 },
     executive: { base: 50000, n1: 45000, n2: 42500, n3: 40000 }
@@ -244,37 +252,29 @@ function trimForComment(s, limit = MAX_OUT_CHAR) {
 }
 
 /* =========================
-   HOOKS (price nudge)
+   HOOKS (price nudge) — updated for 40% OFF
    ========================= */
 const HOOKS = {
   en: [
-    'discounted prices inside! ✨',
-    'special launch discounts await! 🎉',
-    'exclusive DM-only deals! 🔒',
-    'limited-time savings available! ⏳',
-    'bundle discounts for 2+ nights! 🛖'
+    `Flat ${DISCOUNT.percent}% OFF till ${DISCOUNT.validUntilText} — DM us for the full rate list & availability! ✨`,
+    `Limited-time ${DISCOUNT.percent}% discount! DM now for rates & quick booking. 🌿`,
+    `${DISCOUNT.percent}% OFF launch offer — message us for your deal & dates! 🛖`
   ],
   'roman-ur': [
-    'discounted prices andar! ✨',
-    'launch discounts tayyar! 🎉',
-    'sirf DM mein deals! 🔒',
-    'limited-time bachat! ⏳',
-    '2+ nights par extra off! 🛖'
+    `Flat ${DISCOUNT.percent}% OFF ${DISCOUNT.validUntilText} tak — rates aur availability ke liye DM karein! ✨`,
+    `Limited-time ${DISCOUNT.percent}% discount! Rates chahiye? DM now. 🌿`,
+    `${DISCOUNT.percent}% OFF launch offer — apni dates ke sath DM karein! 🛖`
   ],
   ur: [
-    'ڈسکاؤنٹڈ قیمتیں دستیاب! ✨',
-    'لانچ ڈسکاؤنٹس آپ کے لیے! 🎉',
-    'خصوصی آفرز صرف DM میں! 🔒',
-    'محدود وقت کی بچت! ⏳',
-    'دو+ راتوں پر اضافی رعایت! 🛖'
+    `فلیٹ ${DISCOUNT.percent}% ڈسکاؤنٹ ${DISCOUNT.validUntilText} تک — مکمل ریٹ لسٹ اور دستیابی کے لیے DM کیجیے! ✨`,
+    `محدود وقت کے لیے ${DISCOUNT.percent}% رعایت! ریٹس کے لیے DM کریں۔ 🌿`,
+    `${DISCOUNT.percent}% ڈسکاؤنٹ آفر — اپنی تاریخوں کے ساتھ DM کریں! 🛖`
   ]
 };
 function priceNudgePublic(lang = 'en') {
   const arr = HOOKS[lang] || HOOKS.en;
   const hook = arr[Math.floor(Math.random() * arr.length)];
-  if (lang === 'ur') return trimForComment(`براہِ کرم ریٹس کے لیے DM کریں — ${hook}`);
-  if (lang === 'roman-ur') return trimForComment(`Rates ke liye DM karein — ${hook}`);
-  return trimForComment(`Please DM us for rates — ${hook}`);
+  return trimForComment(hook);
 }
 
 /* =========================
@@ -359,6 +359,7 @@ Facts to rely on (do not invent new facts):
 - Travel tips: ${FACTS.travel_tips.join('; ')}.
 - T&Cs: ${FACTS.tnc.join('; ')}.
 - Pricing policy: NEVER post numeric prices in public comments. Share prices only in DMs.
+- Campaign: Flat ${DISCOUNT.percent}% OFF on Deluxe (PKR 30,000) & Executive (PKR 50,000) until ${DISCOUNT.validUntilText}.
   `.trim();
 
   return `
@@ -494,137 +495,131 @@ function parseNightsAndType(text = '') {
   return { nights, type };
 }
 
-/* =========================
-   DM price message — SMART FORMAT
-   ========================= */
+/* =========================================================
+   DM price message — UPDATED for 40% OFF campaign (added)
+   ========================================================= */
+function discounted(n) { return Math.round(n * (1 - DISCOUNT.percent / 100)); }
+
 async function dmPriceMessage(userText = '') {
   const lang = detectLanguage(userText);
-  const { nights, type } = parseNightsAndType(userText);
+  const { nights } = parseNightsAndType(userText);
 
-  const r = FACTS.rates;
-  const d = r.deluxe;
-  const e = r.executive;
+  const dBase = FACTS.rates.deluxe.base;
+  const eBase = FACTS.rates.executive.base;
+  const dDisc = discounted(dBase);
+  const eDisc = discounted(eBase);
 
-  // If nights unknown → show tidy discount ladder.
-  if (!nights) {
+  const headerEN = `We’re currently offering an exclusive ${DISCOUNT.percent}% limited-time discount for our guests at Roameo Resorts, valid only till ${DISCOUNT.validUntilText}!`;
+  const headerRU = `Roameo Resorts par abhi ${DISCOUNT.percent}% limited-time discount chal raha hai — sirf ${DISCOUNT.validUntilText} tak!`;
+  const headerUR = `Roameo Resorts میں اس وقت ${DISCOUNT.percent}% خصوصی رعایت دستیاب ہے — صرف ${DISCOUNT.validUntilText} تک!`;
+
+  const listEN = [
+    '📍 Limited-Time Discounted Rate List:',
+    '',
+    `Deluxe Hut – PKR ${formatMoney(dBase)}/night`,
+    `✨ Flat ${DISCOUNT.percent}% Off → PKR ${formatMoney(dDisc)}/night`,
+    '',
+    `Executive Hut – PKR ${formatMoney(eBase)}/night`,
+    `✨ Flat ${DISCOUNT.percent}% Off → PKR ${formatMoney(eDisc)}/night`
+  ];
+  const listRU = [
+    '📍 Limited-Time Discounted Rate List:',
+    '',
+    `Deluxe Hut – PKR ${formatMoney(dBase)}/night`,
+    `✨ Flat ${DISCOUNT.percent}% Off → PKR ${formatMoney(dDisc)}/night`,
+    '',
+    `Executive Hut – PKR ${formatMoney(eBase)}/night`,
+    `✨ Flat ${DISCOUNT.percent}% Off → PKR ${formatMoney(eDisc)}/night`
+  ];
+  const listUR = [
+    '📍 محدود مدت کی ڈسکاؤنٹڈ ریٹ فہرست:',
+    '',
+    `ڈیلکس ہٹ – PKR ${formatMoney(dBase)} فی رات`,
+    `✨ فلیٹ ${DISCOUNT.percent}% آف → PKR ${formatMoney(dDisc)} فی رات`,
+    '',
+    `ایگزیکٹو ہٹ – PKR ${formatMoney(eBase)} فی رات`,
+    `✨ فلیٹ ${DISCOUNT.percent}% آف → PKR ${formatMoney(eDisc)} فی رات`
+  ];
+
+  const tnc = FACTS.tnc.map(x => `• ${x}`);
+
+  // Optional totals when nights detected
+  let totals = '';
+  if (nights) {
+    const dOrigTot = dBase * nights;
+    const dDiscTot = dDisc * nights;
+    const eOrigTot = eBase * nights;
+    const eDiscTot = eDisc * nights;
+
     if (lang === 'ur') {
-      const msg = [
-        '💚 *Roameo Resorts — ڈسکاؤنٹڈ ریٹس*',
+      totals = [
         '',
-        '🏡 *ڈیلکس ہٹ*',
-        `• رات 1 — PKR ${formatMoney(d.n1)}`,
-        `• رات 2 — PKR ${formatMoney(d.n2)}`,
-        `• رات 3+ — PKR ${formatMoney(d.n3)} (ہر رات)`,
-        '',
-        '🏡 *ایگزیکٹو ہٹ*',
-        `• رات 1 — PKR ${formatMoney(e.n1)}`,
-        `• رات 2 — PKR ${formatMoney(e.n2)}`,
-        `• رات 3+ — PKR ${formatMoney(e.n3)} (ہر رات)`,
-        '',
-        `شرائط: ٹیکس شامل • چار مہمانوں کے لیے ناشتہ شامل • 50% ایڈوانس لازمی`,
-        `Availability / book: ${SITE_URL}`,
-        `Chat on WhatsApp: ${WHATSAPP_LINK}`
+        `🧮 *${nights} راتوں کے لیے*:`,
+        `ڈیلکس: PKR ${formatMoney(dOrigTot)} → رعایتی: PKR ${formatMoney(dDiscTot)}`,
+        `ایگزیکٹو: PKR ${formatMoney(eOrigTot)} → رعایتی: PKR ${formatMoney(eDiscTot)}`
       ].join('\n');
-      return sanitizeVoice(msg);
-    }
-    if (lang === 'roman-ur') {
-      const msg = [
-        '💚 *Roameo Resorts — discounted rates*',
+    } else if (lang === 'roman-ur') {
+      totals = [
         '',
-        '🏡 *Deluxe Hut*',
-        `• Night 1 — PKR ${formatMoney(d.n1)}`,
-        `• Night 2 — PKR ${formatMoney(d.n2)}`,
-        `• Night 3+ — PKR ${formatMoney(d.n3)} (per night)`,
-        '',
-        '🏡 *Executive Hut*',
-        `• Night 1 — PKR ${formatMoney(e.n1)}`,
-        `• Night 2 — PKR ${formatMoney(e.n2)}`,
-        `• Night 3+ — PKR ${formatMoney(e.n3)} (per night)`,
-        '',
-        'T&Cs: taxes included • breakfast for 4 • 50% advance to confirm',
-        `Availability / book: ${SITE_URL}`,
-        `Chat on WhatsApp: ${WHATSAPP_LINK}`
+        `🧮 *For ${nights} nights*:`,
+        `Deluxe: PKR ${formatMoney(dOrigTot)} → after ${DISCOUNT.percent}% OFF: PKR ${formatMoney(dDiscTot)}`,
+        `Executive: PKR ${formatMoney(eOrigTot)} → after ${DISCOUNT.percent}% OFF: PKR ${formatMoney(eDiscTot)}`
       ].join('\n');
-      return sanitizeVoice(msg);
+    } else {
+      totals = [
+        '',
+        `🧮 *For ${nights} nights*:`,
+        `Deluxe: PKR ${formatMoney(dOrigTot)} → after ${DISCOUNT.percent}% OFF: PKR ${formatMoney(dDiscTot)}`,
+        `Executive: PKR ${formatMoney(eOrigTot)} → after ${DISCOUNT.percent}% OFF: PKR ${formatMoney(eDiscTot)}`
+      ].join('\n');
     }
-    const msg = [
-      '💚 *Roameo Resorts — discounted rates*',
+  }
+
+  let msg;
+  if (lang === 'ur') {
+    msg = [
+      headerUR,
       '',
-      '🏡 *Deluxe Hut*',
-      `• Night 1 — PKR ${formatMoney(d.n1)}`,
-      `• Night 2 — PKR ${formatMoney(d.n2)}`,
-      `• Night 3+ — PKR ${formatMoney(d.n3)} (per night)`,
+      ...listUR,
       '',
-      '🏡 *Executive Hut*',
-      `• Night 1 — PKR ${formatMoney(e.n1)}`,
-      `• Night 2 — PKR ${formatMoney(e.n2)}`,
-      `• Night 3+ — PKR ${formatMoney(e.n3)} (per night)`,
+      'Terms & Conditions:',
+      ...tnc,
+      totals,
       '',
-      'T&Cs: taxes included • breakfast for 4 • 50% advance to confirm',
+      `Let us know if you’d like to book your stay or need any assistance! 🌿✨`,
       `Availability / book: ${SITE_URL}`,
       `Chat on WhatsApp: ${WHATSAPP_LINK}`
     ].join('\n');
-    return sanitizeVoice(msg);
+  } else if (lang === 'roman-ur') {
+    msg = [
+      headerRU,
+      '',
+      ...listRU,
+      '',
+      'Terms & Conditions:',
+      ...tnc,
+      totals,
+      '',
+      `Let us know if you’d like to book your stay or need any assistance! 🌿✨`,
+      `Availability / book: ${SITE_URL}`,
+      `Chat on WhatsApp: ${WHATSAPP_LINK}`
+    ].join('\n');
+  } else {
+    msg = [
+      headerEN,
+      '',
+      ...listEN,
+      '',
+      'Terms & Conditions:',
+      ...tnc,
+      totals,
+      '',
+      `Let us know if you’d like to book your stay or need any assistance! 🌿✨`,
+      `Availability / book: ${SITE_URL}`,
+      `Chat on WhatsApp: ${WHATSAPP_LINK}`
+    ].join('\n');
   }
-
-  function renderSection(label, rates) {
-    const groups = groupSamePrice(nights, rates);
-    const total = sumTotal(nights, rates);
-    let lines;
-
-    if (lang === 'ur') {
-      const hdr = `🏡 *${label}*`;
-      const rows = groups.map(g =>
-        (g.from === g.to)
-          ? `• رات ${g.from} — PKR ${formatMoney(g.price)}`
-          : `• راتیں ${g.from}–${g.to} — ہر رات PKR ${formatMoney(g.price)}`
-      );
-      lines = [hdr, ...rows, `— *کل*: PKR ${formatMoney(total)}`];
-    } else if (lang === 'roman-ur') {
-      const hdr = `🏡 *${label}*`;
-      const rows = groups.map(g =>
-        (g.from === g.to)
-          ? `• Night ${g.from} — PKR ${formatMoney(g.price)}`
-          : `• Nights ${g.from}–${g.to} — PKR ${formatMoney(g.price)} each`
-      );
-      lines = [hdr, ...rows, `— *Total*: PKR ${formatMoney(total)}`];
-    } else {
-      const hdr = `🏡 *${label}*`;
-      const rows = groups.map(g =>
-        (g.from === g.to)
-          ? `• Night ${g.from} — PKR ${formatMoney(g.price)}`
-          : `• Nights ${g.from}–${g.to} — PKR ${formatMoney(g.price)} each`
-      );
-      lines = [hdr, ...rows, `— *Total*: PKR ${formatMoney(total)}`];
-    }
-    return lines.join('\n');
-  }
-
-  const L = {
-    ur: { title: `${nights} راتوں کا کوٹ — Roameo Resorts`, deluxe: 'ڈیلکس ہٹ', exec: 'ایگزیکٹو ہٹ', footer:
-      ['شرائط: ٹیکس شامل • 4 مہمانوں کے لیے ناشتہ شامل • 50% ایڈوانس لازمی'] },
-    'roman-ur': { title: `${nights} nights ka quote — Roameo Resorts`, deluxe: 'Deluxe Hut', exec: 'Executive Hut', footer:
-      ['T&Cs: taxes included • breakfast for 4 • 50% advance to confirm'] },
-    en: { title: `${nights}-night quote — Roameo Resorts`, deluxe: 'Deluxe Hut', exec: 'Executive Hut', footer:
-      ['T&Cs: taxes included • breakfast for 4 • 50% advance to confirm'] }
-  }[lang === 'ur' ? 'ur' : (lang === 'roman-ur' ? 'roman-ur' : 'en')];
-
-  const sections = [];
-  sections.push(`✨ *${L.title}*`);
-  sections.push('');
-
-  if (!type || type === 'deluxe') sections.push(renderSection(L.deluxe, d));
-  if (!type || type === 'executive') {
-    if (!(!type || type === 'deluxe')) sections.push('');
-    sections.push(renderSection(L.exec, e));
-  }
-
-  sections.push('');
-  sections.push(...L.footer);
-  sections.push(`Availability / book: ${SITE_URL}`);
-  sections.push(`Chat on WhatsApp: ${WHATSAPP_LINK}`);
-
-  return sanitizeVoice(sections.join('\n'));
+  return sanitizeVoice(msg);
 }
 
 /* =========================
@@ -816,7 +811,7 @@ async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
 
   if (!AUTO_REPLY_ENABLED) return;
 
-  // Price intent in DM → formatted ladder/quote
+  // Price intent in DM → formatted campaign
   if (intents.wantsRates) {
     return sendBatched(psid, await dmPriceMessage(text));
   }
@@ -1034,7 +1029,9 @@ app.get('/admin/status', requireAdmin, async (_req, res) => {
         CHECKIN: FACTS.checkin,
         CHECKOUT: FACTS.checkout,
         LOCATION: FACTS.location_name,
-        RIVER: FACTS.river_name
+        RIVER: FACTS.river_name,
+        DISCOUNT: `${DISCOUNT.percent}% until ${DISCOUNT.validUntilText}`,
+        BASE_PRICES: { deluxe: FACTS.rates.deluxe.base, executive: FACTS.rates.executive.base }
       }
     });
   } catch (e) {
