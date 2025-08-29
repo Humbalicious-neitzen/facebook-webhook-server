@@ -1,10 +1,9 @@
-// server.js — Roameo Resorts omni-channel bot (v5)
+// server.js — Roameo Resorts omni-channel bot (v5 - tight bullets, WhatsApp-first CTA, robust intents)
 // FB DMs + FB comments + IG DMs + IG comments
 // Languages: EN / Urdu / Roman-Urdu
-// Features: strict price card (locked layout), route (Geoapify), location tips,
-// manager/contact handling, smart general fallback that answers topic then pivots to Roameo.
-// Public comments never contain numeric prices.
-// CTA order everywhere: WhatsApp FIRST, then Website.
+// Price card: strict layout (no extra blank lines in bullets)
+// Route (Geoapify) + contact + generic fallback that still answers and links to Roameo
+// Public comments: NEVER post numeric prices; DM full card + public nudge instead.
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -22,7 +21,7 @@ const APP_SECRET = process.env.APP_SECRET;
 const VERIFY_TOKEN = process.env.verify_token || process.env.VERIFY_TOKEN || 'verify_dev';
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 
-// OpenAI
+// OpenAI (optional for structured replies)
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
@@ -63,7 +62,7 @@ if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
   console.warn('⚠️ Missing required env vars: APP_SECRET, VERIFY_TOKEN, PAGE_ACCESS_TOKEN');
 }
 if (!OPENAI_API_KEY) {
-  console.warn('ℹ️ OPENAI_API_KEY not set. GPT structured replies & smart fallback will be limited.');
+  console.warn('ℹ️ OPENAI_API_KEY not set. GPT structured replies disabled; fallbacks will be used.');
 }
 
 /* =======================================================
@@ -103,17 +102,13 @@ const FACTS = {
     'Luggage assistance from private parking',
     'Free 4×4 jeep assist for elderly / water crossing',
     'Bonfire & outdoor seating on request'
-  ],
-  travel_tips: [
-    'Roads in the valley are fully carpeted for a smooth, scenic drive',
-    'Small water crossing near the resort; sedans can park at private parking (1-minute walk)',
-    'Our team helps with luggage; free jeep transfer available for elderly guests'
   ]
 };
 
 /* =========================
    STYLE / EMOJI
    ========================= */
+const EMOJI = { hello: ['💚','🌿','👋','😊'] };
 function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
 
 /* =========================
@@ -155,23 +150,19 @@ function verifySignature(req) {
 }
 
 /* =========================
-   HELPERS — sanitize, language, intent
+   HELPERS — sanitize, normalize, language, intents
    ========================= */
-// Newline-safe sanitizer (preserves \n & blank lines)
+// Newline-safe sanitizer (preserves \n and blank lines)
 function sanitizeVoice(text = '') {
   if (!text) return '';
   const urls = [];
   let s = String(text).replace(/https?:\/\/\S+/gi, (m) => { urls.push(m); return `__URL${urls.length - 1}__`; });
-
   s = s
-    .replace(/\r\n/g, '\n')      // normalize newlines
-    .replace(/[ \t]+\n/g, '\n')  // strip spaces before newline
-    .replace(/\n[ \t]+/g, '\n')  // strip spaces after newline
-    .replace(/[ \t]{2,}/g, ' ')  // collapse spaces/tabs (not newlines)
-    .replace(/\n{3,}/g, '\n\n')  // max two blank lines
-    .trim();
+    .replace(/\r\n/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n[ \t]+/g, '\n');
 
-  // brand voice (do not change newlines)
+  // Brand voice tweaks (do NOT touch newlines)
   s = s
     .replace(/\bI\'m\b/gi, 'we’re')
     .replace(/\bI am\b/gi, 'we are')
@@ -181,11 +172,14 @@ function sanitizeVoice(text = '') {
     .replace(/\bmy\b/gi, 'our')
     .replace(/\bmine\b/gi, 'ours');
 
+  s = s.replace(/[ \t]{2,}/g, ' ');
+  s = s.replace(/\n{3,}/g, '\n\n');
+  s = s.trim();
   s = s.replace(/__URL(\d+)__/g, (_, i) => urls[Number(i)]);
   return s;
 }
 
-// Normalizer for intent matching
+// Normalize for intent matching (remove punctuation/emoji, collapse spaces, lowercase)
 function normalizeForIntent(s='') {
   return String(s)
     .normalize('NFKD')
@@ -198,7 +192,7 @@ function normalizeForIntent(s='') {
 function stripPricesFromPublic(text = '') {
   const lines = (text || '').split(/\r?\n/).filter(Boolean).filter(l => {
     const s = l.toLowerCase();
-    const hasCurrency = /(?:pkr|rs\.?|rupees|price|prices|rate|rates|tariff|per\s*night|rent|rental|kiraya)/i.test(s);
+    const hasCurrency = /(?:pkr|rs\.?|rupees|price|prices|pricing|rate|rates|tariff|per\s*night|rent|rental|kiraya|قیمت|کرایہ|ریٹ|نرخ)/i.test(s);
     const hasMoneyish = /\b\d{2,3}(?:[, ]?\d{3})\b/.test(s);
     return !(hasCurrency || hasMoneyish);
   });
@@ -212,26 +206,55 @@ function detectLanguage(text = '') {
   const romanUrduTokens = [
     'aap','ap','apka','apki','apke','tum','tm','bhai','plz','pls','krdo','kardo','krna','karna',
     'raha','rha','rhe','rahe','gi','ga','hain','hy','hai','mein','mai','mujhe','acha','accha',
-    'bohat','bahut','kitna','kitni','kiraya','qeemat','keemat','kimat','rate','price','btao','bta','batao','btaye','btana',
+    'bohat','bahut','kitna','kitni','kitne','kitnay','kiraya','qeemat','keemat','kimat','rate','price','pricing','btao','batao',
     'room','booking','mausam','rasta','route','se','say'
   ];
   const hit = romanUrduTokens.some(w => new RegExp(`\\b${w}\\b`, 'i').test(t));
   return hit ? 'roman-ur' : 'en';
 }
 
+// *** PRICE INTENT — extremely inclusive ***
 function isPricingIntent(text = '') {
   const t = normalizeForIntent(text);
-  return /\b(price|prices|rate|rates|cost|costs|charge|charges|tariff|per\s*night|rent|rental)\b/i.test(t)
-      || /\b(kiraya|qeemat|keemat|kimat|qeematein|rate\s*kya|price\s*kya|rates\s*kya|btao)\b/i.test(t)
-      || /\b(kitna|kitni)\s*(per\s*night|room|hut|d)\b/i.test(t);
+
+  // Quick phrasal checks
+  if (/\bhow much\b/.test(t)) return true;
+  if (/\bkitna\b|\bkitni\b|\bkitne\b|\bkitnay\b/.test(t)) return true;
+  if (/\bper night\b|\bpernight\b|\bnight price\b|\broom price\b|\bhut price\b/.test(t)) return true;
+
+  // English set
+  const en = [
+    'price','prices','pricing','quote','quotation',
+    'rate','rates','tariff','tariffs',
+    'cost','costs','amount','amounts','fee','fees','charge','charges',
+    'rent','rents','rental','rentals','renting'
+  ];
+
+  // Roman-Urdu set
+  const ru = [
+    'kiraya','kiraye','kiraiy','kirayein','kirayae',
+    'qeemat','keemat','kimat','qeematein','rate kya','price kya','rates kya'
+  ];
+
+  // Urdu (Arabic script)
+  const ur = [
+    'قیمت','قیمتیں','کرایہ','کرائے','نرخ','ریٹ','کتنا','کتنی'
+  ];
+
+  const buckets = [en, ru, ur];
+  for (const bucket of buckets) {
+    for (const kw of bucket) {
+      if (t.includes(kw)) return true;
+    }
+  }
+  // Numbers with money-ish words
+  if (/\b\d+\s*(price|prices|rate|rates|rent|rental|fee|fees)\b/.test(t)) return true;
+  return false;
 }
+
 function isRouteIntent(text='') {
   const t = normalizeForIntent(text);
-  return /\b(route|direction|directions|rasta|rastah|rahnumai|reach)\b/i.test(t);
-}
-function isPlayful(text='') {
-  const t = String(text).toLowerCase();
-  return /awesome|🔥|😂|😅|😜|😉|party|vibes/.test(t);
+  return /\broute\b|\bdirections?\b|\brasta\b|\brastah\b|\brahnumai\b|\breach\b/.test(t);
 }
 
 /* =========================
@@ -270,7 +293,7 @@ function trimForComment(s, limit = MAX_OUT_CHAR) {
 }
 
 /* =========================
-   HOOKS (price nudge) — updated for 40% OFF
+   HOOKS (price nudge) — 40% OFF
    ========================= */
 const HOOKS = {
   en: [
@@ -347,23 +370,23 @@ async function currentWeather(lat, lon) {
    LOCATION MESSAGE (static helper)
    ========================= */
 function locationMessageByLang(lang = 'en') {
-  const baseWhatsFirst = `\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_URL}`;
   if (lang === 'ur') {
-    return `*Roameo Resorts کا لوکیشن لنک:*\n\n👉 ${MAPS_LINK}\n\n*اہم معلومات:*\n🚙 نیلم ویلی کی سڑکیں مکمل طور پر کارپیٹڈ ہیں — سفر ہموار اور دلکش رہتا ہے۔\n\n🅿️ ریزورٹ کے قریب ایک چھوٹا سا واٹر کراسنگ ہے؛ سیڈان/لو کلیرنس گاڑیاں ہماری پرائیویٹ پارکنگ میں کھڑی کی جا سکتی ہیں (صرف 1 منٹ واک)۔\n\n💼 ہمارا عملہ سامان میں مدد کرتا ہے، اور بزرگ مہمانوں کے لیے آخری حصے پر *مفت جیپ ٹرانسفر* بھی موجود ہے۔\n\nراستے یا پلاننگ میں مدد درکار ہو تو بتائیں—ہم آپ کی آمد کو آسان اور یادگار بناتے ہیں!${baseWhatsFirst}`;
+    return `*Roameo Resorts کا لوکیشن لنک:*\n\n👉 ${MAPS_LINK}\n\n*اہم معلومات:*\n🚙 نیلم ویلی کی سڑکیں مکمل طور پر کارپیٹڈ ہیں — سفر ہموار اور دلکش رہتا ہے۔\n\n🅿️ ریزورٹ کے قریب ایک چھوٹا سا واٹر کراسنگ ہے؛ سیڈان/لو کلیرنس گاڑیاں ہماری پرائیویٹ پارکنگ میں پارک کی جا سکتی ہیں (صرف 1 منٹ واک)۔\n\n💼 ہمارا عملہ سامان میں مدد کرتا ہے، اور بزرگ مہمانوں کے لیے آخری حصے پر *مفت جیپ ٹرانسفر* بھی موجود ہے۔`;
   }
   if (lang === 'roman-ur') {
-    return `*Roameo Resorts location link:*\n\n👉 ${MAPS_LINK}\n\n*Good to know:*\n🚙 Neelum Valley ki roads fully carpeted hain—ride smooth aur scenic rehti hai.\n\n🅿️ Resort ke qareeb chhota sa water crossing hota hai; agar sedan/low-clearance car hai to private parking (sirf 1-minute walk) use kar sakte hain.\n\n💼 Team luggage mein madad karti hai, aur buzurg mehmanon ke liye last stretch par *free jeep transfer* available hai.\n\nDirections ya planning mein help chahiye ho to batayein—arrival smooth aur memorable banate hain!${baseWhatsFirst}`;
+    return `*Roameo Resorts location link:*\n\n👉 ${MAPS_LINK}\n\n*Good to know:*\n🚙 Neelum Valley ki roads fully carpeted hain—ride smooth aur scenic rehti hai.\n\n🅿️ Resort ke qareeb chhota sa water crossing hota hai; sedan/low-clearance cars private parking (sirf 1-minute walk) use kar sakti hain.\n\n💼 Team luggage mein madad karti hai; buzurg mehmanon ke liye last stretch par *free jeep transfer* available hai.`;
   }
-  return `*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\n*Good to know:*\n🚙 Roads are fully carpeted for a smooth, scenic drive.\n\n🅿️ There’s a small water crossing near the resort. Sedans/low-clearance cars can use our private parking (1-minute walk).\n\n💼 Our team helps with luggage, and we offer a *free jeep transfer* for elderly guests on the final stretch.\n\nNeed directions or trip planning help? We’ll make your arrival smooth and memorable!${baseWhatsFirst}`;
+  return `*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\n*Good to know:*\n🚙 Roads are fully carpeted for a smooth, scenic drive.\n\n🅿️ There’s a small water crossing near the resort; sedans use our private parking (1-minute walk).\n\n💼 Our team helps with luggage and offers a *free jeep transfer* for elderly guests on the final stretch.`;
 }
 
 /* =========================
-   STRICT GPT (JSON) + RENDERER (kept for structured replies)
+   GPT (optional) — strict JSON + renderer
    ========================= */
 async function gptStructuredReply({ intent, lang, userText, facts, extras }) {
   if (!OPENAI_API_KEY) return null;
 
   const headers = { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' };
+
   const schema = {
     name: "roameo_reply",
     schema: {
@@ -400,11 +423,8 @@ async function gptStructuredReply({ intent, lang, userText, facts, extras }) {
 
   const sys = [
     `You are Roameo Resorts' assistant. Never invent facts.`,
-    `Numeric prices are allowed only in DMs (here it's DM unless caller flags comment).`,
+    `Respect privacy: numeric prices are allowed only in DMs.`,
     `Use "lang" language; keep lines short, emoji-light. Return ONLY JSON per schema.`,
-    `When kind="prices": Header → blank line → "Limited-Time Discounted Rate List:" →`,
-    `Deluxe line → discount line → blank line → Executive line → discount line →`,
-    `blank line → "Terms & Conditions:" with bullet-style lines.`
   ].join(' ');
 
   const payload = {
@@ -443,70 +463,100 @@ function renderCard(j, platform = 'dm') {
 }
 
 /* =========================================================
-   DM price message — HARD-CODED LAYOUT (EN / Roman-Urdu / Urdu)
+   DM price message — HARD-CODED LAYOUT (tight bullets)
    ========================================================= */
 function discounted(n) { return Math.round(n * (1 - DISCOUNT.percent / 100)); }
 function fm(n){ return Number(n).toLocaleString('en-PK'); }
 
+function bulletsBlock(lines) {
+  return lines.join('\n'); // tight — single newline between bullets
+}
+
 async function dmPriceMessage(userText = '') {
   const lang = detectLanguage(userText);
+
   const dBase = FACTS.rates.deluxe.base;
   const eBase = FACTS.rates.executive.base;
   const dDisc = discounted(dBase);
   const eDisc = discounted(eBase);
 
-  let header, title, deluxe, exec, termsTitle, bullets, closer;
+  let msg;
 
   if (lang === 'ur') {
-    header = `ہم Roameo Resorts میں اس وقت ${DISCOUNT.percent}% محدود مدت کی رعایت پیش کر رہے ہیں — صرف ${DISCOUNT.validUntilText} تک!`;
-    title  = `📍 رعایتی ریٹ فہرست:`;
-    deluxe = `ڈیلکس ہٹ – PKR ${fm(dBase)} فی رات\n✨ فلیٹ ${DISCOUNT.percent}% آف → PKR ${fm(dDisc)} فی رات`;
-    exec   = `ایگزیکٹو ہٹ – PKR ${fm(eBase)} فی رات\n✨ فلیٹ ${DISCOUNT.percent}% آف → PKR ${fm(eDisc)} فی رات`;
-    termsTitle = `شرائط و ضوابط:`;
-    bullets = [
-      `• قیمتیں تمام ٹیکسز سمیت ہیں`,
-      `• فی بُکنگ 2 مہمانوں کے لیے ناشتہ مفت`,
-      `• اضافی ناشتہ: فی فرد PKR 500`,
-      `• ریزرویشن کی تصدیق کے لیے 50% ایڈوانس لازمی`,
-      `• آفر ${DISCOUNT.validUntilText} تک مؤثر`
-    ].join('\n');
-    closer = `اگر آپ بکنگ کرنا چاہیں یا کوئی مدد چاہیے ہو تو بتا دیجیے! 🌿✨`;
+    msg = [
+`ہم Roameo Resorts میں اس وقت ${DISCOUNT.percent}% محدود مدت کی رعایت پیش کر رہے ہیں — صرف ${DISCOUNT.validUntilText} تک!`,
+
+`📍 رعایتی ریٹ فہرست:`,
+
+`ڈیلکس ہٹ – PKR ${fm(dBase)} فی رات`,
+`✨ فلیٹ ${DISCOUNT.percent}% آف → PKR ${fm(dDisc)} فی رات`,
+
+`ایگزیکٹو ہٹ – PKR ${fm(eBase)} فی رات`,
+`✨ فلیٹ ${DISCOUNT.percent}% آف → PKR ${fm(eDisc)} فی رات`,
+
+`Terms & Conditions:`,
+bulletsBlock([
+`• قیمتیں تمام ٹیکسز سمیت ہیں`,
+`• فی بُکنگ 2 مہمانوں کے لیے ناشتہ مفت`,
+`• اضافی ناشتہ: فی فرد PKR 500`,
+`• ریزرویشن کی تصدیق کے لیے 50% ایڈوانس لازمی`,
+`• آفر ${DISCOUNT.validUntilText} تک مؤثر`
+]),
+
+`اگر آپ بکنگ کرنا چاہیں یا کوئی مدد چاہیے ہو تو بتا دیجیے! 🌿✨`
+    ].join('\n\n');
   } else if (lang === 'roman-ur') {
-    header = `Roameo Resorts par abhi ${DISCOUNT.percent}% limited-time discount chal raha hai — sirf ${DISCOUNT.validUntilText} tak!`;
-    title  = `📍 Limited-Time Discounted Rate List:`;
-    deluxe = `Deluxe Hut – PKR ${fm(dBase)}/night\n✨ Flat ${DISCOUNT.percent}% Off → PKR ${fm(dDisc)}/night`;
-    exec   = `Executive Hut – PKR ${fm(eBase)}/night\n✨ Flat ${DISCOUNT.percent}% Off → PKR ${fm(eDisc)}/night`;
-    termsTitle = `Terms & Conditions:`;
-    bullets = [
-      `• Rates are inclusive of all taxes`,
-      `• Complimentary breakfast for 2 guests per booking`,
-      `• Additional breakfast charges: PKR 500 per person`,
-      `• 50% advance payment required to confirm the reservation`,
-      `• Offer valid till ${DISCOUNT.validUntilText}`
-    ].join('\n');
-    closer = `Let us know if you’d like to book your stay or need any assistance! 🌿✨`;
+    msg = [
+`Roameo Resorts par abhi ${DISCOUNT.percent}% limited-time discount chal raha hai — sirf ${DISCOUNT.validUntilText} tak!`,
+
+`📍 Limited-Time Discounted Rate List:`,
+
+`Deluxe Hut – PKR ${fm(dBase)}/night`,
+`✨ Flat ${DISCOUNT.percent}% Off → PKR ${fm(dDisc)}/night`,
+
+`Executive Hut – PKR ${fm(eBase)}/night`,
+`✨ Flat ${DISCOUNT.percent}% Off → PKR ${fm(eDisc)}/night`,
+
+`Terms & Conditions:`,
+bulletsBlock([
+`• Rates are inclusive of all taxes`,
+`• Complimentary breakfast for 2 guests per booking`,
+`• Additional breakfast charges: PKR 500 per person`,
+`• 50% advance payment required to confirm the reservation`,
+`• Offer valid till ${DISCOUNT.validUntilText}`
+]),
+
+`Let us know if you’d like to book your stay or need any assistance! 🌿✨`
+    ].join('\n\n');
   } else {
-    header = `We’re currently offering an exclusive ${DISCOUNT.percent}% limited-time discount for our guests at Roameo Resorts — valid only till ${DISCOUNT.validUntilText}!`;
-    title  = `📍 Limited-Time Discounted Rate List:`;
-    deluxe = `Deluxe Hut – PKR ${fm(dBase)}/night\n✨ Flat ${DISCOUNT.percent}% Off → PKR ${fm(dDisc)}/night`;
-    exec   = `Executive Hut – PKR ${fm(eBase)}/night\n✨ Flat ${DISCOUNT.percent}% Off → PKR ${fm(eDisc)}/night`;
-    termsTitle = `Terms & Conditions:`;
-    bullets = [
-      `• Rates are inclusive of all taxes`,
-      `• Complimentary breakfast for 2 guests per booking`,
-      `• Additional breakfast charges: PKR 500 per person`,
-      `• 50% advance payment required to confirm the reservation`,
-      `• Offer valid till ${DISCOUNT.validUntilText}`
-    ].join('\n');
-    closer = `Let us know if you’d like to book your stay or need any assistance! 🌿✨`;
+    msg = [
+`We’re currently offering an exclusive ${DISCOUNT.percent}% limited-time discount for our guests at Roameo Resorts — valid only till ${DISCOUNT.validUntilText}!`,
+
+`📍 Limited-Time Discounted Rate List:`,
+
+`Deluxe Hut – PKR ${fm(dBase)}/night`,
+`✨ Flat ${DISCOUNT.percent}% Off → PKR ${fm(dDisc)}/night`,
+
+`Executive Hut – PKR ${fm(eBase)}/night`,
+`✨ Flat ${DISCOUNT.percent}% Off → PKR ${fm(eDisc)}/night`,
+
+`Terms & Conditions:`,
+bulletsBlock([
+`• Rates are inclusive of all taxes`,
+`• Complimentary breakfast for 2 guests per booking`,
+`• Additional breakfast charges: PKR 500 per person`,
+`• 50% advance payment required to confirm the reservation`,
+`• Offer valid till ${DISCOUNT.validUntilText}`
+]),
+
+`Let us know if you’d like to book your stay or need any assistance! 🌿✨`
+    ].join('\n\n');
   }
 
-  // Section gaps, single-spaced bullets, WhatsApp-first CTA
-  const body =
-    `${header}\n\n${title}\n\n${deluxe}\n\n${exec}\n\n${termsTitle}\n${bullets}\n\n${closer}` +
-    `\n\nWhatsApp: ${WHATSAPP_LINK}\nAvailability / book: ${SITE_URL}`;
+  // WhatsApp FIRST, then Website (as requested)
+  msg = `${msg}\n\nWhatsApp: ${WHATSAPP_LINK}\nAvailability / book: ${SITE_URL}`;
 
-  return sanitizeVoice(body);
+  return sanitizeVoice(msg);
 }
 
 /* =========================
@@ -558,33 +608,72 @@ async function dmRouteMessage(userText = '') {
     if (r) routeInfo = { origin, distance_km: Number(km(r.meters)), drive_time: hhmm(r.seconds) };
   }
 
-  const facts = { map: MAPS_LINK, location_name: RESORT_LOCATION_NAME };
-  const extras = { route: routeInfo };
+  const simple = routeInfo
+    ? (lang === 'ur'
+        ? `*${origin}* سے Roameo Resorts تک تقریباً ${routeInfo.distance_km} کلومیٹر — سفر وقت ${routeInfo.drive_time}.\n\nلوکیشن: ${MAPS_LINK}`
+        : lang === 'roman-ur'
+          ? `From *${origin}* to Roameo Resorts ~${routeInfo.distance_km} km, drive ~${routeInfo.drive_time}.\n\nLocation: ${MAPS_LINK}`
+          : `From *${origin}* to Roameo Resorts is ~${routeInfo.distance_km} km (~${routeInfo.drive_time}).\n\nLocation: ${MAPS_LINK}`)
+    : (lang === 'ur'
+        ? `لوکیشن لنک: ${MAPS_LINK}`
+        : (lang === 'roman-ur' ? `Location: ${MAPS_LINK}` : `Location: ${MAPS_LINK}`));
 
-  const j = await gptStructuredReply({ intent: "route", lang, userText, facts, extras });
-  let body;
-  if (!j) {
-    body = routeInfo
-      ? (lang === 'ur'
-          ? `*${origin}* سے Roameo Resorts تک تقریباً ${routeInfo.distance_km} کلومیٹر — سفر وقت ${routeInfo.drive_time}۔ لوکیشن: ${MAPS_LINK}`
-          : lang === 'roman-ur'
-            ? `From *${origin}* to Roameo Resorts ~${routeInfo.distance_km} km, drive ~${routeInfo.drive_time}. Location: ${MAPS_LINK}`
-            : `From *${origin}* to Roameo Resorts is ~${routeInfo.distance_km} km (~${routeInfo.drive_time}). Location: ${MAPS_LINK}`)
-      : (lang === 'ur'
-          ? `لوکیشن لنک: ${MAPS_LINK}`
-          : (lang === 'roman-ur' ? `Location: ${MAPS_LINK}` : `Location: ${MAPS_LINK}`));
-  } else {
-    body = renderCard(j, 'dm');
-  }
-
-  return sanitizeVoice(`${body}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_URL}`);
+  return sanitizeVoice(`${simple}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
 }
 
 /* =========================
-   Decision helpers (CTA)
+   Generic fallback that answers + bridges to Roameo
+   ========================= */
+function fallbackGeneral(lang = 'en', userText = '') {
+  const t = normalizeForIntent(userText);
+
+  // A couple of light heuristics so the answer feels relevant
+  let lead;
+  if (/earth.*flat|flat.*earth/.test(t)) {
+    lead = (lang === 'ur')
+      ? 'نہیں، زمین چپٹی نہیں بلکہ گول (oblate spheroid) ہے۔'
+      : (lang === 'roman-ur')
+        ? 'Nahi, Earth flat nahi — oblate spheroid hoti hai.'
+        : 'No—the Earth is not flat; it is an oblate spheroid.';
+  } else if (/what is\b/.test(t)) {
+    const term = userText.replace(/^.*what is/i, '').replace(/[?!.]+$/,'').trim();
+    lead = (lang === 'ur')
+      ? `عمومی طور پر "${term}" سے مراد ایک عمومی تعریف/چیز ہوتی ہے—سیاق کے مطابق بدل سکتی ہے۔`
+      : (lang === 'roman-ur')
+        ? `"${term}" aam tor par ek generic cheez/taaruf hota hai—context par depend karta hai.`
+        : `In general, “${term}” refers to a common concept/definition—it varies by context.`;
+  } else if (/laptop/.test(t)) {
+    lead = (lang === 'ur')
+      ? 'لیپ ٹاپ ایک پورٹ ایبل کمپیوٹر ہے جس میں ڈیسک ٹاپ کے زیادہ تر حصے ایک یونٹ میں ہوتے ہیں۔'
+      : (lang === 'roman-ur')
+        ? 'Laptop ek portable computer hota hai jo desktop ke components ko single unit mein laata hai.'
+        : 'A laptop is a portable personal computer that combines the main components in a single unit.';
+  } else {
+    lead = (lang === 'ur')
+      ? 'اچھا سوال! مختصر جواب سیاق پر منحصر ہوتا ہے۔'
+      : (lang === 'roman-ur')
+        ? 'Achha sawaal! Short answer context par depend karta hai.'
+        : 'Good question! The short answer depends on context.';
+  }
+
+  const bridge = (lang === 'ur')
+    ? 'اگر آپ نیلم ویلی کی طرف ٹرپ پلان کر رہے ہیں تو Roameo Resorts کی دریا کے سامنے آرام دہ ہٹس اور ناشتہ آپ کے قیام کو آسان بنا دیتے ہیں۔'
+    : (lang === 'roman-ur')
+      ? 'Agar aap Neelum Valley ki trip plan kar rahe hain to Roameo Resorts ki riverfront huts aur complimentary breakfast stay ko bohat easy banate hain.'
+      : 'If you’re planning a trip around Neelum Valley, Roameo Resorts’ river-front huts and complimentary breakfast make for an easy, relaxing escape.';
+
+  const cta = (lang === 'ur')
+    ? `\n\nWhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`
+    : `\n\nWhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`;
+
+  return sanitizeVoice(`${lead}\n${bridge}${cta}`);
+}
+
+/* =========================
+   Decision helpers
    ========================= */
 function shouldAttachCTA(intent, surface) {
-  if (surface === 'comment' && intent === 'rates') return false;
+  // never show numeric pricing in public comments — but CTAs are fine
   return true;
 }
 function attachCTA(body, intent, platform, surface) {
@@ -592,135 +681,67 @@ function attachCTA(body, intent, platform, surface) {
   const compact = (body || '').trim();
   const already = /WhatsApp:|wa\.me|roameoresorts\.com/i.test(compact);
   if (already) return compact;
-  const cta = `WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`;
-  return `${compact}\n\n${cta}`.trim();
+  const cta = platform === 'instagram'
+    ? `WhatsApp: ${WHATSAPP_NUMBER} • Website: ${SITE_SHORT}`
+    : `WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`;
+  return `${compact}\n${cta}`.trim();
 }
 
 /* =========================
-   SMART FALLBACK — topical one-liner + Roameo pivot
+   GPT general wrapper (uses fallback when needed)
    ========================= */
-async function fallbackGeneral(lang = 'en', userText = '') {
-  if (OPENAI_API_KEY && (userText || '').trim()) {
-    try {
-      const headers = { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' };
-      const sys = [
-        'You are a concise concierge for Roameo Resorts.',
-        'TASK: (1) Give a single-sentence, correct, neutral answer to the user question; (2) In a second short sentence, pivot to how Roameo Resorts in Neelum is a relaxing riverfront escape and invite the user to ask trip questions.',
-        'Never mention prices, numbers, or availability. Family-friendly, minimal emoji. Keep it brief.',
-        `Respond in language code: ${lang}.`
-      ].join(' ');
-      const payload = {
-        model: OPENAI_MODEL,
-        messages: [
-          { role: 'system', content: sys },
-          { role: 'user', content: userText }
-        ],
-        temperature: 0.2
-      };
-      const { data } = await axios.post('https://api.openai.com/v1/chat/completions', payload, { headers, timeout: 12000 });
-      const text = (data?.choices?.[0]?.message?.content || '').trim();
-      if (text) return sanitizeVoice(`${text}\n\nWhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`);
-    } catch (e) { /* fall through */ }
+async function generateReply({ intent, userText, lang, asComment }) {
+  // For "general", prefer our deterministic fallback to avoid odd answers
+  if (intent === 'general') {
+    let out = fallbackGeneral(lang, userText);
+    return asComment ? stripPricesFromPublic(out) : out;
   }
 
-  // Offline minimal fallback
-  if (lang === 'ur') {
-    return sanitizeVoice(
-      `اچھا سوال ہے—مختصر جواب موضوع پر منحصر ہے۔ سفر پلان کے لیے Roameo Resorts (نیلم) کی ریورفرنٹ ہٹس پرسکون قیام دیتی ہیں۔\n\nWhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`
-    );
-  }
-  if (lang === 'roman-ur') {
-    return sanitizeVoice(
-      `Achha sawaal—short answer topic par depend karta hai. Trip plan ho to Roameo Resorts (Neelum) ki riverfront huts relaxed stay deti hain.\n\nWhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`
-    );
-  }
-  return sanitizeVoice(
-    `Good question—the exact answer depends on the topic. For your trip, Roameo Resorts in Neelum offers cozy riverfront huts for a relaxing escape.\n\nWhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`
-  );
-}
-
-/* =========================
-   GPT general wrapper
-   ========================= */
-async function generateReply({ intent, userText, lang, asComment, playful, enrich }) {
   const facts = {
     location_name: RESORT_LOCATION_NAME,
     map: MAPS_LINK,
     checkin: FACTS.checkin, checkout: FACTS.checkout,
     facilities: FACTS.facilities, tnc: FACTS.tnc
   };
-  const extras = { weather: enrich?.wx || null };
 
-  // Never let comments produce price numbers
-  const safeIntent = (asComment && intent === 'rates') ? 'general' : intent;
-
-  const j = await gptStructuredReply({ intent: safeIntent, lang, userText, facts, extras });
-
+  const j = await gptStructuredReply({ intent, lang, userText, facts, extras: {} });
   if (!j) {
-    return await fallbackGeneral(lang, userText);
+    let out = fallbackGeneral(lang, userText);
+    return asComment ? stripPricesFromPublic(out) : out;
   }
 
   let out = renderCard(j, asComment ? 'comment' : 'dm');
-  if (!out || /^we.?re here to help/i.test(out)) {
-    out = await fallbackGeneral(lang, userText);
-  }
   if (asComment) out = stripPricesFromPublic(out);
   return sanitizeVoice(out);
 }
 
 /* =========================
-   Intent
+   Decision flow
    ========================= */
 function intentFromText(text = '') {
   const t = normalizeForIntent(text);
-  const wantsLocation   = /\b(location|where|address|map|pin|google\s*maps|reach)\b/i.test(t);
-  const wantsRates      = isPricingIntent(t);
-  const wantsFacilities = /\b(facility|facilities|amenity|amenities|wifi|internet|kitchen|food|meal|heater|bonfire|family|kids|children|parking|jeep|inverter)\b/i.test(t);
-  const wantsBooking    = /\b(book|booking|reserve|reservation|checkin|checkin|checkout|advance|payment)\b/i.test(t);
-  const wantsAvail      = /\b(availability|available|dates|calendar)\b/i.test(t);
-  const wantsDistance   = /\b(distance|far|how\s*far|hours|drive|time|eta)\b/i.test(t);
-  const wantsWeather    = /\b(weather|temperature|cold|hot|forecast|rain)\b/i.test(t);
-  const wantsRoute      = isRouteIntent(t);
-  const wantsVideo      = /\b(video|live\s*video|exterior|outside|hotel\s*exterior|reel)\b/i.test(t);
-  const wantsContact    = /\b(contact|manager|owner|number|phone|whats\s*app|whatsapp|call|speak|raabta)\b/i.test(t);
+  const wantsLocation   = /\blocation\b|\bwhere\b|\baddress\b|\bmap\b|\bpin\b|\bdirections?\b|\bgoogle maps\b|\breach\b/.test(t);
+  const wantsRates      = isPricingIntent(text);
+  const wantsFacilities = /\bfaciliti(?:y|ies)\b|\bamenit(?:y|ies)\b|\bwifi\b|\binternet\b|\bkitchen\b|\bfood\b|\bmeal\b|\bheater\b|\bbonfire\b|\bfamily\b|\bkids?\b|\bparking\b|\bjeep\b|\binverter\b/.test(t);
+  const wantsBooking    = /\bbook\b|\bbooking\b|\breserve\b|\breservation\b|\bcheck ?in\b|\bcheckin\b|\bcheck ?out\b|\bcheckout\b|\badvance\b|\bpayment\b/.test(t);
+  const wantsAvail      = /\bavailability\b|\bavailable\b|\bdates?\b|\bcalendar\b/.test(t);
+  const wantsDistance   = /\bdistance\b|\bhow far\b|\bhours\b|\bdrive\b|\btime from\b|\beta\b/.test(t);
+  const wantsWeather    = /\bweather\b|\btemperature\b|\bcold\b|\bhot\b|\bforecast\b|\brain\b|\bmausam\b/.test(t);
+  const wantsRoute      = isRouteIntent(text);
+  const wantsContact    = /\bcontact\b|\bmanager\b|\bowner\b|\bnumber\b|\bphone\b|\bwhats\s*app\b|\bwhatsapp\b|\bcall\b|\bspeak to\b|\braabta\b/.test(t);
 
-  return {
-    wantsLocation, wantsRates, wantsFacilities, wantsBooking, wantsAvail,
-    wantsDistance, wantsWeather, wantsRoute, wantsVideo, wantsContact
-  };
-}
-
-/* =========================
-   DECIDER for comments (and can be used elsewhere)
-   ========================= */
-async function decideReply(text, { surface = 'comment', platform = 'facebook' } = {}) {
-  const lang = detectLanguage(text);
-  const intents = intentFromText(text);
-
-  if (intents.wantsRates && surface === 'comment') {
-    // prices not allowed publicly; handled by callers (nudge + private reply)
-    return priceNudgePublic(lang);
-  }
-
-  const reply = await generateReply({
-    intent: intents.wantsRates ? 'rates'
-          : intents.wantsRoute ? 'route'
-          : intents.wantsLocation ? 'location'
-          : 'general',
-    userText: text, lang, asComment: surface === 'comment', playful: isPlayful(text), enrich: {}
-  });
-
-  return attachCTA(reply, 'general', platform, surface);
+  return { wantsLocation, wantsRates, wantsFacilities, wantsBooking, wantsAvail,
+           wantsDistance, wantsWeather, wantsRoute, wantsContact };
 }
 
 /* =========================
    Shared DM handler (stateful for route origin)
    ========================= */
 function isAffirmative(text = '') {
-  const t = (text || '').trim().toLowerCase();
-  const en = /\b(yes|yeah|yep|sure|ok(ay)?|please|go ahead|sounds good|alright|affirmative|y)\b/;
-  const ru = /\b(haan|han|ji|jee|bilkul|theek(?:\s*hai)?|acha|accha|zaroor|krdo|kardo|kar do|kr den|krden)\b/;
-  const ur = /(?:\u062C\u06CC|\u062C\u06CC\u06C1|\u06C1\u0627\u06BA|\u0628\u0644\u06A9\u0644|\u062A\u06BE\u06CC\u06A9\s?\u06C1\u06D2?)/;
+  const t = normalizeForIntent(text);
+  const en = /\b(yes|yeah|yep|sure|okay|ok|please|go ahead|sounds good|alright|affirmative|y)\b/;
+  const ru = /\b(haan|han|ji|jee|bilkul|theek hai|acha|accha|zaroor|krdo|kardo|kar do|kr den|krden)\b/;
+  const ur = /(?:\u062C\u06CC|\u062C\u06CC\u06C1|\u06C1\u0627\u06BA|\u0628\u0644\u06A9\u0644|\u062A\u06BE\u06CC\u06A9)/;
   return en.test(t) || ru.test(t) || ur.test(t);
 }
 
@@ -742,17 +763,15 @@ async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
       : lang === 'roman-ur'
         ? `Great! Apni *dates* aur *guests ki tadaad* bata dein. Chahein to *kis shehar se aa rahe hain* bhi likh dein.`
         : `Awesome! Please share your *travel dates* and *number of guests*. Also tell us *which city you’ll start from*.`;
-    return sendBatched(psid, attachCTA(msg, 'general', 'messenger', 'dm'));
+    return sendBatched(psid, msg);
   }
 
-  // DM: contact/manager shortcut
+  // Contact / manager
   if (intents.wantsContact) {
     const msg = lang === 'ur'
-      ? `رابطے کے لیے WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_URL}`
-      : lang === 'roman-ur'
-        ? `Contact ke liye WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_URL}`
-        : `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_URL}`;
-    return sendBatched(psid, sanitizeVoice(msg));
+      ? `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`
+      : `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`;
+    return sendBatched(psid, msg);
   }
 
   if (state === 'awaiting_details') {
@@ -760,19 +779,20 @@ async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
     const msg = lang === 'ur'
       ? `شکریہ! بکنگ کی تصدیق کے لیے ویب سائٹ استعمال کریں: ${SITE_URL}`
       : lang === 'roman-ur'
-        ? `Shukriya! Booking ki tasdeeq ke liye website use karein: ${SITE_URL}`
+        ? `Shukriya! Booking confirm karne ke liye: ${SITE_URL}`
         : `Thanks! To confirm your booking, please use: ${SITE_URL}`;
-    await sendBatched(psid, attachCTA(msg, 'general', 'messenger', 'dm'));
+    await sendBatched(psid, msg);
   }
 
   if (!AUTO_REPLY_ENABLED) return;
 
   // Quick DM branches
   if (intents.wantsLocation) {
-    return sendBatched(psid, sanitizeVoice(locationMessageByLang(lang)));
+    const blocks = sanitizeVoice(locationMessageByLang(lang)) + `\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`;
+    return sendBatched(psid, blocks);
   }
   if (intents.wantsRates) {
-    return sendBatched(psid, await dmPriceMessage(text)); // already contains CTA
+    return sendBatched(psid, await dmPriceMessage(text));
   }
   if (intents.wantsRoute || intents.wantsDistance) {
     const origin = extractOrigin(text);
@@ -783,33 +803,18 @@ async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
         : lang === 'roman-ur'
           ? 'Apni rawangi ka shehar batayein. Example: "route from Lahore"'
           : 'Please tell us your departure city. Example: "route from Lahore".';
-      return sendBatched(psid, attachCTA(ask, 'general', 'messenger', 'dm'));
+      return sendBatched(psid, ask);
     }
-    return sendBatched(psid, await dmRouteMessage(text)); // contains CTA
-  }
-  if (intents.wantsVideo) {
-    const msg = lang === 'ur'
-      ? `اس وقت لائیو ویڈیو دستیاب نہیں، لیکن تازہ *انٹیریئر/ایکسٹیریئر* کی جھلکیاں Instagram پر ہیں:\n${INSTAGRAM_PROFILE}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_URL}`
-      : lang === 'roman-ur'
-        ? `Live video abhi available nahi, lekin recent *interior/exterior* reels & photos Instagram par hain:\n${INSTAGRAM_PROFILE}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_URL}`
-        : `We don’t have a live video right now, but you can see our latest *interior/exterior* reels & photos on Instagram:\n${INSTAGRAM_PROFILE}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_URL}`;
-    return sendBatched(psid, sanitizeVoice(msg));
+    return sendBatched(psid, await dmRouteMessage(text));
   }
 
-  // Compose general DM
-  let wx = null;
-  if ((intents.wantsWeather || intents.wantsLocation || intents.wantsBooking || intents.wantsRates) && FACTS.resort_coords.includes(',')) {
-    const [lat, lon] = FACTS.resort_coords.split(',').map(s => s.trim());
-    wx = await currentWeather(parseFloat(lat), parseFloat(lon));
-  }
-
+  // Generic answer + brand bridge
   const reply = await generateReply({
-    intent: intents.wantsRates ? 'rates' : (intents.wantsRoute ? 'route' : 'general'),
-    userText: text, lang, asComment: false, playful: isPlayful(text),
-    enrich: { wx, needOriginConfirm: false }
+    intent: 'general',
+    userText: text, lang, asComment: false
   });
 
-  await sendBatched(psid, attachCTA(reply, 'general', 'messenger', 'dm'));
+  await sendBatched(psid, reply);
 }
 
 /* =========================
@@ -901,6 +906,7 @@ function isSelfComment(v = {}, platform = 'facebook') {
   if (platform === 'instagram') return from.username && from.username.toLowerCase() === BRAND_USERNAME.toLowerCase();
   return (from.name || '').toLowerCase().includes('roameo');
 }
+
 async function routePageChange(change) {
   if (change.field !== 'feed') return;
   const v = change.value || {};
@@ -942,6 +948,7 @@ async function igPrivateReplyToComment(pageId, commentId, message) {
   const payload = { recipient: { comment_id: commentId }, message: { text: splitToChunks(message)[0] } };
   await axios.post(url, payload, { params, timeout: 10000 });
 }
+
 async function routeInstagramChange(change, pageId) {
   const v = change.value || {};
   const isComment = (change.field || '').toLowerCase().includes('comment') || (v.item === 'comment');
@@ -962,6 +969,24 @@ async function routeInstagramChange(change, pageId) {
       await replyToInstagramComment(commentId, reply);
     }
   }
+}
+
+/* =========================
+   Decide reply for comments (generic -> bridge + CTA)
+   ========================= */
+async function decideReply(text, { surface, platform }) {
+  const lang = detectLanguage(text);
+  const intents = intentFromText(text);
+  if (intents.wantsLocation) {
+    return attachCTA(stripPricesFromPublic(locationMessageByLang(lang)), 'location', platform, surface);
+  }
+  if (intents.wantsRoute) {
+    const out = await generateReply({ intent: 'general', userText: text, lang, asComment: true });
+    return attachCTA(out, 'route', platform, surface);
+  }
+  // Any other vague topic -> brand-bridged generic
+  const out = await generateReply({ intent: 'general', userText: text, lang, asComment: true });
+  return attachCTA(out, 'general', platform, surface);
 }
 
 /* =========================
