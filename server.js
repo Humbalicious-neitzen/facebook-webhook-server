@@ -431,78 +431,103 @@ function renderCard(j, platform = 'dm') {
   return [header, sections, footer].join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
-/* =========================
-   PRICE MESSAGE (DM) — deterministic via structured JSON
-   ========================= */
+/* =========================================================
+   DM price message — HARD-CODED LAYOUT (EN / Roman-Urdu / Urdu)
+   ========================================================= */
 function discounted(n) { return Math.round(n * (1 - DISCOUNT.percent / 100)); }
+function fm(n){ return Number(n).toLocaleString('en-PK'); }
 
 async function dmPriceMessage(userText = '') {
   const lang = detectLanguage(userText);
-  const { nights } = parseNightsAndType(userText);
 
-  const dBase = FACTS.rates.deluxe.base, eBase = FACTS.rates.executive.base;
-  const dDisc = discounted(dBase), eDisc = discounted(eBase);
+  const dBase = FACTS.rates.deluxe.base;
+  const eBase = FACTS.rates.executive.base;
+  const dDisc = discounted(dBase);
+  const eDisc = discounted(eBase);
 
-  const facts = {
-    discount_percent: DISCOUNT.percent,
-    discount_valid_until: DISCOUNT.validUntilText,
-    prices: { deluxe_base: dBase, executive_base: eBase, deluxe_disc: dDisc, executive_disc: eDisc },
-    tnc: FACTS.tnc
-  };
+  let msg;
 
-  const totals = nights ? {
-    nights,
-    deluxe_total_base: dBase * nights, deluxe_total_disc: dDisc * nights,
-    executive_total_base: eBase * nights, executive_total_disc: eDisc * nights
-  } : null;
+  if (lang === 'ur') {
+    // Urdu (locked spacing)
+    msg = [
+`ہم Roameo Resorts میں اس وقت ${DISCOUNT.percent}% محدود مدت کی رعایت پیش کر رہے ہیں — صرف ${DISCOUNT.validUntilText} تک!`,
 
-  const extras = { pricing: totals };
+`📍 رعایتی ریٹ فہرست:`,
 
-  // Ask GPT to place lines but we control numbers/facts.
-  const j = await gptStructuredReply({
-    intent: "prices", lang, userText, facts, extras
-  });
+`ڈیلکس ہٹ – PKR ${fm(dBase)} فی رات`,
+`✨ فلیٹ ${DISCOUNT.percent}% آف → PKR ${fm(dDisc)} فی رات`,
 
-  // If GPT fails, build deterministic fallback with exact layout
-  if (!j) {
-    const hEN = `We’re currently offering an exclusive ${DISCOUNT.percent}% limited-time discount for our guests at Roameo Resorts — valid only till ${DISCOUNT.validUntilText}!`;
-    const hRU = `Roameo Resorts par abhi ${DISCOUNT.percent}% limited-time discount chal raha hai — sirf ${DISCOUNT.validUntilText} tak!`;
-    const hUR = `Roameo Resorts میں ${DISCOUNT.percent}% خصوصی رعایت — صرف ${DISCOUNT.validUntilText} تک!`;
+`ایگزیکٹو ہٹ – PKR ${fm(eBase)} فی رات`,
+`✨ فلیٹ ${DISCOUNT.percent}% آف → PKR ${fm(eDisc)} فی رات`,
 
-    const header = (lang === 'ur' ? hUR : (lang === 'roman-ur' ? hRU : hEN));
-    const listTitle = lang === 'ur' ? 'محدود مدت کی ڈسکاؤنٹڈ ریٹ فہرست:' : 'Limited-Time Discounted Rate List:';
+`شرائط و ضوابط:`,
+`• قیمتیں تمام ٹیکسز سمیت ہیں`,
+`• فی بُکنگ 2 مہمانوں کے لیے ناشتہ مفت`,
+`• اضافی ناشتہ: فی فرد PKR 500`,
+`• ریزرویشن کنفرم کرنے کے لیے 50% ایڈوانس لازمی`,
+`• آفر ${DISCOUNT.validUntilText} تک مؤثر`,
 
-    const deluxeL1 = lang === 'ur' ? `ڈیلکس ہٹ – PKR ${dBase.toLocaleString('en-PK')}/night`
-                                   : `Deluxe Hut — PKR ${dBase.toLocaleString('en-PK')}/night`;
-    const deluxeL2 = lang === 'ur' ? `✨ فلیٹ ${DISCOUNT.percent}% آف → PKR ${dDisc.toLocaleString('en-PK')}/night`
-                                   : `✨ Flat ${DISCOUNT.percent}% Off → PKR ${dDisc.toLocaleString('en-PK')}/night`;
-
-    const execL1 = lang === 'ur' ? `ایگزیکٹو ہٹ – PKR ${eBase.toLocaleString('en-PK')}/night`
-                                 : `Executive Hut — PKR ${eBase.toLocaleString('en-PK')}/night`;
-    const execL2 = lang === 'ur' ? `✨ فلیٹ ${DISCOUNT.percent}% آف → PKR ${eDisc.toLocaleString('en-PK')}/night`
-                                 : `✨ Flat ${DISCOUNT.percent}% Off → PKR ${eDisc.toLocaleString('en-PK')}/night`;
-
-    const footer = [
-      'Terms & Conditions:',
-      ...FACTS.tnc.map(x => `• ${x}`),
-      nights ? (lang === 'ur'
-        ? `\n🧮 *${nights} راتوں کے لیے*: ڈیلکس: PKR ${(dBase*nights).toLocaleString('en-PK')} → رعایتی: PKR ${(dDisc*nights).toLocaleString('en-PK')} | ایگزیکٹو: PKR ${(eBase*nights).toLocaleString('en-PK')} → رعایتی: PKR ${(eDisc*nights).toLocaleString('en-PK')}`
-        : `\n🧮 *For ${nights} nights*: Deluxe: PKR ${(dBase*nights).toLocaleString('en-PK')} → after ${DISCOUNT.percent}% OFF: PKR ${(dDisc*nights).toLocaleString('en-PK')} | Executive: PKR ${(eBase*nights).toLocaleString('en-PK')} → after ${DISCOUNT.percent}% OFF: PKR ${(eDisc*nights).toLocaleString('en-PK')}`) : ''
-    ].join('\n');
-
-    const fallback = [
-      header, '',
-      listTitle, '',
-      deluxeL1, deluxeL2, '',
-      execL1, execL2, '',
-      footer
-    ].join('\n');
-
-    return sanitizeVoice(`${fallback}\n\nAvailability / book: ${SITE_URL}\nChat on WhatsApp: ${WHATSAPP_LINK}`);
+`اگر آپ بکنگ کرنا چاہیں یا کوئی مدد چاہیے ہو تو بتا دیجیے! 🌿✨`
+    ].join('\n\n') // create block gaps
+    .replace(/\n\nشرائط/,'\n\nشرائط و ضوابط:') // keep only one blank before Terms
+    .replace(/(فی رات)\n\nایگزیکٹو/,'$1\n\nایگزیکٹو'); // ensure one blank between sections
   }
 
-  const body = renderCard(j, 'dm');
-  return sanitizeVoice(`${body}\n\nAvailability / book: ${SITE_URL}\nChat on WhatsApp: ${WHATSAPP_LINK}`);
+  else if (lang === 'roman-ur') {
+    // Roman-Urdu (locked spacing; list kept in EN for clarity)
+    msg = [
+`Roameo Resorts par abhi ${DISCOUNT.percent}% limited-time discount chal raha hai — sirf ${DISCOUNT.validUntilText} tak!`,
+
+`📍 Limited-Time Discounted Rate List:`,
+
+`Deluxe Hut – PKR ${fm(dBase)}/night`,
+`✨ Flat ${DISCOUNT.percent}% Off → PKR ${fm(dDisc)}/night`,
+
+`Executive Hut – PKR ${fm(eBase)}/night`,
+`✨ Flat ${DISCOUNT.percent}% Off → PKR ${fm(eDisc)}/night`,
+
+`Terms & Conditions:`,
+`• Rates are inclusive of all taxes`,
+`• Complimentary breakfast for 2 guests per booking`,
+`• Additional breakfast charges: PKR 500 per person`,
+`• 50% advance payment required to confirm the reservation`,
+`• Offer valid till ${DISCOUNT.validUntilText}`,
+
+`Let us know if you’d like to book your stay or need any assistance! 🌿✨`
+    ].join('\n\n')
+    .replace(/(\/night)\n\nExecutive/,'$1\n\nExecutive'); // one blank between sections
+  }
+
+  else {
+    // English (locked spacing)
+    msg = [
+`We’re currently offering an exclusive ${DISCOUNT.percent}% limited-time discount for our guests at Roameo Resorts — valid only till ${DISCOUNT.validUntilText}!`,
+
+`📍 Limited-Time Discounted Rate List:`,
+
+`Deluxe Hut – PKR ${fm(dBase)}/night`,
+`✨ Flat ${DISCOUNT.percent}% Off → PKR ${fm(dDisc)}/night`,
+
+`Executive Hut – PKR ${fm(eBase)}/night`,
+`✨ Flat ${DISCOUNT.percent}% Off → PKR ${fm(eDisc)}/night`,
+
+`Terms & Conditions:`,
+`• Rates are inclusive of all taxes`,
+`• Complimentary breakfast for 2 guests per booking`,
+`• Additional breakfast charges: PKR 500 per person`,
+`• 50% advance payment required to confirm the reservation`,
+`• Offer valid till ${DISCOUNT.validUntilText}`,
+
+`Let us know if you’d like to book your stay or need any assistance! 🌿✨`
+    ].join('\n\n')
+    .replace(/(\/night)\n\nExecutive/,'$1\n\nExecutive'); // one blank between sections
+  }
+
+  // Append CTAs with a blank line (kept outside the locked block)
+  msg = `${msg}\n\nAvailability / book: ${SITE_URL}\nChat on WhatsApp: ${WHATSAPP_LINK}`;
+
+  // Final sanitization (keeps our layout intact)
+  return sanitizeVoice(msg);
 }
 
 /* =========================
