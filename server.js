@@ -1,4 +1,4 @@
-// server.js — Roameo Resorts omni-channel bot (v4 - structured)
+// server.js — Roameo Resorts omni-channel bot (v4 - structured, newline-safe)
 // FB DMs + FB comments + IG DMs + IG comments
 // Language-correct replies (EN/Urdu/Roman-Urdu) + price card (strict layout) + route (Geoapify) + manager/contact handling
 // PUBLIC PRICES: FORBIDDEN in comments. Pricing → DM only.
@@ -163,10 +163,24 @@ function verifySignature(req) {
 /* =========================
    HELPERS — sanitize, language, intent
    ========================= */
+// 🔧 NEW: newline-safe sanitizer (preserves \n & blank lines)
 function sanitizeVoice(text = '') {
-  // Protect URLs first
+  if (!text) return '';
+
+  // Protect URLs first so we don't mangle them while normalizing whitespace
   const urls = [];
-  let s = (text || '').replace(/https?:\/\/\S+/gi, (m) => { urls.push(m); return `__URL${urls.length - 1}__`; });
+  let s = String(text).replace(/https?:\/\/\S+/gi, (m) => {
+    urls.push(m);
+    return `__URL${urls.length - 1}__`;
+  });
+
+  // Normalize line endings and trim line edges (but KEEP newlines)
+  s = s
+    .replace(/\r\n/g, '\n')         // Windows → Unix newlines
+    .replace(/[ \t]+\n/g, '\n')     // strip trailing spaces before \n
+    .replace(/\n[ \t]+/g, '\n');    // strip leading spaces after \n
+
+  // Brand voice tweaks (don’t touch newlines)
   s = s
     .replace(/\bI\'m\b/gi, 'we’re')
     .replace(/\bI am\b/gi, 'we are')
@@ -174,12 +188,22 @@ function sanitizeVoice(text = '') {
     .replace(/\bI\b/gi, 'we')
     .replace(/\bme\b/gi, 'us')
     .replace(/\bmy\b/gi, 'our')
-    .replace(/\bmine\b/gi, 'ours')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
+    .replace(/\bmine\b/gi, 'ours');
+
+  // Collapse ONLY spaces/tabs (NOT newlines)
+  s = s.replace(/[ \t]{2,}/g, ' ');
+
+  // Allow intentional blank lines but cap excessive ones to 2
+  s = s.replace(/\n{3,}/g, '\n\n');
+
+  s = s.trim();
+
+  // Restore URLs
   s = s.replace(/__URL(\d+)__/g, (_, i) => urls[Number(i)]);
+
   return s;
 }
+
 function stripPricesFromPublic(text = '') {
   const lines = (text || '').split(/\r?\n/).filter(Boolean).filter(l => {
     const s = l.toLowerCase();
@@ -468,9 +492,9 @@ async function dmPriceMessage(userText = '') {
 `• آفر ${DISCOUNT.validUntilText} تک مؤثر`,
 
 `اگر آپ بکنگ کرنا چاہیں یا کوئی مدد چاہیے ہو تو بتا دیجیے! 🌿✨`
-    ].join('\n\n') // create block gaps
-    .replace(/\n\nشرائط/,'\n\nشرائط و ضوابط:') // keep only one blank before Terms
-    .replace(/(فی رات)\n\nایگزیکٹو/,'$1\n\nایگزیکٹو'); // ensure one blank between sections
+    ].join('\n\n')
+    .replace(/\n\nشرائط/,'\n\nشرائط و ضوابط:')
+    .replace(/(فی رات)\n\nایگزیکٹو/,'$1\n\nایگزیکٹو');
   }
 
   else if (lang === 'roman-ur') {
@@ -495,7 +519,7 @@ async function dmPriceMessage(userText = '') {
 
 `Let us know if you’d like to book your stay or need any assistance! 🌿✨`
     ].join('\n\n')
-    .replace(/(\/night)\n\nExecutive/,'$1\n\nExecutive'); // one blank between sections
+    .replace(/(\/night)\n\nExecutive/,'$1\n\nExecutive');
   }
 
   else {
@@ -520,7 +544,7 @@ async function dmPriceMessage(userText = '') {
 
 `Let us know if you’d like to book your stay or need any assistance! 🌿✨`
     ].join('\n\n')
-    .replace(/(\/night)\n\nExecutive/,'$1\n\nExecutive'); // one blank between sections
+    .replace(/(\/night)\n\nExecutive/,'$1\n\nExecutive');
   }
 
   // Append CTAs with a blank line (kept outside the locked block)
