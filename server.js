@@ -1,6 +1,6 @@
-// server.js — Roameo Resorts omni-channel bot (v3)
+// server.js — Roameo Resorts omni-channel bot (v4)
 // FB DMs + FB comments + IG DMs + IG comments
-// Language-correct replies (EN/Urdu/Roman-Urdu) + smart pricing formatter + IG video/exterior routing + manager/contact handling
+// Language-correct replies (EN/Urdu/Roman-Urdu) + campaign pricing card + real driving route (Geoapify) + IG video/exterior routing + manager/contact handling
 // PUBLIC PRICES: FORBIDDEN. Pricing → DM only.
 // WhatsApp rules: IG comments = number only; FB comments & all DMs = wa.me link.
 
@@ -65,7 +65,7 @@ if (!OPENAI_API_KEY) {
 }
 
 /* =======================================================
-   40% OFF CAMPAIGN (added) — valid till 6th September 2025
+   40% OFF CAMPAIGN — valid till 6th September 2025
    ======================================================= */
 const DISCOUNT = { percent: 40, validUntilText: '6th September 2025' };
 
@@ -87,8 +87,7 @@ const FACTS = {
     '50% advance payment required to confirm the reservation',
     `Offer valid till ${DISCOUNT.validUntilText}`
   ],
-  // NOTE: Keeping your previous ladder here (not used during 40% campaign),
-  // base prices are authoritative for discount math.
+  // Base prices are authoritative for the campaign math.
   rates: {
     deluxe:    { base: 30000, n1: 27000, n2: 25500, n3: 24000 },
     executive: { base: 50000, n1: 45000, n2: 42500, n3: 40000 }
@@ -198,7 +197,7 @@ function detectLanguage(text = '') {
     /\b(aap|ap|apka|apki|apke|tum|tm|bhai|plz|pls)\b/i,
     /\b(kia|kya|kyun|kyon|kaise|kese|krna|karna|krdo|kardo|raha|rha|rhe|rahe|gi|ga|hain|hy|hai)\b/i,
     /\b(mein|mai|mujhe|yahan|wahan|acha|accha|bohat|bahut)\b/i,
-    /\b(kitna|kitni|room|booking|rate|price|mausam|kiraya|rent|rental|btao|btaye)\b/i
+    /\b(kitna|kitni|room|booking|rate|price|mausam|kiraya|rent|rental)\b/i
   ].reduce((a, rx) => a + (rx.test(t) ? 1 : 0), 0);
   const englishHits = [/\b(the|and|is|are|you|we|from|how|where|price|rate|book|available|distance|weather|rent|rental)\b/i]
     .reduce((a, rx) => a + (rx.test(t) ? 1 : 0), 0);
@@ -208,7 +207,7 @@ function detectLanguage(text = '') {
 function isPricingIntent(text = '') {
   const t = (text || '').toLowerCase();
   return /\b(price|prices|rate|rates|cost|costs|charge|charges|tariff|per\s*night|rent|rental)\b/i.test(t)
-      || /\b(kiraya|qeemat|keemat|kimat|qeematein|rate\s*kya|price\s*kya|rates\s*kya|btao|btaye)\b/i.test(t)
+      || /\b(kiraya|qeemat|keemat|kimat|qeematein|rate\s*kya|price\s*kya|rates\s*kya)\b/i.test(t)
       || /\b(kitna|kitni)\s*(per\s*night|room|hut|d\b)/i.test(t);
 }
 function isPlayful(text='') {
@@ -252,7 +251,7 @@ function trimForComment(s, limit = MAX_OUT_CHAR) {
 }
 
 /* =========================
-   HOOKS (price nudge) — updated for 40% OFF
+   HOOKS (price nudge) — 40% OFF
    ========================= */
 const HOOKS = {
   en: [
@@ -278,7 +277,7 @@ function priceNudgePublic(lang = 'en') {
 }
 
 /* =========================
-   ENRICHMENT (optional)
+   ENRICHMENT (Geo/Weather)
    ========================= */
 function km(meters) { return (meters / 1000).toFixed(0); }
 function hhmm(seconds) { const h = Math.floor(seconds/3600); const m = Math.round((seconds%3600)/60); return `${h}h ${m}m`; }
@@ -292,7 +291,7 @@ async function geocodePlace(place) {
     const feat = data?.features?.[0];
     if (!feat) return null;
     const [lon, lat] = feat.geometry.coordinates || [];
-    const res = { lat, lon, name: (feat.properties?.formatted || place) };
+    const res = { lat, lon };
     tinyCache.set(key, res);
     return res;
   } catch (e) { console.error('geoapify geocode error', e?.response?.data || e.message); return null; }
@@ -307,39 +306,7 @@ async function routeDrive(originLat, originLon, destLat, destLon) {
     const { data } = await axios.get(url, { params: { waypoints, mode: 'drive', apiKey: GEOAPIFY_API_KEY }, timeout: 12000 });
     const ft = data?.features?.[0]?.properties;
     if (!ft) return null;
-    const res = { meters: ft.distance, seconds: ft.time };
-    tinyCache.set(key, res);
-    return res;
-  } catch (e) { console.error('geoapify routing error', e?.response?.data || e.message); return null; }
-}
-// NEW: detailed route with instruction_details (road names)
-async function routeDetails(originLat, originLon, destLat, destLon) {
-  if (!GEOAPIFY_API_KEY) return null;
-  try {
-    const { data } = await axios.get('https://api.geoapify.com/v1/routing', {
-      params: {
-        waypoints: `${originLat},${originLon}|${destLat},${destLon}`,
-        mode: 'drive',
-        details: 'instruction_details',
-        apiKey: GEOAPIFY_API_KEY
-      },
-      timeout: 15000
-    });
-    const prop = data?.features?.[0]?.properties;
-    if (!prop) return null;
-    const legs = prop.legs || [];
-    const names = [];
-    for (const leg of legs) {
-      for (const step of (leg.steps || [])) {
-        const nm = (step?.name || '').trim();
-        const instr = (step?.instruction?.text || '').trim();
-        const candidate = nm || instr;
-        if (candidate && !/unnamed|service road/i.test(candidate)) {
-          if (!names.includes(candidate)) names.push(candidate);
-        }
-      }
-    }
-    return { meters: prop.distance, seconds: prop.time, topRoads: names.slice(0, 4) };
+    return { meters: ft.distance, seconds: ft.time };
   } catch (e) { console.error('geoapify routing error', e?.response?.data || e.message); return null; }
 }
 async function currentWeather(lat, lon) {
@@ -371,92 +338,6 @@ function locationMessageByLang(lang = 'en') {
 }
 
 /* =========================
-   ROUTE HELPERS (NEW)
-   ========================= */
-function gmapsDir(oLat,oLon,dLat,dLon){
-  return `https://www.google.com/maps/dir/?api=1&origin=${oLat},${oLon}&destination=${dLat},${dLon}&travelmode=driving`;
-}
-function isRouteIntent(text=''){
-  const t = text.toLowerCase();
-  return /\b(route|road|drive|directions?|how\s*to\s*reach|kaise\s*jana|raasta|rasta|rassta)\b/.test(t)
-      || /\bfrom\s+[\w\s,'-]+$/.test(t) || /(.+?)\s+(?:se|سے)\s*(?:route|raasta|rasta|rassta|jana|kaise|directions?)?$/i.test(t);
-}
-function parseOrigin(text=''){
-  const t = text.trim();
-  let m = t.match(/\bfrom\s+([A-Za-z][\w\s,'-]{2,})$/i);
-  if (m) return m[1].trim();
-  m = t.match(/(.+?)\s+(?:se|سے)\s*(?:route|raasta|rasta|rassta|jana|kaise|directions?)?$/i);
-  if (m) return m[1].trim();
-  return null;
-}
-async function routeReply(text, lang='en'){
-  if (!(FACTS.resort_coords && FACTS.resort_coords.includes(','))) {
-    return lang==='ur'
-      ? `لوکیشن: ${MAPS_LINK}\n\n🚙 سڑکیں کارپیٹڈ ہیں؛ آخری حصے میں چھوٹا سا واٹر کراسنگ ہے — ہماری ٹیم سامان میں مدد کرتی ہے۔`
-      : lang==='roman-ur'
-        ? `Location: ${MAPS_LINK}\n\n🚙 Roads carpeted; end par chhota water crossing — team luggage help karti hai.`
-        : `Location: ${MAPS_LINK}\n\n🚙 Roads are carpeted; there’s a small water crossing — our team helps with luggage.`;
-  }
-  const originText = parseOrigin(text);
-  if (!originText){
-    return lang==='ur'
-      ? `کیا آپ روانگی کا شہر لکھ سکتے ہیں؟ مثال: "route from Lahore" یا "Lahore se route"۔`
-      : lang==='roman-ur'
-        ? `Ap apni rawangi ka shehar likh dein? Example: "route from Lahore" ya "Lahore se route".`
-        : `Please tell us your departure city. Example: "route from Lahore".`;
-  }
-  const [dLat,dLon] = FACTS.resort_coords.split(',').map(s=>parseFloat(s.trim()));
-  const from = await geocodePlace(originText);
-  if (!from){
-    return lang==='ur'
-      ? `معاف کیجیے، "${originText}" نہیں ملا۔ کوئی اور قریبی جگہ لکھیں؟`
-      : lang==='roman-ur'
-        ? `Maaf kijiye, "${originText}" locate nahi hua. Koi qareebi jagah batayein?`
-        : `Sorry, couldn’t locate "${originText}". Please try a nearby city or landmark.`;
-  }
-  const details = await routeDetails(from.lat, from.lon, dLat, dLon) || await routeDrive(from.lat, from.lon, dLat, dLon);
-  const dist = details ? `${km(details.meters)} km` : '—';
-  const time = details ? hhmm(details.seconds) : '—';
-  const roads = (details?.topRoads || []).join(' → ');
-  const dirLink = gmapsDir(from.lat, from.lon, dLat, dLon);
-
-  if (lang==='ur'){
-    return [
-`*${from.name} → Roameo Resorts*`,
-`فاصلہ تقریباً: ${dist} • ڈرائیو ٹائم: ${time}`,
-roads ? `اہم روٹس: ${roads}` : '',
-`Google Maps: ${dirLink}`,
-``,
-`📍 ${MAPS_LINK}`,
-``,
-`نوٹ: آخری حصے میں چھوٹا واٹر کراسنگ ہے؛ ہماری ٹیم سامان میں مدد کرتی ہے۔`
-    ].filter(Boolean).join('\n');
-  }
-  if (lang==='roman-ur'){
-    return [
-`*${from.name} → Roameo Resorts*`,
-`Distance approx: ${dist} • Drive time: ${time}`,
-roads ? `Main route: ${roads}` : '',
-`Google Maps: ${dirLink}`,
-``,
-`📍 ${MAPS_LINK}`,
-``,
-`Note: Last stretch par chhota water crossing hota hai; team luggage mein madad karti hai.`
-    ].filter(Boolean).join('\n');
-  }
-  return [
-`*${from.name} → Roameo Resorts*`,
-`Distance approx: ${dist} • Drive time: ${time}`,
-roads ? `Main route: ${roads}` : '',
-`Google Maps: ${dirLink}`,
-``,
-`📍 ${MAPS_LINK}`,
-``,
-`Note: There’s a small water crossing near the resort; our team helps with luggage.`
-  ].filter(Boolean).join('\n');
-}
-
-/* =========================
    GPT reply composer
    ========================= */
 function systemRules(asComment, lang, playful) {
@@ -467,7 +348,6 @@ function systemRules(asComment, lang, playful) {
       : 'Write in natural English.';
   const humor = playful ? '- The user is playful; add a light one-liner.' : '- Warm and friendly; a little charm is fine.';
   const surface = asComment ? 'COMMENT' : 'DM';
-  // The KB is summarized for the model to prevent hallucinations.
   const kb = `
 Facts to rely on (do not invent new facts):
 - Brand: Roameo Resorts (riverside huts). Focus on the resort; avoid long talk about the valley.
@@ -614,7 +494,7 @@ function parseNightsAndType(text = '') {
 }
 
 /* =========================================================
-   DM price message — UPDATED for 40% OFF campaign (added)
+   DM price message — campaign layout
    ========================================================= */
 function discounted(n) { return Math.round(n * (1 - DISCOUNT.percent / 100)); }
 
@@ -627,117 +507,170 @@ async function dmPriceMessage(userText = '') {
   const dDisc = discounted(dBase);
   const eDisc = discounted(eBase);
 
-  const headerEN = `We’re currently offering an exclusive ${DISCOUNT.percent}% limited-time discount for our guests at Roameo Resorts, valid only till ${DISCOUNT.validUntilText}!`;
-  const headerRU = `Roameo Resorts par abhi ${DISCOUNT.percent}% limited-time discount chal raha hai — sirf ${DISCOUNT.validUntilText} tak!`;
-  const headerUR = `Roameo Resorts میں اس وقت ${DISCOUNT.percent}% خصوصی رعایت دستیاب ہے — صرف ${DISCOUNT.validUntilText} تک!`;
+  const IND = '  ';         // small left indent
+  const GAP = '\n';
 
-  const listEN = [
-    'Limited-Time Discounted Rate List:',
-    '',
-    `Deluxe Hut – PKR ${formatMoney(dBase)}/night`,
-    `✨ Flat ${DISCOUNT.percent}% Off → PKR ${formatMoney(dDisc)}/night`,
-    '',
-    `Executive Hut – PKR ${formatMoney(eBase)}/night`,
-    `✨ Flat ${DISCOUNT.percent}% Off → PKR ${formatMoney(eDisc)}/night`
-  ];
-  const listRU = [
-    'Limited-Time Discounted Rate List:',
-    '',
-    `Deluxe Hut – PKR ${formatMoney(dBase)}/night`,
-    `✨ Flat ${DISCOUNT.percent}% Off → PKR ${formatMoney(dDisc)}/night`,
-    '',
-    `Executive Hut – PKR ${formatMoney(eBase)}/night`,
-    `✨ Flat ${DISCOUNT.percent}% Off → PKR ${formatMoney(eDisc)}/night`
-  ];
-  const listUR = [
-    'محدود مدت کی ڈسکاؤنٹڈ ریٹ فہرست:',
-    '',
-    `ڈیلکس ہٹ – PKR ${formatMoney(dBase)} فی رات`,
-    `✨ فلیٹ ${DISCOUNT.percent}% آف → PKR ${formatMoney(dDisc)} فی رات`,
-    '',
-    `ایگزیکٹو ہٹ – PKR ${formatMoney(eBase)} فی رات`,
-    `✨ فلیٹ ${DISCOUNT.percent}% آف → PKR ${formatMoney(eDisc)} فی رات`
+  const header = (lang === 'ur')
+    ? `ہم فی الحال Roameo Resorts میں اپنے مہمانوں کے لیے *${DISCOUNT.percent}%* کی محدود مدت رعایت دے رہے ہیں — صرف *${DISCOUNT.validUntilText}* تک!`
+    : (lang === 'roman-ur')
+      ? `Abhi hamare paas *${DISCOUNT.percent}%* limited-time discount chal raha hai — sirf *${DISCOUNT.validUntilText}* tak!`
+      : `We’re currently offering an exclusive *${DISCOUNT.percent}%* limited-time discount at Roameo Resorts — valid only till *${DISCOUNT.validUntilText}*!`;
+
+  const list = [
+    `${IND}*Limited-Time Discounted Rate List:*`,
+    GAP,
+    `${IND}Deluxe Hut — PKR ${formatMoney(dBase)}/night`,
+    `${IND}✨ Flat ${DISCOUNT.percent}% Off → PKR ${formatMoney(dDisc)}/night`,
+    GAP,
+    `${IND}Executive Hut — PKR ${formatMoney(eBase)}/night`,
+    `${IND}✨ Flat ${DISCOUNT.percent}% Off → PKR ${formatMoney(eDisc)}/night`
   ];
 
-  const tnc = FACTS.tnc.map(x => `• ${x}`);
+  const tnc = [
+    'Rates are inclusive of all taxes',
+    'Complimentary breakfast for 2 guests per booking',
+    'Additional breakfast charges: PKR 500 per person',
+    `50% advance payment required to confirm the reservation`,
+    `Offer valid till ${DISCOUNT.validUntilText}`
+  ].map(x => `${IND}• ${x}`);
 
-  // Optional totals when nights detected
   let totals = '';
   if (nights) {
-    const dOrigTot = dBase * nights;
-    const dDiscTot = dDisc * nights;
-    const eOrigTot = eBase * nights;
-    const eDiscTot = eDisc * nights;
-
+    const dOrigTot = dBase * nights, dDiscTot = dDisc * nights;
+    const eOrigTot = eBase * nights, eDiscTot = eDisc * nights;
+    totals = [
+      GAP,
+      `${IND}🧮 *For ${nights} nights*:`,
+      `${IND}Deluxe: PKR ${formatMoney(dOrigTot)} → after ${DISCOUNT.percent}% OFF: PKR ${formatMoney(dDiscTot)}`,
+      `${IND}Executive: PKR ${formatMoney(eOrigTot)} → after ${DISCOUNT.percent}% OFF: PKR ${formatMoney(eDiscTot)}`
+    ].join('\n');
     if (lang === 'ur') {
       totals = [
-        '',
-        `🧮 *${nights} راتوں کے لیے*:`,
-        `ڈیلکس: PKR ${formatMoney(dOrigTot)} → رعایتی: PKR ${formatMoney(dDiscTot)}`,
-        `ایگزیکٹو: PKR ${formatMoney(eOrigTot)} → رعایتی: PKR ${formatMoney(eDiscTot)}`
-      ].join('\n');
-    } else if (lang === 'roman-ur') {
-      totals = [
-        '',
-        `🧮 *For ${nights} nights*:`,
-        `Deluxe: PKR ${formatMoney(dOrigTot)} → after ${DISCOUNT.percent}% OFF: PKR ${formatMoney(dDiscTot)}`,
-        `Executive: PKR ${formatMoney(eOrigTot)} → after ${DISCOUNT.percent}% OFF: PKR ${formatMoney(eDiscTot)}`
-      ].join('\n');
-    } else {
-      totals = [
-        '',
-        `🧮 *For ${nights} nights*:`,
-        `Deluxe: PKR ${formatMoney(dOrigTot)} → after ${DISCOUNT.percent}% OFF: PKR ${formatMoney(dDiscTot)}`,
-        `Executive: PKR ${formatMoney(eOrigTot)} → after ${DISCOUNT.percent}% OFF: PKR ${formatMoney(eDiscTot)}`
+        GAP,
+        `${IND}🧮 *${nights} راتوں کے لیے*:`,
+        `${IND}Deluxe: PKR ${formatMoney(dOrigTot)} → رعایتی: PKR ${formatMoney(dDiscTot)}`,
+        `${IND}Executive: PKR ${formatMoney(eOrigTot)} → رعایتی: PKR ${formatMoney(eDiscTot)}`
       ].join('\n');
     }
   }
 
-  let msg;
-  if (lang === 'ur') {
-    msg = [
-      headerUR,
-      '',
-      ...listUR,
-      '',
-      'Terms & Conditions:',
-      ...tnc,
-      totals,
-      '',
-      `Let us know if you’d like to book your stay or need any assistance! 🌿✨`,
-      `Availability / book: ${SITE_URL}`,
-      `Chat on WhatsApp: ${WHATSAPP_LINK}`
-    ].join('\n');
-  } else if (lang === 'roman-ur') {
-    msg = [
-      headerRU,
-      '',
-      ...listRU,
-      '',
-      'Terms & Conditions:',
-      ...tnc,
-      totals,
-      '',
-      `Let us know if you’d like to book your stay or need any assistance! 🌿✨`,
-      `Availability / book: ${SITE_URL}`,
-      `Chat on WhatsApp: ${WHATSAPP_LINK}`
-    ].join('\n');
-  } else {
-    msg = [
-      headerEN,
-      '',
-      ...listEN,
-      '',
-      'Terms & Conditions:',
-      ...tnc,
-      totals,
-      '',
-      `Let us know if you’d like to book your stay or need any assistance! 🌿✨`,
-      `Availability / book: ${SITE_URL}`,
-      `Chat on WhatsApp: ${WHATSAPP_LINK}`
-    ].join('\n');
-  }
+  const closing = [
+    GAP,
+    (lang === 'ur')
+      ? `${IND}اگر آپ بک کرنا چاہیں یا مزید مدد درکار ہو تو بتائیے! 🌿✨`
+      : `${IND}Let us know if you’d like to book your stay or need any assistance! 🌿✨`,
+    `${IND}Availability / book: ${SITE_URL}`,
+    `${IND}Chat on WhatsApp: ${WHATSAPP_LINK}`
+  ];
+
+  const msg = [header, GAP, ...list, GAP, `${IND}*Terms & Conditions:*`, ...tnc, totals, ...closing]
+    .filter(Boolean)
+    .join('\n');
+
   return sanitizeVoice(msg);
+}
+
+/* =========================
+   ROUTE HELPERS (Geoapify)
+   ========================= */
+function extractRouteOrigin(text = '') {
+  const t = (text || '').trim();
+  const m1 = t.match(/route\s+(?:from|frm|fr|se|say)\s+([a-z\u0600-\u06FF][\w\u0600-\u06FF\s,.'-]{2,})/i);
+  const m2 = t.match(/from\s+([a-z\u0600-\u06FF][\w\u0600-\u06FF\s,.'-]{2,})\s+(?:to|till|route|raasta|rasta)/i);
+  const m3 = t.match(/(?:raasta|rasta)\s+(?:from|se)\s+([a-z\u0600-\u06FF][\w\u0600-\u06FF\s,.'-]{2,})/i);
+  const guess = m1?.[1] || m2?.[1] || m3?.[1];
+  if (guess) return guess.replace(/\s+/g, ' ').trim();
+  return null;
+}
+function normalizeOriginForGeocode(origin = '') {
+  let o = (origin || '').trim();
+  if (/bilal\s*ganj/i.test(o)) o = 'Bilal Ganj, Lahore';
+  if (!/,/i.test(o)) o = `${o}, Pakistan`;
+  return o;
+}
+function properCasePlace(s = '') {
+  return s.split(' ')
+    .map(w => w[0] ? w[0].toUpperCase() + w.slice(1) : w)
+    .join(' ');
+}
+async function buildRouteReply(originRaw, lang = 'en') {
+  if (!FACTS.resort_coords.includes(',')) {
+    return lang === 'ur'
+      ? 'لوکیشن سیٹ نہیں—براہِ کرم دوبارہ پوچھیں۔'
+      : lang === 'roman-ur'
+        ? 'Location set nahin—please dobara poochein.'
+        : 'Resort coordinates are missing—please ask again.';
+  }
+  const origin = normalizeOriginForGeocode(originRaw);
+  const [destLat, destLon] = FACTS.resort_coords.split(',').map(s => parseFloat(s.trim()));
+  const g = await geocodePlace(origin);
+  if (!g) {
+    return lang === 'ur'
+      ? `*${originRaw}* نہیں ملا—براہِ کرم شہر/علاقہ واضح لکھیں (مثال: "route from Lahore")`
+      : lang === 'roman-ur'
+        ? `*${originRaw}* locate nahin hua—clear city likhein (e.g. "route from Lahore").`
+        : `Couldn’t locate *${originRaw}*. Please share a clear city name (e.g., "route from Lahore").`;
+  }
+  const rt = await routeDrive(g.lat, g.lon, destLat, destLon);
+  const prettyOrigin = properCasePlace(originRaw);
+  if (!rt) {
+    const base = lang === 'ur'
+      ? `*${prettyOrigin} → Roameo Resorts* تک ڈرائیونگ رُوٹ:\n• مشورہ: مظفرآباد → اتھمقام → کیرن → تہجیان\n📍 میپ لنک: ${MAPS_LINK}\nWhatsApp: ${WHATSAPP_NUMBER}`
+      : lang === 'roman-ur'
+        ? `*${prettyOrigin} → Roameo Resorts* driving route:\n• Suggestion: Muzaffarabad → Athmuqam → Keran → Tehjian\n📍 Map pin: ${MAPS_LINK}\nWhatsApp: ${WHATSAPP_NUMBER}`
+        : `*${prettyOrigin} → Roameo Resorts* driving route:\n• Suggestion: Muzaffarabad → Athmuqam → Keran → Tehjian\n📍 Map pin: ${MAPS_LINK}\nWhatsApp: ${WHATSAPP_NUMBER}`;
+    return sanitizeVoice(base);
+  }
+  const dist = `${km(rt.meters)} km`;
+  const eta  = hhmm(rt.seconds);
+  const chain = /lahore|bilal\s*ganj/i.test(prettyOrigin)
+    ? `Lahore → Islamabad → Muzaffarabad → Athmuqam → Keran → Tehjian`
+    : /islamabad|rawalpindi/i.test(prettyOrigin)
+      ? `Islamabad/Rawalpindi → Muzaffarabad → Athmuqam → Keran → Tehjian`
+      : `${properCasePlace(prettyOrigin)} → Muzaffarabad → Athmuqam → Keran → Tehjian`;
+
+  let lines;
+  if (lang === 'ur') {
+    lines = [
+      `🧭 *${prettyOrigin} → Roameo Resorts*`,
+      `• فاصلہ: ${dist}   • اندازاً وقت: ${eta}`,
+      `• مشورہ شدہ راستہ: ${chain}`,
+      `📍 نقشہ: ${MAPS_LINK}`,
+      '',
+      'اہم باتیں:',
+      '• سڑکیں کارپیٹڈ اور اسمووتھ ہیں',
+      '• ریزورٹ کے قریب چھوٹا سا واٹر کراسنگ (پارکنگ 1 منٹ واک)',
+      '• بزرگ مہمانوں کے لیے فری جیپ ٹرانسفر',
+      `WhatsApp: ${WHATSAPP_NUMBER}`
+    ];
+  } else if (lang === 'roman-ur') {
+    lines = [
+      `🧭 *${prettyOrigin} → Roameo Resorts*`,
+      `• Distance: ${dist}   • ETA: ${eta}`,
+      `• Suggested path: ${chain}`,
+      `📍 Map pin: ${MAPS_LINK}`,
+      '',
+      'Good to know:',
+      '• Roads are carpeted & smooth',
+      '• Small water crossing near resort (private parking 1-min walk)',
+      '• Free jeep transfer for elderly on last stretch',
+      `WhatsApp: ${WHATSAPP_NUMBER}`
+    ];
+  } else {
+    lines = [
+      `🧭 *${prettyOrigin} → Roameo Resorts*`,
+      `• Distance: ${dist}   • ETA: ${eta}`,
+      `• Suggested path: ${chain}`,
+      `📍 Map pin: ${MAPS_LINK}`,
+      '',
+      'Good to know:',
+      '• Roads are fully carpeted & smooth',
+      '• Small water crossing near the resort (private parking 1-min walk)',
+      '• Free jeep transfer for elderly guests on the last stretch',
+      `WhatsApp: ${WHATSAPP_NUMBER}`
+    ];
+  }
+  return sanitizeVoice(lines.join('\n'));
 }
 
 /* =========================
@@ -752,7 +685,7 @@ function intentFromText(text = '') {
   const wantsAvail      = /\b(availability|available|dates?|calendar)\b/i.test(t);
   const wantsDistance   = /\b(distance|far|how\s*far|hours|drive|time\s*from|eta)\b/i.test(t);
   const wantsWeather    = /\b(weather|temperature|cold|hot|forecast|rain|mausam|kaysa|kaisa)\b/i.test(t);
-  const wantsRoute      = isRouteIntent(text);
+  const wantsRoute      = /\b(route|raasta|rasta)\b/i.test(t) || /route\s+from/i.test(t);
 
   const wantsVideo      = /(video|live\s*video|current\s*video|exterior|outside|hotel\s*exterior|bahar|video\s*dekh)/i.test(t);
   const wantsContact    = /(contact|manager|owner|number|phone|whats\s*app|whatsapp|call\s*(you|me)?|speak\s*to|baat|raabta|raabta\s*number)/i.test(t);
@@ -763,7 +696,7 @@ function intentFromText(text = '') {
   };
 }
 
-async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) {
+async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook', psid: null }) {
   const t = (text || '').toLowerCase();
   const lang = detectLanguage(text);
   const playful = isPlayful(text);
@@ -772,8 +705,8 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
   const intents = intentFromText(text);
 
   const primaryIntent = intents.wantsRates ? 'rates'
-    : intents.wantsRoute ? 'route'
     : intents.wantsLocation ? 'location'
+    : intents.wantsRoute ? 'route'
     : intents.wantsVideo ? 'video'
     : intents.wantsContact ? 'contact'
     : intents.wantsFacilities ? 'facilities'
@@ -793,8 +726,20 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
     if (intents.wantsRates) {
       return await dmPriceMessage(text);
     }
-    if (intents.wantsRoute) {
-      return await routeReply(text, lang);
+    // Route / Distance → Geoapify
+    if (intents.wantsRoute || intents.wantsDistance) {
+      const origin = extractRouteOrigin(text);
+      if (origin) {
+        return await buildRouteReply(origin, lang);
+      } else {
+        // ask for city and set state
+        convo.set(ctx.psid || `route:${Date.now()}`, { mode: 'awaiting_route' });
+        return lang === 'ur'
+          ? 'براہِ کرم اپنا روانگی شہر لکھیں۔ مثال: "route from Lahore"'
+          : lang === 'roman-ur'
+            ? 'Please apna departure city batayein. Example: "route from Lahore".'
+            : 'Please tell us your departure city. Example: "route from Lahore".';
+      }
     }
     if (intents.wantsVideo) {
       const msg = lang === 'ur'
@@ -806,7 +751,7 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
     }
     if (intents.wantsContact) {
       const msg = lang === 'ur'
-        ? `ہمارے ساتھ رابطہ کرنے کے لیے WhatsApp کیجیے: ${WHATSAPP_LINK}\nیا کال/WhatsApp نمبرز: ${WHATSAPP_NUMBER}\nہم مدد کے لیے موجود ہیں!`
+        ? `ہمارے ساتھ رابطہ کرنے کے لیے WhatsApp کیجیے: ${WHATSAPP_LINK}\نیا کال/WhatsApp نمبرز: ${WHATSAPP_NUMBER}\nہم مدد کے لیے موجود ہیں!`
         : lang === 'roman-ur'
           ? `Contact ke liye WhatsApp karein: ${WHATSAPP_LINK}\nCall/WhatsApp: ${WHATSAPP_NUMBER}\nWe’re here to help!`
           : `For direct assistance, message us on WhatsApp: ${WHATSAPP_LINK}\nCall/WhatsApp: ${WHATSAPP_NUMBER}\nWe’re here to help!`;
@@ -826,25 +771,27 @@ async function decideReply(text, ctx = { surface: 'dm', platform: 'facebook' }) 
       enrich: { wx, needOriginConfirm }
     });
 
-    body += `\n\nChat on WhatsApp: ${WHATSAPP_LINK}`;
+    // Do not append WA CTA for route/distance replies
+    if (!['distance','route'].includes(primaryIntent)) {
+      body += `\n\nChat on WhatsApp: ${WHATSAPP_LINK}`;
+    }
     return body;
   }
 
   // === COMMENTS ===
   if (asComment && intents.wantsRates) return priceNudgePublic(lang);
 
-  // Special: comments asking for videos/exterior → point to IG profile (and keep short)
+  // comments asking for videos/exterior → IG profile
   if (asComment && intents.wantsVideo) {
     const msg = lang === 'ur'
       ? `تازہ *انٹیریئر/ایکسٹیریئر* ویڈیوز اور تصاویر ہمارے Instagram پروفائل پر دیکھیے: ${INSTAGRAM_PROFILE}`
       : lang === 'roman-ur'
         ? `Recent *interior/exterior* reels & photos hamare Instagram par maujood hain: ${INSTAGRAM_PROFILE}`
         : `See our latest *interior/exterior* reels & photos on Instagram: ${INSTAGRAM_PROFILE}`;
-    // do NOT append WA CTA here; keep it focused
     return trimForComment(sanitizeVoice(msg), MAX_OUT_CHAR);
   }
 
-  // Special: comments asking for contact/manager → follow per-platform rule
+  // contact/manager in comments → per-platform rule
   if (asComment && intents.wantsContact) {
     const msg = (ctx.platform === 'instagram')
       ? (lang === 'ur'
@@ -902,6 +849,14 @@ async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
   const state = convo.get(psid);
   const intents = intentFromText(text);
 
+  // If we were waiting for a route origin, treat this message as the city
+  const st = typeof state === 'object' ? state : null;
+  if (st?.mode === 'awaiting_route') {
+    convo.delete(psid);
+    const reply = await buildRouteReply(text, lang);
+    return sendBatched(psid, reply);
+  }
+
   if (isAffirmative(text)) {
     convo.set(psid, 'awaiting_details');
     const msg = lang === 'ur'
@@ -934,16 +889,15 @@ async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
 
   if (!AUTO_REPLY_ENABLED) return;
 
-  // Price intent in DM → formatted campaign
+  // Price intent in DM → campaign card
   if (intents.wantsRates) {
     return sendBatched(psid, await dmPriceMessage(text));
   }
-  // NEW: Route intent in DM
-  if (intents.wantsRoute) {
-    return sendBatched(psid, await routeReply(text, lang));
-  }
 
-  const reply = await decideReply(text, { surface: 'dm', platform: opts.channel === 'instagram' ? 'instagram' : 'facebook' });
+  const reply = await decideReply(
+    text,
+    { surface: 'dm', platform: opts.channel === 'instagram' ? 'instagram' : 'facebook', psid }
+  );
   await sendBatched(psid, reply);
 }
 
