@@ -198,7 +198,13 @@ function sanitizeVoice(text = '') {
 
   s = s.trim();
 
-   // NEW: normalize text for intent matching (kills emoji/punct, lowercases)
+  // Restore URLs
+  s = s.replace(/__URL(\d+)__/g, (_, i) => urls[Number(i)]);
+
+  return s;
+}
+
+  // NEW: normalize text for intent matching (kills emoji/punct, lowercases)
 function normalizeForIntent(s='') {
   return String(s)
     .normalize('NFKD')
@@ -206,12 +212,6 @@ function normalizeForIntent(s='') {
     .replace(/\s+/g, ' ')
     .trim()
     .toLowerCase();
-}
-
-  // Restore URLs
-  s = s.replace(/__URL(\d+)__/g, (_, i) => urls[Number(i)]);
-
-  return s;
 }
 
 function stripPricesFromPublic(text = '') {
