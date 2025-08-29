@@ -198,6 +198,16 @@ function sanitizeVoice(text = '') {
 
   s = s.trim();
 
+   // NEW: normalize text for intent matching (kills emoji/punct, lowercases)
+function normalizeForIntent(s='') {
+  return String(s)
+    .normalize('NFKD')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
   // Restore URLs
   s = s.replace(/__URL(\d+)__/g, (_, i) => urls[Number(i)]);
 
@@ -228,11 +238,35 @@ function detectLanguage(text = '') {
   return hit ? 'roman-ur' : 'en';
 }
 function isPricingIntent(text = '') {
-  const t = (text || '').toLowerCase();
-  return /\b(price|prices|rate|rates|cost|costs|charge|charges|tariff|per\s*night|rent|rental)\b/i.test(t)
-      || /\b(kiraya|qeemat|keemat|kimat|qeematein|rate\s*kya|price\s*kya|rates\s*kya|btao)\b/i.test(t)
-      || /\b(kitna|kitni)\s*(per\s*night|room|hut|d\b)/i.test(t);
+  const t = String(text);
+  const n = normalizeForIntent(t);
+
+  // Fast regex hits (English + Roman-Urdu)
+  const rxHit =
+    /\b(price|prices|rate|rates|tariff|rent|rental|cost|costs|charge|charges)\b/i.test(t) ||
+    /\b(per\s*(night|day))\b/i.test(t) ||
+    /\b(kiraya|kiraye|qeemat|keemat|kimat|qeematein|btao|batao|btaye)\b/i.test(t) ||
+    /\b(kitna|kitni|kitne|kitnay)\b/i.test(t);
+
+  if (rxHit) return true;
+
+  // Urdu-script keywords (RTL; avoid word boundaries)
+  if (/(قیمت|کرایہ|کرائے|ریٹ|نرخ)/.test(t)) return true;
+
+  // Normalized contains checks (handles emoji/punct/variants)
+  const keywords = [
+    'price','prices','rate','rates','tariff','rent','rental','cost','costs','charge','charges',
+    'per night','per day','kiraya','kiraye','qeemat','keemat','kimat'
+  ];
+  if (keywords.some(w => n.includes(w))) return true;
+
+  // Common phrasings
+  if (n.includes('how much')) return true;
+  if (/(kitne|kitnay)\s*(paise|paisay|ka|ki|ke)/i.test(n)) return true;
+
+  return false;
 }
+
 function isRouteIntent(text='') {
   const t = (text||'').toLowerCase();
   return /\b(route|directions?|rasta|rastah|rahnumai|reach)\b/i.test(t);
