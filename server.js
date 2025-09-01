@@ -1,10 +1,8 @@
-// server.js — Roameo Resorts omni-channel bot (GPT brain; no intent tree)
-// Channels: FB DMs + FB comments + IG DMs + IG comments
-// Policies enforced here:
-//  - All replies come from GPT brain (lib/brain.js). No hand-coded intents.
-//  - Public comments NEVER show numeric prices (scrub as guard).
-//  - If a public comment asks for prices, also send a private DM with prices.
-//  - DMs append "WhatsApp + Website" CTA.
+// server.js — Roameo Resorts omni-channel bot
+// FB DMs + FB comments + IG DMs + IG comments
+// Uses brain.js for everything EXCEPT: pricing in DMs is deterministic here.
+// Public comments: numeric prices are never shown; if user asks price in a comment,
+// we DM the full price card automatically.
 
 require("dotenv").config();
 
@@ -13,30 +11,26 @@ const bodyParser = require("body-parser");
 const crypto = require("crypto");
 const axios = require("axios");
 const { LRUCache } = require("lru-cache");
-const { askBrain } = require("./lib/brain");
+const { askBrain, detectLang } = require("./lib/brain");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-/* =========================
-   ENV & CONSTANTS
-   ========================= */
+/* ==== ENV ==== */
 const APP_SECRET = process.env.APP_SECRET;
 const VERIFY_TOKEN = process.env.verify_token || process.env.VERIFY_TOKEN || "verify_dev";
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
-
-// IG token (can reuse PAGE token if scoped)
 const IG_MANAGE_TOKEN = process.env.IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
 
-// Admin
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+const ROAMEO_WHATSAPP_LINK = process.env.ROAMEO_WHATSAPP_LINK || "https://wa.me/923558000078";
+const ROAMEO_WEBSITE_LINK  = process.env.ROAMEO_WEBSITE_LINK  || "https://www.roameoresorts.com/";
+const INSTAGRAM_PROFILE    = process.env.ROAMEO_INSTAGRAM     || "https://www.instagram.com/roameoresorts/";
 
-// Brand constants
-const BRAND_USERNAME = "roameoresorts"; // avoid self-replies
-const WHATSAPP_NUMBER = "03558000078"; // IG comments (number only rule if you want)
-const WHATSAPP_LINK   = process.env.ROAMEO_WHATSAPP_LINK || "https://wa.me/923558000078"; // DMs + FB comments
-const SITE_URL        = process.env.ROAMEO_WEBSITE_LINK || "https://www.roameoresorts.com/";
-const SITE_SHORT      = new URL(SITE_URL).hostname;
+// Prices you control (PKR). Edit anytime without touching brain.js
+const PRICE_DELUXE_BASE    = Number(process.env.PRICE_DELUXE_BASE    || 30000);
+const PRICE_EXECUTIVE_BASE = Number(process.env.PRICE_EXECUTIVE_BASE || 50000);
+const DISCOUNT_PERCENT     = Number(process.env.DISCOUNT_PERCENT     || 40);
+const DISCOUNT_VALID_UNTIL = process.env.DISCOUNT_VALID_UNTIL || "6th September 2025";
 
 // Limits
 const MAX_OUT_CHAR = 800;
@@ -45,34 +39,13 @@ if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
   console.warn("⚠️ Missing required env vars: APP_SECRET, VERIFY_TOKEN, PAGE_ACCESS_TOKEN");
 }
 if (!process.env.OPENAI_API_KEY) {
-  console.warn("ℹ️ OPENAI_API_KEY not set. Brain cannot reply.");
+  console.warn("ℹ️ OPENAI_API_KEY not set. Brain replies will fail.");
 }
 
-/* =========================
-   MIDDLEWARE & CACHES
-   ========================= */
+/* ==== utils ==== */
 app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
-const dedupe = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 }); // 1h
+const dedupe = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });
 
-/* =========================
-   BASIC ROUTES
-   ========================= */
-app.get("/", (_req, res) => res.send("Roameo Omni Bot (GPT) running"));
-
-/* =========================
-   VERIFY
-   ========================= */
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"] || req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-  if (mode === "subscribe" && token === VERIFY_TOKEN) return res.status(200).send(challenge);
-  return res.sendStatus(403);
-});
-
-/* =========================
-   SECURITY
-   ========================= */
 function verifySignature(req) {
   const sig = req.headers["x-hub-signature-256"];
   if (!sig || !req.rawBody || !APP_SECRET) return false;
@@ -84,10 +57,7 @@ function verifySignature(req) {
   } catch { return false; }
 }
 
-/* =========================
-   HELPERS
-   ========================= */
-function splitToChunks(s, limit = MAX_OUT_CHAR) {
+function chunks(s, limit = MAX_OUT_CHAR) {
   const out = [];
   let str = (s || "").trim();
   while (str.length > limit) {
@@ -106,59 +76,103 @@ function splitToChunks(s, limit = MAX_OUT_CHAR) {
   if (str) out.push(str);
   return out;
 }
-async function sendBatched(psid, textOrArray) {
-  const parts = Array.isArray(textOrArray) ? textOrArray : [textOrArray];
-  for (const p of parts) {
-    for (const chunk of splitToChunks(p, MAX_OUT_CHAR)) {
-      await sendText(psid, chunk);
-    }
-  }
+async function sendBatched(psid, text) {
+  for (const c of chunks(text)) await sendText(psid, c);
+}
+async function sendText(psid, text) {
+  const url = "https://graph.facebook.com/v19.0/me/messages";
+  const params = { access_token: PAGE_ACCESS_TOKEN };
+  const payload = { recipient: { id: psid }, messaging_type: "RESPONSE", message: { text } };
+  await axios.post(url, payload, { params, timeout: 10000 });
 }
 
-// Guard: NEVER allow numeric prices in public comments, even if GPT makes a mistake
-function stripPricesForComments(s) {
-  return String(s || "").replace(/\b(?:PKR|Rs\.?|Rupees?)\b[\s:.,\d→%\-]+/gi, "[rates shared in DM]");
-}
-
-// Simple detector: did the public comment ask for prices?
-function isPricingIntent(text = "") {
-  const t = String(text).toLowerCase();
+function priceAsked(text="") {
+  const t = text.toLowerCase();
   return /\b(price|prices|pricing|rate|rates|tariff|cost|charges?|rent|rental)\b/.test(t)
       || /قیمت|کرایہ|ریٹ|نرخ/.test(text)
       || /\bkitna|kitni|kitne|kitnay\b/i.test(text);
 }
+function scrubPricesForPublic(s) {
+  return String(s||"").replace(/\b(?:PKR|Rs\.?|Rupees?)\b[\s:.,\d→/%\-]+/gi, "[rates shared in DM]");
+}
+function fm(n){ return Number(n).toLocaleString("en-PK"); }
+function discounted(n){ return Math.round(n * (1 - DISCOUNT_PERCENT/100)); }
 
-function logErr(err) {
-  const payload = err?.response?.data || err.message || err;
-  if (payload?.error) console.error("FB/IG API error", payload);
-  else console.error("💥 Handler error:", payload);
+/* ==== deterministic DM pricing (never left to GPT) ==== */
+function dmPriceCard(userText="") {
+  const lang = detectLang(userText);
+  const dB = PRICE_DELUXE_BASE, eB = PRICE_EXECUTIVE_BASE;
+  const dD = discounted(dB),   eD = discounted(eB);
+
+  if (lang === "ur") {
+    return [
+`Roameo Resorts میں اس وقت ${DISCOUNT_PERCENT}% محدود مدت کی رعایت—صرف ${DISCOUNT_VALID_UNTIL} تک!`,
+`📍 ڈسکاؤنٹڈ ریٹس:`,
+`ڈیلکس ہٹ — PKR ${fm(dB)}\n✨ فلیٹ ${DISCOUNT_PERCENT}% آف → PKR ${fm(dD)}`,
+`ایگزیکٹو ہٹ — PKR ${fm(eB)}\n✨ فلیٹ ${DISCOUNT_PERCENT}% آف → PKR ${fm(eD)}`,
+`شرائط:\n• تمام ٹیکسز شامل\n• فی بُکنگ 2 مہمانوں کے لیے ناشتہ مفت\n• اضافی ناشتہ: PKR 500 فی فرد\n• کنفرمیشن کے لیے 50% ادائیگی ضروری\n• آفر ${DISCOUNT_VALID_UNTIL} تک مؤثر`,
+`بکنگ یا دستیابی کے لیے میسج کر دیں۔\n\nWhatsApp: ${ROAMEO_WHATSAPP_LINK} • Website: ${ROAMEO_WEBSITE_LINK}`
+    ].join("\n\n");
+  }
+  if (lang === "roman-ur") {
+    return [
+`Roameo Resorts par ${DISCOUNT_PERCENT}% limited-time discount — ${DISCOUNT_VALID_UNTIL} tak!`,
+`📍 Discounted Rates:`,
+`Deluxe Hut — PKR ${fm(dB)}\n✨ Flat ${DISCOUNT_PERCENT}% Off → PKR ${fm(dD)}`,
+`Executive Hut — PKR ${fm(eB)}\n✨ Flat ${DISCOUNT_PERCENT}% Off → PKR ${fm(eD)}`,
+`T&Cs:\n• Taxes included\n• Breakfast for 2 per booking\n• Extra breakfast PKR 500/person\n• 50% advance to confirm\n• Offer valid till ${DISCOUNT_VALID_UNTIL}`,
+`Availability/book ke liye bata dein.\n\nWhatsApp: ${ROAMEO_WHATSAPP_LINK} • Website: ${ROAMEO_WEBSITE_LINK}`
+    ].join("\n\n");
+  }
+  return [
+`At **Roameo Resorts**, we’re running a ${DISCOUNT_PERCENT}% limited-time discount (valid till ${DISCOUNT_VALID_UNTIL}).`,
+`📍 Discounted Rates:`,
+`Deluxe Hut — PKR ${fm(dB)}\n✨ Flat ${DISCOUNT_PERCENT}% Off → PKR ${fm(dD)}`,
+`Executive Hut — PKR ${fm(eB)}\n✨ Flat ${DISCOUNT_PERCENT}% Off → PKR ${fm(eD)}`,
+`T&Cs:\n• Rates include taxes\n• Breakfast for 2 per booking\n• Extra breakfast PKR 500/person\n• 50% advance to confirm\n• Offer valid till ${DISCOUNT_VALID_UNTIL}`,
+`Tell us your dates and guests and we’ll get you set.\n\nWhatsApp: ${ROAMEO_WHATSAPP_LINK} • Website: ${ROAMEO_WEBSITE_LINK}`
+  ].join("\n\n");
 }
 
-/* =========================
-   Brain glue (no intents)
-   ========================= */
-function surfaceFor({ isComment }) {
-  return isComment ? "comment" : "dm";
-}
-
+/* ==== one router to the brain + deterministic pricing ==== */
 async function buildReply({ text, isComment }) {
-  const surface = surfaceFor({ isComment });
-  const out = await askBrain({ text, surface });
-  let message = out.message || "We’re here to help at Roameo Resorts! 💚";
+  // 1) If public comment asks for price → public scrubbed reply + DM the card.
+  // 2) If DM asks for price → deterministic card.
+  const surface = isComment ? "comment" : "dm";
 
-  if (surface === "comment") {
-    // Guard against accidental numeric prices in public
-    message = stripPricesForComments(message);
-    return message;
+  if (!isComment && priceAsked(text)) {
+    return { message: dmPriceCard(text), alsoDM: null };
   }
 
-  // DMs → CTA footer
-  return `${message}\n\nWhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`;
+  // Ask GPT brain (it already: brand-first, links vague Qs to Roameo, routes “video/exterior” to Instagram, “manager/contact” to WhatsApp)
+  const brain = await askBrain({ text, surface });
+
+  let message = String(brain.message || "").trim();
+  if (!message) message = "At Roameo Resorts, we’re here to help with plans, prices and availability.";
+
+  // Public: never show numbers if GPT accidentally mentioned any
+  if (isComment) {
+    message = scrubPricesForPublic(message);
+  } else {
+    // DMs: always add CTA
+    message += `\n\nWhatsApp: ${ROAMEO_WHATSAPP_LINK} • Website: ${ROAMEO_WEBSITE_LINK}`;
+  }
+
+  // If the original public comment was a price question, signal caller to DM the price card too.
+  const alsoDM = isComment && priceAsked(text) ? dmPriceCard(text) : null;
+
+  return { message, alsoDM };
 }
 
-/* =========================
-   WEBHOOKS & ROUTERS
-   ========================= */
+/* ==== webhook plumbing ==== */
+app.get("/", (_req, res) => res.send("Roameo Omni Bot (GPT) running"));
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"] || req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+  if (mode === "subscribe" && token === VERIFY_TOKEN) return res.status(200).send(challenge);
+  return res.sendStatus(403);
+});
 app.post("/webhook", async (req, res) => {
   if (!verifySignature(req)) return res.sendStatus(403);
   res.sendStatus(200);
@@ -171,15 +185,10 @@ app.post("/webhook", async (req, res) => {
         if (dedupe.has(key)) continue; dedupe.set(key, true);
 
         if (Array.isArray(entry.messaging)) {
-          for (const ev of entry.messaging) await routeMessengerEvent(ev, { source: "messaging" }).catch(logErr);
+          for (const ev of entry.messaging) await routeMessengerEvent(ev).catch(console.error);
         }
         if (Array.isArray(entry.changes)) {
-          for (const change of entry.changes) await routePageChange(change).catch(logErr);
-        }
-        if (Array.isArray(entry.standby)) {
-          for (const ev of entry.standby) {
-            // We keep it simple: ignore standby unless you want to take thread control
-          }
+          for (const change of entry.changes) await routeFacebookChange(change).catch(console.error);
         }
       }
       return;
@@ -192,178 +201,100 @@ app.post("/webhook", async (req, res) => {
         if (dedupe.has(key)) continue; dedupe.set(key, true);
 
         if (Array.isArray(entry.messaging)) {
-          for (const ev of entry.messaging) await routeInstagramMessage(ev).catch(logErr);
+          for (const ev of entry.messaging) await routeInstagramMessage(ev).catch(console.error);
         }
         if (Array.isArray(entry.changes)) {
-          for (const change of entry.changes) await routeInstagramChange(change, pageId).catch(logErr);
+          for (const change of entry.changes) await routeInstagramChange(change, pageId).catch(console.error);
         }
       }
       return;
     }
-  } catch (e) { logErr(e); }
+  } catch (e) {
+    console.error("💥 Handler error:", e?.response?.data || e.message || e);
+  }
 });
 
-/* =========================
-   FB Messenger (DMs)
-   ========================= */
-async function routeMessengerEvent(event, _ctx) {
+/* ==== FB: DMs ==== */
+async function routeMessengerEvent(event) {
   if (event.delivery || event.read || event.message?.is_echo) return;
   if (event.message && event.sender?.id) {
     const text = (event.message.text || "").trim();
-    return handleTextMessage(event.sender.id, text, { channel: "messenger" });
-  }
-  if (event.postback?.payload && event.sender?.id) {
-    return handleTextMessage(event.sender.id, "help", { channel: "messenger" });
+    const { message } = await buildReply({ text, isComment: false });
+    return sendBatched(event.sender.id, message);
   }
 }
 
-/* =========================
-   FB Page Comments
-   ========================= */
-async function replyToFacebookComment(commentId, message) {
-  const url = `https://graph.facebook.com/v19.0/${commentId}/comments`;
-  await axios.post(url, { message: _trimForComment(message) }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
-}
-async function fbPrivateReplyToComment(commentId, message) {
-  const url = `https://graph.facebook.com/v19.0/${commentId}/private_replies`;
-  await axios.post(url, { message: splitToChunks(message)[0] }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
-}
-function isSelfComment(v = {}, platform = "facebook") {
-  const from = v.from || {};
-  if (platform === "instagram") return from.username && from.username.toLowerCase() === BRAND_USERNAME.toLowerCase();
-  return (from.name || "").toLowerCase().includes("roameo");
-}
-
-async function routePageChange(change) {
+/* ==== FB: comments ==== */
+async function routeFacebookChange(change) {
   if (change.field !== "feed") return;
   const v = change.value || {};
-  if (v.item === "comment" && v.comment_id) {
+  if (v.item === "comment" && v.comment_id && (!v.verb || v.verb === "add")) {
+    // avoid replying to ourselves
+    if ((v.from?.name || "").toLowerCase().includes("roameo")) return;
+
     const text = (v.message || "").trim();
-    if (v.verb && v.verb !== "add") return;
-    if (isSelfComment(v, "facebook")) return;
+    const { message, alsoDM } = await buildReply({ text, isComment: true });
 
-    try {
-      // Public reply (scrubbed)
-      const publicReply = await buildReply({ text, isComment: true });
-      await replyToFacebookComment(v.comment_id, publicReply);
+    // public reply
+    await axios.post(`https://graph.facebook.com/v19.0/${v.comment_id}/comments`,
+      { message }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
 
-      // If user asked for prices, send a private DM with prices too
-      if (isPricingIntent(text)) {
-        const dmReply = await buildReply({ text: "Please share prices", isComment: false });
-        await fbPrivateReplyToComment(v.comment_id, dmReply);
-      }
-    } catch (e) { logErr(e); }
+    // private reply with prices if asked
+    if (alsoDM) {
+      await axios.post(`https://graph.facebook.com/v19.0/${v.comment_id}/private_replies`,
+        { message: chunks(alsoDM)[0] }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
+    }
   }
 }
 
-/* =========================
-   Instagram (DMs + Comments)
-   ========================= */
+/* ==== IG: DMs ==== */
 async function routeInstagramMessage(event) {
   if (event.delivery || event.read || event.message?.is_echo) return;
   if (event.message && event.sender?.id) {
-    const igUserId = event.sender.id;
     const text = (event.message.text || "").trim();
-    const reply = await buildReply({ text, isComment: false });
-    return sendBatched(igUserId, reply);
+    const { message } = await buildReply({ text, isComment: false });
+    return sendBatched(event.sender.id, message);
   }
 }
-async function replyToInstagramComment(commentId, message) {
-  const url = `https://graph.facebook.com/v19.0/${commentId}/replies`;
-  await axios.post(url, { message: _trimForComment(message) }, { params: { access_token: IG_MANAGE_TOKEN }, timeout: 10000 });
-}
-async function igPrivateReplyToComment(pageId, commentId, message) {
-  const url = `https://graph.facebook.com/v19.0/${pageId}/messages`;
-  const params = { access_token: IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN };
-  const payload = { recipient: { comment_id: commentId }, message: { text: splitToChunks(message)[0] } };
-  await axios.post(url, payload, { params, timeout: 10000 });
-}
+
+/* ==== IG: comments ==== */
 async function routeInstagramChange(change, pageId) {
   const v = change.value || {};
-  const isComment = (change.field || "").toLowerCase().includes("comment") || (v.item === "comment");
-  if (isComment && (v.comment_id || v.id)) {
-    const commentId = v.comment_id || v.id;
-    const text = (v.text || v.message || "").trim();
-    if (v.verb && v.verb !== "add") return;
-    if (isSelfComment(v, "instagram")) return;
+  const isComment = (change.field || "").toLowerCase().includes("comment") || v.item === "comment";
+  if (!isComment) return;
 
-    try {
-      // Public reply (scrubbed)
-      const publicReply = await buildReply({ text, isComment: true });
-      await replyToInstagramComment(commentId, publicReply);
+  const commentId = v.comment_id || v.id;
+  if (!commentId || (v.verb && v.verb !== "add")) return;
+  if ((v.from?.username || "").toLowerCase() === "roameoresorts") return;
 
-      // If user asked for prices, send a private DM with prices too
-      if (isPricingIntent(text)) {
-        const dmReply = await buildReply({ text: "Please share prices", isComment: false });
-        await igPrivateReplyToComment(pageId, commentId, dmReply);
-      }
-    } catch (e) { logErr(e); }
+  const text = (v.text || v.message || "").trim();
+  const { message, alsoDM } = await buildReply({ text, isComment: true });
+
+  // public reply
+  await axios.post(`https://graph.facebook.com/v19.0/${commentId}/replies`,
+    { message }, { params: { access_token: IG_MANAGE_TOKEN }, timeout: 10000 });
+
+  // private reply with prices if asked
+  if (alsoDM) {
+    const url = `https://graph.facebook.com/v19.0/${pageId}/messages`;
+    const params = { access_token: IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN };
+    const payload = { recipient: { comment_id: commentId }, message: { text: chunks(alsoDM)[0] } };
+    await axios.post(url, payload, { params, timeout: 10000 });
   }
 }
 
-/* =========================
-   Shared DM handler
-   ========================= */
-async function handleTextMessage(psid, text, _opts = { channel: "messenger" }) {
-  const reply = await buildReply({ text, isComment: false });
-  await sendBatched(psid, reply);
-}
-
-/* =========================
-   SEND API
-   ========================= */
-async function sendText(psid, text) {
-  const url = "https://graph.facebook.com/v19.0/me/messages";
-  const params = { access_token: PAGE_ACCESS_TOKEN };
-  const payload = { recipient: { id: psid }, messaging_type: "RESPONSE", message: { text } };
-  await axios.post(url, payload, { params, timeout: 10000 });
-}
-function _trimForComment(s, limit = MAX_OUT_CHAR) {
-  const str = String(s || "");
-  if (str.length <= limit) return str;
-  return str.slice(0, limit - 1).trim() + "…";
-}
-
-/* =========================
-   ADMIN HELPERS
-   ========================= */
-function requireAdmin(req, res, next) {
-  const hdr = req.headers.authorization || "";
-  const token = hdr.startsWith("Bearer ") ? hdr.slice(7) : "";
-  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) return res.status(401).json({ error: "unauthorized" });
-  next();
-}
-app.post("/admin/subscribe", requireAdmin, async (_req, res) => {
-  const subscribed_fields = ["messages","messaging_postbacks","messaging_optins","message_deliveries","message_reads","feed"];
-  try {
-    const url = `https://graph.facebook.com/v19.0/me/subscribed_apps`;
-    const params = { access_token: PAGE_ACCESS_TOKEN };
-    const { data } = await axios.post(url, { subscribed_fields }, { params, timeout: 10000 });
-    res.json({ ok: true, data, subscribed_fields });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.response?.data || e.message });
-  }
-});
-app.get("/admin/status", requireAdmin, async (_req, res) => {
-  try {
-    const url = `https://graph.facebook.com/v19.0/me/subscribed_apps`;
-    const params = { access_token: PAGE_ACCESS_TOKEN, fields: "subscribed_fields" };
-    const { data } = await axios.get(url, { params, timeout: 10000 });
-    res.json({
-      ok: true,
-      subscribed_apps: data,
-      env: {
-        OPENAI_ENABLED: Boolean(process.env.OPENAI_API_KEY),
-        WHATSAPP_LINK: WHATSAPP_LINK,
-        SITE_URL: SITE_URL
-      }
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.response?.data || e.message });
-  }
+/* ==== admin ==== */
+app.get("/admin/status", async (_req, res) => {
+  res.json({
+    ok: true,
+    env: {
+      prices: { deluxe: PRICE_DELUXE_BASE, executive: PRICE_EXECUTIVE_BASE, discount: DISCOUNT_PERCENT, until: DISCOUNT_VALID_UNTIL },
+      whatsapp: ROAMEO_WHATSAPP_LINK,
+      website: ROAMEO_WEBSITE_LINK,
+      instagram: INSTAGRAM_PROFILE
+    }
+  });
 });
 
-/* =========================
-   START
-   ========================= */
+/* ==== start ==== */
 app.listen(PORT, () => console.log(`🚀 Listening on :${PORT}`));
