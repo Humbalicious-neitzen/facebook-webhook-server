@@ -104,7 +104,7 @@ Terms & Conditions:
 • Complimentary breakfast for 2 guests per booking
 • Additional breakfast charges: PKR 500 per person
 • 50% advance payment required to confirm the reservation
-• Offer valid till 6th September 2025
+• Offer valid till 15th September 2025
 
 Let us know if you’d like to book your stay or need any assistance! 🌿✨`).trim()
 };
