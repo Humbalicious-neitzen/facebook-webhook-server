@@ -61,9 +61,9 @@ if (!OPENAI_API_KEY) {
 }
 
 /* =======================================================
-   40% OFF CAMPAIGN — valid till 6th September 2025
+   40% OFF CAMPAIGN — valid till 15th September 2025
    ======================================================= */
-const DISCOUNT = { percent: 40, validUntilText: '6th September 2025' };
+const DISCOUNT = { percent: 40, validUntilText: '15th September 2025' };
 
 /* =========================
    BUSINESS FACTS
@@ -89,7 +89,7 @@ const FACTS = {
   },
   // Exact price card layout (DM-only). Keep spacing & newlines.
   PRICE_CARD_EN: (
-`We’re currently offering an exclusive 40% limited-time discount for our guests at Roameo Resort valid only till 6th September 2025!
+`We’re currently offering an exclusive 40% limited-time discount for our guests at Roameo Resort valid only till 15th September 2025!
 
 📍 Limited-Time Discounted Rate List:
 
