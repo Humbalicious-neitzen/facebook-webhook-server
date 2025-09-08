@@ -211,30 +211,111 @@ async function geocodePlace(place) {
     return res;
   } catch (e) { console.error('geoapify geocode error', e?.response?.data || e.message); return null; }
 }
-async function routeDrive(originLat, originLon, destLat, destLon) {
+async function getRouteInfo(originLat, originLon, destLat, destLon) {
   if (!GEOAPIFY_API_KEY) return null;
   const key = `route:${originLat},${originLon}->${destLat},${destLon}`;
   if (tinyCache.has(key)) return tinyCache.get(key);
+  
   try {
-    const url = 'https://api.geoapify.com/v1/routing';
     const waypoints = `${originLat},${originLon}|${destLat},${destLon}`;
-    const { data } = await axios.get(url, { params: { waypoints, mode: 'drive', apiKey: GEOAPIFY_API_KEY }, timeout: 12000 });
-    const ft = data?.features?.[0]?.properties;
-    if (!ft) return null;
-    return { meters: ft.distance, seconds: ft.time };
-  } catch (e) { console.error('geoapify routing error', e?.response?.data || e.message); return null; }
+    const url = 'https://api.geoapify.com/v1/routing';
+    
+    // Get multiple transport modes
+    const modes = ['drive', 'walk', 'transit'];
+    const routePromises = modes.map(async (mode) => {
+      try {
+        const { data } = await axios.get(url, { 
+          params: { 
+            waypoints, 
+            mode, 
+            apiKey: GEOAPIFY_API_KEY,
+            traffic: mode === 'drive' ? 'approximated' : undefined
+          }, 
+          timeout: 12000 
+        });
+        const ft = data?.features?.[0]?.properties;
+        if (!ft) return null;
+        return {
+          mode,
+          distance: ft.distance,
+          duration: ft.time,
+          distance_km: Number(km(ft.distance)),
+          duration_formatted: hhmm(ft.time)
+        };
+      } catch (e) {
+        console.error(`geoapify routing error for ${mode}:`, e?.response?.data || e.message);
+        return null;
+      }
+    });
+    
+    const routes = await Promise.all(routePromises);
+    const validRoutes = routes.filter(r => r !== null);
+    
+    if (validRoutes.length === 0) return null;
+    
+    const result = {
+      routes: validRoutes,
+      primary: validRoutes.find(r => r.mode === 'drive') || validRoutes[0]
+    };
+    
+    tinyCache.set(key, result);
+    return result;
+  } catch (e) { 
+    console.error('geoapify routing error', e?.response?.data || e.message); 
+    return null; 
+  }
+}
+
+// Keep the old function for backward compatibility
+async function routeDrive(originLat, originLon, destLat, destLon) {
+  const routeInfo = await getRouteInfo(originLat, originLon, destLat, destLon);
+  return routeInfo?.primary ? { meters: routeInfo.primary.distance, seconds: routeInfo.primary.duration } : null;
 }
 function extractOrigin(text='') {
   const t = text.trim();
   const rx = [
+    // Direct route queries
     /route\s+from\s+(.+)$/i,
     /rasta\s+from\s+(.+)$/i,
-    /from\s+(.+)\s+(?:to|till|for)?\s*(?:roameo|resort|neelum|tehjian)?$/i,
-    /(.+)\s+(?:se|say)\s+(?:rasta|route)/i
+    /directions?\s+from\s+(.+)$/i,
+    /how\s+to\s+reach\s+from\s+(.+)$/i,
+    /how\s+to\s+get\s+there\s+from\s+(.+)$/i,
+    
+    // Coming from patterns
+    /(?:i\s+am\s+)?coming\s+from\s+(.+)$/i,
+    /(?:i\s+am\s+)?travelling\s+from\s+(.+)$/i,
+    /(?:i\s+am\s+)?traveling\s+from\s+(.+)$/i,
+    
+    // From X to Y patterns
+    /from\s+(.+)\s+(?:to|till|for)?\s*(?:roameo|resort|neelum|tehjian|here)?$/i,
+    /(.+)\s+(?:se|say)\s+(?:rasta|route|directions?)/i,
+    /(.+)\s+to\s+(?:roameo|resort|neelum|tehjian)/i,
+    
+    // Distance/time queries
+    /how\s+far\s+is\s+(.+)\s+(?:from|to)/i,
+    /distance\s+from\s+(.+)$/i,
+    /how\s+long\s+to\s+reach\s+from\s+(.+)$/i,
+    /travel\s+time\s+from\s+(.+)$/i,
+    
+    // Urdu patterns
+    /(.+)\s+سے\s+(?:راستہ|فاصلہ|دور|کتنے|کتنا)/i,
+    /(.+)\s+سے\s+(?:کتنے|کتنا)\s+(?:کلومیٹر|گھنٹے)/i,
+    /(.+)\s+سے\s+(?:روامو|ریسورٹ)/i,
+    
+    // Roman Urdu patterns
+    /(.+)\s+se\s+(?:rasta|distance|far|kitna|kitne)/i,
+    /(.+)\s+se\s+(?:kitna|kitne)\s+(?:km|kilometer|ghante)/i,
+    /(.+)\s+se\s+(?:roameo|resort)/i
   ];
+  
   for (const r of rx) {
     const m = t.match(r);
-    if (m && m[1]) return m[1].replace(/[.?!]+$/,'').trim();
+    if (m && m[1]) {
+      let origin = m[1].replace(/[.?!]+$/,'').trim();
+      // Clean up common words that might be captured
+      origin = origin.replace(/\b(?:the|a|an|from|to|is|are|was|were|will|would|can|could|should|may|might)\b/gi, '').trim();
+      if (origin.length > 2) return origin;
+    }
   }
   return null;
 }
@@ -255,21 +336,58 @@ async function dmRouteMessage(userText = '') {
   const [dLat, dLon] = destParts.map(parseFloat);
 
   const originGeo = await geocodePlace(origin);
-  let routeInfo = null;
-  if (originGeo) {
-    const r = await routeDrive(originGeo.lat, originGeo.lon, dLat, dLon);
-    if (r) routeInfo = { origin, distance_km: Number(km(r.meters)), drive_time: hhmm(r.seconds) };
+  if (!originGeo) {
+    return lang === 'ur'
+      ? `"${origin}" کا مقام نہیں مل سکا۔ براہِ کرم شہر کا صحیح نام استعمال کریں۔\n\nلوکیشن: ${MAPS_LINK}`
+      : lang === 'roman-ur'
+        ? `"${origin}" ka location nahi mila. Sahi shehar ka naam use karein.\n\nLocation: ${MAPS_LINK}`
+        : `Could not find location for "${origin}". Please use the correct city name.\n\nLocation: ${MAPS_LINK}`;
   }
 
-  const simple = routeInfo
-    ? (lang === 'ur'
-        ? `*${origin}* سے Roameo Resorts تک تقریباً ${routeInfo.distance_km} کلومیٹر — سفر وقت ${routeInfo.drive_time}.\n\nلوکیشن: ${MAPS_LINK}`
-        : lang === 'roman-ur'
-          ? `From *${origin}* to Roameo Resorts ~${routeInfo.distance_km} km, drive ~${routeInfo.drive_time}.\n\nLocation: ${MAPS_LINK}`
-          : `From *${origin}* to Roameo Resorts is ~${routeInfo.distance_km} km (~${routeInfo.drive_time}).\n\nLocation: ${MAPS_LINK}`)
-    : (lang === 'ur' ? `لوکیشن لنک: ${MAPS_LINK}` : `Location: ${MAPS_LINK}`);
+  const routeInfo = await getRouteInfo(originGeo.lat, originGeo.lon, dLat, dLon);
+  
+  if (!routeInfo) {
+    return lang === 'ur'
+      ? `راستہ معلومات دستیاب نہیں۔ براہِ کرم بعد میں کوشش کریں۔\n\nلوکیشن: ${MAPS_LINK}`
+      : lang === 'roman-ur'
+        ? `Route info nahi mila. Baad mein try karein.\n\nLocation: ${MAPS_LINK}`
+        : `Route information not available. Please try again later.\n\nLocation: ${MAPS_LINK}`;
+  }
 
-  return sanitizeVoice(`${simple}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+  // Format comprehensive route information
+  let response = '';
+  
+  if (lang === 'ur') {
+    response = `*${origin}* سے Roameo Resorts تک:\n\n`;
+    routeInfo.routes.forEach(route => {
+      const modeName = route.mode === 'drive' ? 'گاڑی' : route.mode === 'walk' ? 'پیدل' : 'پبلک ٹرانسپورٹ';
+      response += `• ${modeName}: ${route.distance_km} کلومیٹر (${route.duration_formatted})\n`;
+    });
+    response += `\nلوکیشن: ${MAPS_LINK}`;
+  } else if (lang === 'roman-ur') {
+    response = `*${origin}* se Roameo Resorts:\n\n`;
+    routeInfo.routes.forEach(route => {
+      const modeName = route.mode === 'drive' ? 'Car' : route.mode === 'walk' ? 'Walking' : 'Public Transport';
+      response += `• ${modeName}: ${route.distance_km} km (${route.duration_formatted})\n`;
+    });
+    response += `\nLocation: ${MAPS_LINK}`;
+  } else {
+    response = `From *${origin}* to Roameo Resorts:\n\n`;
+    routeInfo.routes.forEach(route => {
+      const modeName = route.mode === 'drive' ? 'By Car' : route.mode === 'walk' ? 'Walking' : 'Public Transport';
+      response += `• ${modeName}: ${route.distance_km} km (${route.duration_formatted})\n`;
+    });
+    response += `\nLocation: ${MAPS_LINK}`;
+  }
+
+  // Add additional helpful information
+  const additionalInfo = lang === 'ur'
+    ? `\n\n💡 ٹپ: گاڑی سے آنا بہترین ہے۔ راستہ خوبصورت ہے!`
+    : lang === 'roman-ur'
+      ? `\n\n💡 Tip: Car se ana best hai. Rasta khoobsurat hai!`
+      : `\n\n💡 Tip: Driving is the best option. The route is beautiful!`;
+
+  return sanitizeVoice(`${response}${additionalInfo}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
 }
 
 /* =========================
@@ -285,7 +403,7 @@ function intentFromText(text = '') {
     wantsAvail      : /\bavailability\b|\bavailable\b|\bdates?\b|\bcalendar\b/.test(t),
     wantsDistance   : /\bdistance\b|\bhow far\b|\bhours\b|\bdrive\b|\btime from\b|\beta\b/.test(t),
     wantsWeather    : /\bweather\b|\btemperature\b|\bforecast\b/.test(t),
-    wantsRoute      : /\broute\b|\brasta\b/.test(t),
+    wantsRoute      : /\broute\b|\brasta\b|\bhow\s+to\s+(?:reach|get|come)\b|\bfrom\s+\w+\s+(?:to|till|for)\b|\b(?:travel|journey)\s+time\b|\b(?:travel|journey)\s+from\b/.test(t),
     wantsContact    : /\bcontact\b|\bmanager\b|\bowner\b|\bnumber\b|\bwhats\s*app\b|\bwhatsapp\b|\bcall\b|\bspeak to\b|\braabta\b/.test(t)
   };
 }
