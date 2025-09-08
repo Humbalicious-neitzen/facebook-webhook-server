@@ -7,7 +7,7 @@ const axios = require('axios');
 const { LRUCache } = require('lru-cache');
 
 // 👇 use the centralized GPT brain (reads ROAMEO_PRICES_TEXT + ROAMEO_FACTS_JSON from ENV)
-const { askBrain } = require('./lib/brain');
+const { askBrain, userContent } = require('./lib/brain');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -71,8 +71,9 @@ const FACTS = {
    MIDDLEWARE & CACHES
    ========================= */
 app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
-const dedupe    = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });  // 1h
-const tinyCache = new LRUCache({ max: 200,  ttl: 1000 * 60 * 10 });  // 10m
+const dedupe      = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });  // 1h
+const tinyCache   = new LRUCache({ max: 200,  ttl: 1000 * 60 * 10 });  // 10m
+const chatHistory = new LRUCache({ max: 1000, ttl: 1000 * 60 * 60 * 24 }); // 24h history
 
 /* =========================
    BASIC ROUTES
@@ -297,7 +298,7 @@ async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
 
   const intents = intentFromText(text);
 
-  // Quick branches we keep local
+  // Quick branches we keep local (no history)
   if (intents.wantsContact) {
     const msg = `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`;
     return sendBatched(psid, msg);
@@ -310,14 +311,24 @@ async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
     return sendBatched(psid, await dmRouteMessage(text));
   }
 
-  // Prices (DM-only layout) — from the brain
-  if (intents.wantsRates) {
-    const { message } = await askBrain({ text, surface: 'dm' });
-    return sendBatched(psid, message);
-  }
+  // For all other intents, use the brain and store history
+  const history = chatHistory.get(psid) || [];
+  const surface = 'dm';
 
-  // Everything else — factual answer + Roameo bridge (from brain)
-  const { message } = await askBrain({ text, surface: 'dm' });
+  const response = await askBrain({ text, surface, history });
+  const { message } = response;
+
+  // Update history
+  const newHistory = [
+    ...history,
+    // Note: userContent is a stringified JSON, which is what the API expects.
+    // For assistant, we just need the message text.
+    { role: 'user', content: userContent({ text, surface }) },
+    { role: 'assistant', content: message }
+  ].slice(-10); // Keep it trimmed to the last 5 turns
+
+  chatHistory.set(psid, newHistory);
+
   return sendBatched(psid, message);
 }
 
