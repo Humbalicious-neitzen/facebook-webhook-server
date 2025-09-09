@@ -1,12 +1,15 @@
-// server.js — Roameo Resorts omni-channel bot (v7 — brain-first: prices + general answers via brain.js)
+// server.js — Roameo Resorts omni-channel bot (v8)
+// Fixes: image proxy for OpenAI Vision, robust routing, retries, fewer 4xx logs.
 
 const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const axios = require('axios');
 const { LRUCache } = require('lru-cache');
+const URL = require('url').URL;
+const path = require('path');
 
-// 👇 use the centralized GPT brain (reads ROAMEO_PRICES_TEXT + ROAMEO_FACTS_JSON from ENV)
+// Brain
 const { askBrain, constructUserMessage } = require('./lib/brain');
 
 const app = express();
@@ -19,27 +22,22 @@ const APP_SECRET = process.env.APP_SECRET;
 const VERIFY_TOKEN = process.env.verify_token || process.env.VERIFY_TOKEN || 'verify_dev';
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 
-// Optional enrichment keys
-const GEOAPIFY_API_KEY   = process.env.GEOAPIFY_API_KEY   || '';
-const OPENWEATHER_API_KEY= process.env.OPENWEATHER_API_KEY|| '';
-const RESORT_COORDS      = (process.env.RESORT_COORDS || '').trim(); // "lat,lon"
-const RESORT_LOCATION_NAME = process.env.RESORT_LOCATION_NAME || 'Roameo Resorts, Tehjian (Neelum)';
+const GEOAPIFY_API_KEY    = process.env.GEOAPIFY_API_KEY   || '';
+const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY|| '';
+const RESORT_COORDS       = (process.env.RESORT_COORDS || '').trim(); // "lat,lon"
+const RESORT_LOCATION_NAME= process.env.RESORT_LOCATION_NAME || 'Roameo Resorts, Tehjian (Neelum)';
 
-// Toggles
 const AUTO_REPLY_ENABLED       = String(process.env.AUTO_REPLY_ENABLED       || 'true').toLowerCase() === 'true';
 const ALLOW_REPLY_IN_STANDBY   = String(process.env.ALLOW_REPLY_IN_STANDBY   || 'true').toLowerCase() === 'true';
 const AUTO_TAKE_THREAD_CONTROL = String(process.env.AUTO_TAKE_THREAD_CONTROL || 'false').toLowerCase() === 'true';
 
-// IG token (can reuse PAGE token if scoped)
 const IG_MANAGE_TOKEN = process.env.IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
 
-// Admin
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
-// ==== Brand constants ====
-const BRAND_USERNAME = 'roameoresorts';                 // avoid self-replies
-const WHATSAPP_NUMBER = '03558000078';                  // IG comments (number only)
-const WHATSAPP_LINK   = 'https://wa.me/923558000078';   // FB comments & all DMs
+// Brand constants
+const BRAND_USERNAME  = 'roameoresorts';
+const WHATSAPP_LINK   = 'https://wa.me/923558000078';
 const SITE_URL        = 'https://www.roameoresorts.com/';
 const SITE_SHORT      = 'roameoresorts.com';
 const MAPS_LINK       = 'https://maps.app.goo.gl/Y49pQPd541p1tvUf6';
@@ -47,15 +45,15 @@ const MAPS_LINK       = 'https://maps.app.goo.gl/Y49pQPd541p1tvUf6';
 const CHECKIN_TIME  = process.env.CHECKIN_TIME  || '3:00 pm';
 const CHECKOUT_TIME = process.env.CHECKOUT_TIME || '12:00 pm';
 
-// Outgoing message limits
 const MAX_OUT_CHAR = 800;
 
+// Sanity check
 if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
   console.warn('⚠️ Missing required env vars: APP_SECRET, VERIFY_TOKEN, PAGE_ACCESS_TOKEN');
 }
 
 /* =========================
-   BASIC FACTS (kept for location/route helpers)
+   FACTS
    ========================= */
 const FACTS = {
   site: SITE_URL,
@@ -71,9 +69,10 @@ const FACTS = {
    MIDDLEWARE & CACHES
    ========================= */
 app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
-const dedupe      = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });  // 1h
-const tinyCache   = new LRUCache({ max: 200,  ttl: 1000 * 60 * 10 });  // 10m
-const chatHistory = new LRUCache({ max: 1000, ttl: 1000 * 60 * 60 * 24 }); // 24h history
+
+const dedupe      = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });       // 1h
+const tinyCache   = new LRUCache({ max: 300,  ttl: 1000 * 60 * 15 });       // 15m
+const chatHistory = new LRUCache({ max: 1000, ttl: 1000 * 60 * 60 * 24 });  // 24h
 
 /* =========================
    BASIC ROUTES
@@ -85,9 +84,9 @@ app.get('/', (_req, res) => res.send('Roameo Omni Bot running'));
    ========================= */
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'] || req.query['hub.verify_token'];
+  const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && (token === VERIFY_TOKEN)) return res.status(200).send(challenge);
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
 
@@ -106,7 +105,7 @@ function verifySignature(req) {
 }
 
 /* =========================
-   HELPERS — sanitize, normalize, language, intent
+   UTILITIES
    ========================= */
 function sanitizeVoice(text = '') {
   if (!text) return '';
@@ -143,25 +142,18 @@ function stripPricesFromPublic(text = '') {
   });
   return lines.join(' ');
 }
-
-/* ===== Pricing: tighter trigger (ignore tiny noise like "cv") ===== */
 function isPricingIntent(text = '') {
   const t = normalize(text);
   if (t.length <= 2) return false;
   const kw = [
     'price','prices','pricing','rate','rates','tariff','cost','rent','rental','per night','night price',
-    'kiraya','qeemat','kimat','keemat',
-    'قیمت','کرایہ','ریٹ','نرخ'
+    'kiraya','qeemat','kimat','keemat','قیمت','کرایہ','ریٹ','نرخ'
   ];
   if (kw.some(x => t.includes(x))) return true;
-  if (/\b\d+\s*(night|nights|din|raat)\b/.test(t)) return true; // “for 4 nights”
+  if (/\b\d+\s*(night|nights|din|raat)\b/.test(t)) return true;
   if (/\bhow much\b/.test(t)) return true;
   return false;
 }
-
-/* =========================
-   CHUNKING + SEND
-   ========================= */
 function splitToChunks(s, limit = MAX_OUT_CHAR) {
   const out = [];
   let str = (s || '').trim();
@@ -170,7 +162,6 @@ function splitToChunks(s, limit = MAX_OUT_CHAR) {
       str.lastIndexOf('\n', limit),
       str.lastIndexOf('. ', limit),
       str.lastIndexOf('•', limit),
-      str.lastIndexOf('—', limit),
       str.lastIndexOf('!', limit),
       str.lastIndexOf('?', limit)
     );
@@ -191,7 +182,77 @@ async function sendBatched(psid, textOrArray) {
 }
 
 /* =========================
-   ENRICHMENT (optional) — route/drive-time
+   IMAGE PROXY for Vision (fix invalid_image_url)
+   ========================= */
+function cleanIncomingUrl(u = '') {
+  let s = String(u || '').trim();
+  // remove trailing punctuation (common when users paste)
+  s = s.replace(/[.)"'?,]+$/g, '');
+  return s;
+}
+// Allow only http/https and common CDNs (but also allow any https since lookaside is public)
+function isSafeRemote(u) {
+  try {
+    const url = new URL(u);
+    return ['http:', 'https:'].includes(url.protocol);
+  } catch { return false; }
+}
+
+app.get('/img', async (req, res) => {
+  try {
+    const raw = req.query.u || '';
+    const target = cleanIncomingUrl(raw);
+    if (!target || !isSafeRemote(target)) return res.status(400).send('Bad image URL');
+
+    const cached = tinyCache.get(`img:${target}`);
+    if (cached) {
+      res.setHeader('Content-Type', cached.type || 'image/jpeg');
+      res.setHeader('Cache-Control', 'public, max-age=600');
+      return res.end(cached.buf, 'binary');
+    }
+
+    // fetch remote image and stream to client
+    const resp = await axios.get(target, {
+      responseType: 'arraybuffer',
+      timeout: 15000,
+      headers: {
+        // Helps with some CDNs
+        'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+        'User-Agent': 'RoameoBot/1.0 (+https://www.roameoresorts.com/)',
+        'Referer': 'https://www.facebook.com/'
+      }
+    });
+
+    const ctype = resp.headers['content-type'] || 'image/jpeg';
+    const buf = Buffer.from(resp.data);
+    tinyCache.set(`img:${target}`, { buf, type: ctype });
+    res.setHeader('Content-Type', ctype);
+    res.setHeader('Cache-Control', 'public, max-age=600');
+    return res.end(buf, 'binary');
+  } catch (e) {
+    console.error('image proxy error', e?.response?.status, e?.message);
+    return res.status(502).send('Upstream image fetch failed');
+  }
+});
+
+// Transform any fbcdn/lookaside/etc. URL to our proxy so OpenAI can fetch it.
+function toVisionableUrl(imageUrl, req) {
+  if (!imageUrl) return null;
+  const cleaned = cleanIncomingUrl(imageUrl);
+  try {
+    const u = new URL(cleaned);
+    const host = (req?.headers?.['x-forwarded-host'] || req?.headers?.host || `localhost:${PORT}`).toString();
+    const proto = (req?.headers?.['x-forwarded-proto'] || req?.protocol || 'http').toString();
+    // Always proxy — those CDNs often fail with signed URLs/headers.
+    const proxied = `${proto}://${host}/img?u=${encodeURIComponent(u.toString())}`;
+    return proxied;
+  } catch {
+    return null;
+  }
+}
+
+/* =========================
+   ENRICHMENT — Geocoding & Routes
    ========================= */
 function km(meters)    { return (meters / 1000).toFixed(0); }
 function hhmm(seconds) { const h = Math.floor(seconds/3600); const m = Math.round((seconds%3600)/60); return `${h}h ${m}m`; }
@@ -211,109 +272,88 @@ async function geocodePlace(place) {
     return res;
   } catch (e) { console.error('geoapify geocode error', e?.response?.data || e.message); return null; }
 }
+
+// Skip walk/transit if distance likely huge to avoid 400 "too long distance"
+async function routingForModes(waypoints, modes) {
+  const url = 'https://api.geoapify.com/v1/routing';
+  const out = [];
+  for (const mode of modes) {
+    try {
+      const { data } = await axios.get(url, {
+        params: { waypoints, mode, apiKey: GEOAPIFY_API_KEY, traffic: mode === 'drive' ? 'approximated' : undefined },
+        timeout: 12000
+      });
+      const ft = data?.features?.[0]?.properties;
+      if (!ft) continue;
+      out.push({
+        mode,
+        distance: ft.distance,
+        time: ft.time,
+        distance_km: Number(km(ft.distance)),
+        duration_formatted: hhmm(ft.time)
+      });
+    } catch (e) {
+      const msg = e?.response?.data?.message || e?.message || '';
+      if (String(msg).includes('Too long distance')) {
+        // silent skip
+      } else {
+        console.error(`routing ${mode} error`, e?.response?.data || e.message);
+      }
+    }
+  }
+  return out;
+}
+
 async function getRouteInfo(originLat, originLon, destLat, destLon) {
   if (!GEOAPIFY_API_KEY) return null;
   const key = `route:${originLat},${originLon}->${destLat},${destLon}`;
   if (tinyCache.has(key)) return tinyCache.get(key);
-  
-  try {
-    const waypoints = `${originLat},${originLon}|${destLat},${destLon}`;
-    const url = 'https://api.geoapify.com/v1/routing';
-    
-    // Get multiple transport modes
-    const modes = ['drive', 'walk', 'transit'];
-    const routePromises = modes.map(async (mode) => {
-      try {
-        const { data } = await axios.get(url, { 
-          params: { 
-            waypoints, 
-            mode, 
-            apiKey: GEOAPIFY_API_KEY,
-            traffic: mode === 'drive' ? 'approximated' : undefined
-          }, 
-          timeout: 12000 
-        });
-        const ft = data?.features?.[0]?.properties;
-        if (!ft) return null;
-        return {
-          mode,
-          distance: ft.distance,
-          duration: ft.time,
-          distance_km: Number(km(ft.distance)),
-          duration_formatted: hhmm(ft.time)
-        };
-      } catch (e) {
-        console.error(`geoapify routing error for ${mode}:`, e?.response?.data || e.message);
-        return null;
-      }
-    });
-    
-    const routes = await Promise.all(routePromises);
-    const validRoutes = routes.filter(r => r !== null);
-    
-    if (validRoutes.length === 0) return null;
-    
-    const result = {
-      routes: validRoutes,
-      primary: validRoutes.find(r => r.mode === 'drive') || validRoutes[0]
-    };
-    
-    tinyCache.set(key, result);
-    return result;
-  } catch (e) { 
-    console.error('geoapify routing error', e?.response?.data || e.message); 
-    return null; 
-  }
+
+  // If crow-fly distance is > 200km, skip walk/transit
+  const approxKm = (() => {
+    try {
+      const R = 6371;
+      const toRad = d => d * Math.PI / 180;
+      const dLat = toRad(destLat - originLat);
+      const dLon = toRad(destLon - originLon);
+      const a = Math.sin(dLat/2)**2 + Math.cos(toRad(originLat)) * Math.cos(toRad(destLat)) * Math.sin(dLon/2)**2;
+      return 2 * R * Math.asin(Math.sqrt(a));
+    } catch { return 999; }
+  })();
+
+  const modes = approxKm > 200 ? ['drive'] : ['drive','walk','transit'];
+  const waypoints = `${originLat},${originLon}|${destLat},${destLon}`;
+  const routes = await routingForModes(waypoints, modes);
+  if (!routes.length) return null;
+
+  const result = { routes, primary: routes.find(r => r.mode === 'drive') || routes[0] };
+  tinyCache.set(key, result);
+  return result;
 }
 
-// Keep the old function for backward compatibility
-async function routeDrive(originLat, originLon, destLat, destLon) {
-  const routeInfo = await getRouteInfo(originLat, originLon, destLat, destLon);
-  return routeInfo?.primary ? { meters: routeInfo.primary.distance, seconds: routeInfo.primary.duration } : null;
-}
+/* =========================
+   TEXT INTENT / ROUTE DM
+   ========================= */
 function extractOrigin(text='') {
   const t = text.trim();
   const rx = [
-    // Direct route queries
     /route\s+from\s+(.+)$/i,
     /rasta\s+from\s+(.+)$/i,
     /directions?\s+from\s+(.+)$/i,
     /how\s+to\s+reach\s+from\s+(.+)$/i,
-    /how\s+to\s+get\s+there\s+from\s+(.+)$/i,
-    
-    // Coming from patterns
-    /(?:i\s+am\s+)?coming\s+from\s+(.+)$/i,
-    /(?:i\s+am\s+)?travelling\s+from\s+(.+)$/i,
-    /(?:i\s+am\s+)?traveling\s+from\s+(.+)$/i,
-    
-    // From X to Y patterns
-    /from\s+(.+)\s+(?:to|till|for)?\s*(?:roameo|resort|neelum|tehjian|here)?$/i,
-    /(.+)\s+(?:se|say)\s+(?:rasta|route|directions?)/i,
-    /(.+)\s+to\s+(?:roameo|resort|neelum|tehjian)/i,
-    
-    // Distance/time queries
+    /coming\s+from\s+(.+)$/i,
+    /travel(?:ling|ing)?\s+from\s+(.+)$/i,
+    /from\s+(.+)\s+(?:to|till)\s+(?:roameo|resort|neelum|tehjian)/i,
     /how\s+far\s+is\s+(.+)\s+(?:from|to)/i,
     /distance\s+from\s+(.+)$/i,
-    /how\s+long\s+to\s+reach\s+from\s+(.+)$/i,
-    /travel\s+time\s+from\s+(.+)$/i,
-    
-    // Urdu patterns
     /(.+)\s+سے\s+(?:راستہ|فاصلہ|دور|کتنے|کتنا)/i,
-    /(.+)\s+سے\s+(?:کتنے|کتنا)\s+(?:کلومیٹر|گھنٹے)/i,
-    /(.+)\s+سے\s+(?:روامو|ریسورٹ)/i,
-    
-    // Roman Urdu patterns
-    /(.+)\s+se\s+(?:rasta|distance|far|kitna|kitne)/i,
-    /(.+)\s+se\s+(?:kitna|kitne)\s+(?:km|kilometer|ghante)/i,
-    /(.+)\s+se\s+(?:roameo|resort)/i
+    /(.+)\s+se\s+(?:rasta|distance|far|kitna|kitne)/i
   ];
-  
   for (const r of rx) {
     const m = t.match(r);
     if (m && m[1]) {
       let origin = m[1].replace(/[.?!]+$/,'').trim();
-      // Clean up common words that might be captured
-      origin = origin.replace(/\b(?:the|a|an|from|to|is|are|was|were|will|would|can|could|should|may|might)\b/gi, '').trim();
+      origin = origin.replace(/\b(the|a|an|from|to|is|are|was|were|will|would|can|could|should|may|might)\b/gi, '').trim();
       if (origin.length > 2) return origin;
     }
   }
@@ -345,7 +385,6 @@ async function dmRouteMessage(userText = '') {
   }
 
   const routeInfo = await getRouteInfo(originGeo.lat, originGeo.lon, dLat, dLon);
-  
   if (!routeInfo) {
     return lang === 'ur'
       ? `راستہ معلومات دستیاب نہیں۔ براہِ کرم بعد میں کوشش کریں۔\n\nلوکیشن: ${MAPS_LINK}`
@@ -354,9 +393,7 @@ async function dmRouteMessage(userText = '') {
         : `Route information not available. Please try again later.\n\nLocation: ${MAPS_LINK}`;
   }
 
-  // Format comprehensive route information
   let response = '';
-  
   if (lang === 'ur') {
     response = `*${origin}* سے Roameo Resorts تک:\n\n`;
     routeInfo.routes.forEach(route => {
@@ -380,18 +417,17 @@ async function dmRouteMessage(userText = '') {
     response += `\nLocation: ${MAPS_LINK}`;
   }
 
-  // Add additional helpful information
-  const additionalInfo = lang === 'ur'
+  const tip = lang === 'ur'
     ? `\n\n💡 ٹپ: گاڑی سے آنا بہترین ہے۔ راستہ خوبصورت ہے!`
     : lang === 'roman-ur'
       ? `\n\n💡 Tip: Car se ana best hai. Rasta khoobsurat hai!`
       : `\n\n💡 Tip: Driving is the best option. The route is beautiful!`;
 
-  return sanitizeVoice(`${response}${additionalInfo}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+  return sanitizeVoice(`${response}${tip}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
 }
 
 /* =========================
-   INTENTS (minimal)
+   INTENT ROUTER
    ========================= */
 function intentFromText(text = '') {
   const t = normalize(text);
@@ -411,27 +447,28 @@ function intentFromText(text = '') {
 /* =========================
    DM HANDLER
    ========================= */
-async function handleTextMessage(psid, text, imageUrl, opts = { channel: 'messenger' }) {
+async function handleTextMessage(psid, text, rawImageUrl, reqCtx = {}) {
   if (!AUTO_REPLY_ENABLED) return;
 
-  // Detect Instagram post links
+  const imageUrl = rawImageUrl ? toVisionableUrl(rawImageUrl, reqCtx.req) : null;
+
+  // IG post link detector — we still prefer screenshot for context
   const igPostRegex = /(https?:\/\/(www\.)?instagram\.com\/(p|reel)\/[a-zA-Z0-9_-]+)/;
-  const igMatch = text.match(igPostRegex);
-  if (igMatch && !imageUrl) { // Only trigger if there isn't an image
+  const igMatch = text && text.match(igPostRegex);
+
+  if (igMatch && !imageUrl) {
     const lang = detectLanguage(text);
     const reply = lang === 'ur'
       ? 'اس پوسٹ کے بارے میں سوالات کے لیے، براہِ مہربانی اسکرین شاٹ بھیجیں۔'
       : lang === 'roman-ur'
         ? 'Is post ke baare mein sawalat ke liye, please screenshot send karein.'
         : 'For questions about this post, please send a screenshot.';
-
     const finalMessage = `${reply}\n\nAt Roameo Resorts, we're always ready to help you plan the perfect getaway!`;
     return sendBatched(psid, finalMessage);
   }
 
-  const intents = intentFromText(text);
+  const intents = intentFromText(text || '');
 
-  // Quick branches we keep local (no history)
   if (intents.wantsContact) {
     const msg = `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`;
     return sendBatched(psid, msg);
@@ -441,10 +478,10 @@ async function handleTextMessage(psid, text, imageUrl, opts = { channel: 'messen
     return sendBatched(psid, msg);
   }
   if (intents.wantsRoute || intents.wantsDistance) {
-    return sendBatched(psid, await dmRouteMessage(text));
+    return sendBatched(psid, await dmRouteMessage(text || ''));
   }
 
-  // For all other intents, use the brain and store history
+  // Brain flow (with short rolling history)
   const history = chatHistory.get(psid) || [];
   const surface = 'dm';
 
@@ -454,10 +491,9 @@ async function handleTextMessage(psid, text, imageUrl, opts = { channel: 'messen
   // Update history
   const newHistory = [
     ...history,
-    // The user message is now constructed by the imported function directly.
     constructUserMessage({ text, imageUrl, surface }),
     { role: 'assistant', content: message }
-  ].slice(-10); // Keep it trimmed to the last 5 turns
+  ].slice(-10);
 
   chatHistory.set(psid, newHistory);
 
@@ -479,16 +515,16 @@ app.post('/webhook', async (req, res) => {
         if (dedupe.has(key)) continue; dedupe.set(key, true);
 
         if (Array.isArray(entry.messaging)) {
-          for (const ev of entry.messaging) await routeMessengerEvent(ev, { source: 'messaging' }).catch(logErr);
+          for (const ev of entry.messaging) await routeMessengerEvent(ev, { source: 'messaging', req }).catch(logErr);
         }
         if (Array.isArray(entry.changes)) {
-          for (const change of entry.changes) await routePageChange(change).catch(logErr);
+          for (const change of entry.changes) await routePageChange(change, { req }).catch(logErr);
         }
         if (Array.isArray(entry.standby)) {
           for (const ev of entry.standby) {
             if (!ALLOW_REPLY_IN_STANDBY) continue;
             if (AUTO_TAKE_THREAD_CONTROL && ev.sender?.id) await takeThreadControl(ev.sender.id).catch(()=>{});
-            await routeMessengerEvent(ev, { source: 'standby' }).catch(logErr);
+            await routeMessengerEvent(ev, { source: 'standby', req }).catch(logErr);
           }
         }
       }
@@ -502,10 +538,10 @@ app.post('/webhook', async (req, res) => {
         if (dedupe.has(key)) continue; dedupe.set(key, true);
 
         if (Array.isArray(entry.messaging)) {
-          for (const ev of entry.messaging) await routeInstagramMessage(ev).catch(logErr);
+          for (const ev of entry.messaging) await routeInstagramMessage(ev, { req }).catch(logErr);
         }
         if (Array.isArray(entry.changes)) {
-          for (const change of entry.changes) await routeInstagramChange(change, pageId).catch(logErr);
+          for (const change of entry.changes) await routeInstagramChange(change, pageId, { req }).catch(logErr);
         }
       }
       return;
@@ -522,7 +558,7 @@ function logErr(err) {
 /* =========================
    FB Messenger (DMs)
    ========================= */
-async function routeMessengerEvent(event, ctx = { source: 'messaging' }) {
+async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null }) {
   if (event.delivery || event.read || event.message?.is_echo) return;
 
   if (event.message && event.sender?.id) {
@@ -532,14 +568,13 @@ async function routeMessengerEvent(event, ctx = { source: 'messaging' }) {
     const text = event.message.text || '';
     const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url;
 
-    // If there's no text and no image, don't do anything
     if (!text && !imageUrl) return;
 
-    return handleTextMessage(event.sender.id, text, imageUrl, { channel: 'messenger' });
+    return handleTextMessage(event.sender.id, text, imageUrl, ctx);
   }
 
   if (event.postback?.payload && event.sender?.id) {
-    return handleTextMessage(event.sender.id, 'help', null, { channel: 'messenger' });
+    return handleTextMessage(event.sender.id, 'help', null, ctx);
   }
 }
 
@@ -560,7 +595,7 @@ function isSelfComment(v = {}, platform = 'facebook') {
   return (from.name || '').toLowerCase().includes('roameo');
 }
 
-async function routePageChange(change) {
+async function routePageChange(change, ctx = { req: null }) {
   if (change.field !== 'feed') return;
   const v = change.value || {};
   if (v.item === 'comment' && v.comment_id) {
@@ -571,7 +606,6 @@ async function routePageChange(change) {
     if (AUTO_REPLY_ENABLED) {
       const lang = detectLanguage(text);
       if (isPricingIntent(text)) {
-        // DM the full card, public nudge without numbers
         try {
           const dm = await askBrain({ text, surface: 'dm' });
           await fbPrivateReplyToComment(v.comment_id, dm.message);
@@ -579,7 +613,6 @@ async function routePageChange(change) {
         await replyToFacebookComment(v.comment_id, 'DM us for today’s rates, availability, and a quick booking link. ✨');
         return;
       }
-      // Generic comment → brain answer, scrub any numbers
       const dm = await askBrain({ text, surface: 'comment' });
       await replyToFacebookComment(v.comment_id, stripPricesFromPublic(dm.message));
     }
@@ -589,7 +622,7 @@ async function routePageChange(change) {
 /* =========================
    Instagram (DMs + Comments)
    ========================= */
-async function routeInstagramMessage(event) {
+async function routeInstagramMessage(event, ctx = { req: null }) {
   if (event.delivery || event.read || event.message?.is_echo) return;
 
   if (event.message && event.sender?.id) {
@@ -597,10 +630,9 @@ async function routeInstagramMessage(event) {
     const text = event.message.text || '';
     const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url;
 
-    // If there's no text and no image, don't do anything
     if (!text && !imageUrl) return;
 
-    return handleTextMessage(igUserId, text, imageUrl, { channel: 'instagram' });
+    return handleTextMessage(igUserId, text, imageUrl, ctx);
   }
 }
 async function replyToInstagramComment(commentId, message) {
@@ -614,7 +646,7 @@ async function igPrivateReplyToComment(pageId, commentId, message) {
   await axios.post(url, payload, { params, timeout: 10000 });
 }
 
-async function routeInstagramChange(change, pageId) {
+async function routeInstagramChange(change, pageId, ctx = { req: null }) {
   const v = change.value || {};
   const isComment = (change.field || '').toLowerCase().includes('comment') || (v.item === 'comment');
   if (isComment && (v.comment_id || v.id)) {
@@ -649,7 +681,7 @@ async function sendText(psid, text) {
 }
 
 /* =========================
-   HANDOVER (optional)
+   HANDOVER
    ========================= */
 async function takeThreadControl(psid) {
   const url = `https://graph.facebook.com/v19.0/me/take_thread_control`;
@@ -659,7 +691,7 @@ async function takeThreadControl(psid) {
 }
 
 /* =========================
-   ADMIN (no discount fields anymore)
+   ADMIN
    ========================= */
 function requireAdmin(req, res, next) {
   const hdr = req.headers.authorization || '';
@@ -696,4 +728,94 @@ app.get('/admin/status', requireAdmin, async (_req, res) => {
   }
 });
 
+/* =========================
+   WIRE BRAIN TOOLS
+   ========================= */
+const { getWeatherForecast, findNearbyPlaces, getRouteInfo: brainRoute } = require('./lib/brain');
+
+// Implement actual tool functions (OpenAI tool calls hit these via brain)
+async function tool_getWeatherForecast() {
+  const latLon = (process.env.RESORT_COORDS || "").trim();
+  if (!OPENWEATHER_API_KEY || !latLon) return { error: "Weather API not configured" };
+
+  const [lat, lon] = latLon.split(',').map(s => s.trim());
+  try {
+    const { data } = await axios.get('https://api.openweathermap.org/data/2.5/forecast', {
+      params: { lat, lon, appid: OPENWEATHER_API_KEY, units: 'metric' },
+      timeout: 8000
+    });
+
+    const daily = {};
+    for (const p of (data.list || [])) {
+      const day = p.dt_txt.split(' ')[0];
+      if (!daily[day]) daily[day] = { temps: [], conditions: {} };
+      daily[day].temps.push(p.main.temp);
+      const cond = p.weather[0]?.main || 'Clear';
+      daily[day].conditions[cond] = (daily[day].conditions[cond] || 0) + 1;
+    }
+    const forecast = Object.entries(daily).map(([date, v]) => ({
+      date,
+      temp_min: Math.min(...v.temps).toFixed(0),
+      temp_max: Math.max(...v.temps).toFixed(0),
+      condition: Object.keys(v.conditions).reduce((a,b)=> v.conditions[a] > v.conditions[b] ? a : b)
+    }));
+    return { forecast };
+  } catch (e) {
+    console.error("weather error", e.message);
+    return { error: "Could not fetch weather." };
+  }
+}
+async function tool_findNearbyPlaces({ categories, radius = 5000, limit = 10 }) {
+  const latLon = (process.env.RESORT_COORDS || "").trim();
+  if (!GEOAPIFY_API_KEY || !latLon) return { error: "Geo API not configured" };
+  const [lat, lon] = latLon.split(',').map(s => s.trim());
+  try {
+    const params = {
+      categories,
+      filter: `circle:${lon},${lat},${radius}`,
+      bias: `proximity:${lon},${lat}`,
+      limit,
+      apiKey: GEOAPIFY_API_KEY
+    };
+    const { data } = await axios.get('https://api.geoapify.com/v2/places', { params, timeout: 8000 });
+    const places = (data.features || []).map(f => ({
+      name: f.properties.name,
+      category: f.properties.categories?.[0],
+      distance_m: f.properties.distance
+    }));
+    return { places };
+  } catch (e) {
+    console.error("places error", e.message);
+    return { error: "Could not fetch places." };
+  }
+}
+async function tool_getRouteInfo({ origin }) {
+  const latLon = (process.env.RESORT_COORDS || "").trim();
+  if (!GEOAPIFY_API_KEY || !latLon) return { error: "Route API not configured" };
+
+  const [destLat, destLon] = latLon.split(',').map(s => parseFloat(s.trim()));
+  try {
+    const geocodeUrl = 'https://api.geoapify.com/v1/geocode/search';
+    const geo = await axios.get(geocodeUrl, { params: { text: origin, limit: 1, apiKey: GEOAPIFY_API_KEY }, timeout: 8000 });
+    const feat = geo.data?.features?.[0];
+    if (!feat) return { error: `Could not find location: ${origin}` };
+    const [originLon, originLat] = feat.geometry.coordinates;
+
+    const routes = await getRouteInfo(originLat, originLon, destLat, destLon);
+    if (!routes) return { error: "Could not calculate routes" };
+    return { origin, destination: "Roameo Resorts", ...routes, maps_link: MAPS_LINK };
+  } catch (e) {
+    console.error('Route info error', e?.response?.data || e.message);
+    return { error: "Could not fetch route information" };
+  }
+}
+
+// Monkey-patch brain tool exports so brain.askBrain() tool calls work
+require('./lib/brain').getWeatherForecast = tool_getWeatherForecast;
+require('./lib/brain').findNearbyPlaces   = tool_findNearbyPlaces;
+require('./lib/brain').getRouteInfo       = tool_getRouteInfo;
+
+/* =========================
+   START
+   ========================= */
 app.listen(PORT, () => console.log(`🚀 Listening on :${PORT}`));
