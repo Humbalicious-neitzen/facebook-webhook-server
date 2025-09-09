@@ -1,5 +1,6 @@
-// server.js — Roameo Resorts omni-channel bot (v10)
-// Adds: brand-only post unfurling (IG/FB) in DMs, long-lived memory, PKR calculator, image proxy for Vision.
+// server.js — Roameo Resorts omni-channel bot (v11)
+// FIX: detect post shares in DMs (attachments: share/fallback/template), unwrap FB redirectors,
+// unfurl via oEmbed, brand-check, proxy thumbnail to Vision, pass postMeta to brain.
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -33,7 +34,7 @@ const IG_MANAGE_TOKEN = process.env.IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
 
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
-const BRAND_USERNAME   = (process.env.BRAND_USERNAME || 'roameoresorts').toLowerCase(); // handle/username
+const BRAND_USERNAME   = (process.env.BRAND_USERNAME || 'roameoresorts').toLowerCase(); // e.g., roameoresorts
 const BRAND_PAGE_NAME  = (process.env.BRAND_PAGE_NAME || 'Roameo Resorts').toLowerCase();
 
 const WHATSAPP_LINK   = process.env.ROAMEO_WHATSAPP_LINK || 'https://wa.me/923558000078';
@@ -47,7 +48,6 @@ const CHECKOUT_TIME = process.env.CHECKOUT_TIME || '12:00 pm';
 const MAX_OUT_CHAR = 800;
 const PRICES_TXT = String(process.env.ROAMEO_PRICES_TEXT || "").replaceAll("\\n","\n");
 
-// Sanity check
 if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
   console.warn('⚠️ Missing required env vars: APP_SECRET, VERIFY_TOKEN, PAGE_ACCESS_TOKEN');
 }
@@ -55,10 +55,10 @@ if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
 /* =========================
    CACHES & MIDDLEWARE
    ========================= */
-// Memory now 30 days per user/thread
 app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
+// Memory now 30 days per user/thread
 const dedupe      = new LRUCache({ max: 8000, ttl: 1000 * 60 * 60 * 24 * 30 });
-const tinyCache   = new LRUCache({ max: 800,  ttl: 1000 * 60 * 30 });
+const tinyCache   = new LRUCache({ max: 1000, ttl: 1000 * 60 * 30 });
 const chatHistory = new LRUCache({ max: 4000, ttl: 1000 * 60 * 60 * 24 * 30 });
 
 /* =========================
@@ -420,51 +420,77 @@ function stripPricesFromPublic(text = '') {
 }
 
 /* =========================
-   POST UNFURLING (brand-only)
+   POST UNFURLING HELPERS
    ========================= */
-const POST_URL_RX = /(https?:\/\/(?:www\.)?(?:instagram\.com\/(?:p|reel)\/[A-Za-z0-9_-]+|facebook\.com\/[^\/]+\/posts\/[0-9]+|fb\.watch\/[A-Za-z0-9_-]+))/ig;
+const POST_URL_RX = /(https?:\/\/(?:www\.)?(?:instagram\.com\/(?:p|reel)\/[A-Za-z0-9_-]+|facebook\.com\/[^\/]+\/posts\/[0-9]+|fb\.watch\/[A-Za-z0-9_-]+))/i;
 
-function extractPostUrls(text='') {
-  const urls = [];
-  let m;
-  while ((m = POST_URL_RX.exec(text)) !== null) {
-    urls.push(m[1]);
-  }
-  return urls;
+function unwrapRedirect(u) {
+  try {
+    const url = new URL(u);
+    const host = url.hostname.toLowerCase();
+    if (host.endsWith('l.facebook.com') || host.endsWith('lm.facebook.com')) {
+      const real = url.searchParams.get('u') || url.searchParams.get('l');
+      if (real) return decodeURIComponent(real);
+    }
+    return u;
+  } catch { return u; }
 }
-
+function looksLikePostUrl(u) {
+  return POST_URL_RX.test(u || '');
+}
+function extractPostUrls(text='') {
+  const out = [];
+  const rxg = new RegExp(POST_URL_RX.source, 'ig');
+  let m;
+  while ((m = rxg.exec(text || '')) !== null) out.push(unwrapRedirect(m[1]));
+  return [...new Set(out)];
+}
 async function fetchOEmbed(url) {
-  // Try Instagram oEmbed first if host is instagram.com, otherwise FB oEmbed
   try {
     const u = new URL(url);
     const token = IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
     const base = 'https://graph.facebook.com/v19.0';
-
     if (/instagram\.com/i.test(u.hostname)) {
-      const { data } = await axios.get(`${base}/instagram_oembed`, {
-        params: { url, omitscript: true, access_token: token },
-        timeout: 9000
-      });
+      const { data } = await axios.get(`${base}/instagram_oembed`, { params: { url, omitscript: true, access_token: token }, timeout: 9000 });
       return { source: 'ig', ...data };
     } else {
-      const { data } = await axios.get(`${base}/oembed_post`, {
-        params: { url, omitscript: true, access_token: token },
-        timeout: 9000
-      });
+      const { data } = await axios.get(`${base}/oembed_post`, { params: { url, omitscript: true, access_token: token }, timeout: 9000 });
       return { source: 'fb', ...data };
     }
   } catch (e) {
-    // As a fallback, return null (we'll ask for screenshot)
     console.error('oEmbed error', e?.response?.data || e.message);
     return null;
   }
 }
-
 function isFromBrand(meta) {
   if (!meta) return false;
   const aName = (meta.author_name || '').toLowerCase();
   const aUrl  = (meta.author_url  || '').toLowerCase();
   return aName.includes(BRAND_PAGE_NAME) || aUrl.includes(`/${BRAND_USERNAME}`);
+}
+function extractSharedPostDataFromAttachments(event) {
+  const urls = [];
+  let thumb = null;
+
+  const atts = event?.message?.attachments || [];
+  for (const a of atts) {
+    const p = a.payload || {};
+    const candidates = [
+      a.url, p.url, p.link, p.href, p.ogurl, p.target_url, p.share_url,
+      // FB link shim
+      p.fallback_url, p.open_graph_url
+    ].filter(Boolean);
+
+    for (let c of candidates) {
+      c = unwrapRedirect(c);
+      if (looksLikePostUrl(c)) urls.push(c);
+    }
+    if (!thumb && (p.image_url || p.preview_url || p.thumbnail_url)) {
+      thumb = p.image_url || p.preview_url || p.thumbnail_url;
+    }
+  }
+
+  return { urls: [...new Set(urls)], thumb };
 }
 
 /* =========================
@@ -483,20 +509,23 @@ function extractNightsAndHut(text='') {
   return { nights, hut };
 }
 
-async function handleTextMessage(psid, text, rawImageUrl, ctx = { req: null }) {
+async function handleTextMessage(psid, text, rawImageUrl, ctx = { req: null, shareUrls: [], shareThumb: null }) {
   if (!AUTO_REPLY_ENABLED) return;
 
   const imageUrl = rawImageUrl ? toVisionableUrl(rawImageUrl, ctx.req) : null;
 
-  // 1) Brand post URLs in the message? Unfurl → if ours, feed to brain with "postMeta"
-  const urls = extractPostUrls(text || '');
-  if (urls.length) {
-    for (const url of urls) {
+  // Combine URLs from text + attachments
+  const textUrls = extractPostUrls(text || '');
+  const combinedUrls = [...new Set([...(ctx.shareUrls || []), ...textUrls])];
+
+  // (A) Post shares present? Unfurl & answer if from our brand
+  if (combinedUrls.length) {
+    for (const url of combinedUrls) {
       const meta = await fetchOEmbed(url);
       if (meta && isFromBrand(meta)) {
-        // Build a synthetic "postMeta" note to give the brain rich context
         const caption = (meta.title || '').trim();
-        const thumb   = meta.thumbnail_url ? toVisionableUrl(meta.thumbnail_url, ctx.req) : null;
+        const thumbRemote = meta.thumbnail_url || ctx.shareThumb || null;
+        const thumb = thumbRemote ? toVisionableUrl(thumbRemote, ctx.req) : imageUrl;
 
         const postNote = [
           'postMeta:',
@@ -510,10 +539,9 @@ async function handleTextMessage(psid, text, rawImageUrl, ctx = { req: null }) {
         const history = chatHistory.get(psid) || [];
         const surface = 'dm';
 
-        // Prefer thumbnail to help Vision read offer banners on the post
         const response = await askBrain({
-          text: `${text}\n\n${postNote}`,
-          imageUrl: thumb || imageUrl,
+          text: `${text || ''}\n\n${postNote}`,
+          imageUrl: thumb,
           surface,
           history
         });
@@ -521,7 +549,7 @@ async function handleTextMessage(psid, text, rawImageUrl, ctx = { req: null }) {
         const { message } = response;
         const newHistory = [
           ...history,
-          constructUserMessage({ text: `${text}\n\n${postNote}`, imageUrl: thumb || imageUrl, surface }),
+          constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: thumb, surface }),
           { role: 'assistant', content: message }
         ].slice(-20);
 
@@ -529,8 +557,8 @@ async function handleTextMessage(psid, text, rawImageUrl, ctx = { req: null }) {
         return sendBatched(psid, message);
       }
     }
-    // If none of the URLs are from our brand, ask for a screenshot (as before)
-    const lang = detectLanguage(text);
+    // Not our post — ask for screenshot to help
+    const lang = detectLanguage(text || '');
     const reply = lang === 'ur'
       ? 'براہِ مہربانی پوسٹ کا اسکرین شاٹ شیئر کریں تاکہ ہم بہتر رہنمائی کر سکیں۔'
       : lang === 'roman-ur'
@@ -539,8 +567,8 @@ async function handleTextMessage(psid, text, rawImageUrl, ctx = { req: null }) {
     return sendBatched(psid, `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`);
   }
 
-  // 2) If it's clearly a pricing + nights question, call calculator directly for guaranteed PKR
-  if (isPricingIntent(text)) {
+  // (B) If it's clearly a pricing + nights question, use calculator
+  if (isPricingIntent(text || '')) {
     const { nights, hut } = extractNightsAndHut(text || '');
     if (nights) {
       const calc = await brain.calculateRates({ nights, hut });
@@ -551,7 +579,7 @@ async function handleTextMessage(psid, text, rawImageUrl, ctx = { req: null }) {
     }
   }
 
-  // 3) Otherwise, let the brain decide (it can still call calculateRates tool)
+  // (C) Normal flow to brain
   const history = chatHistory.get(psid) || [];
   const surface = 'dm';
   const response = await askBrain({ text, imageUrl, surface, history });
@@ -627,16 +655,24 @@ function logErr(err) {
    ========================= */
 async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null }) {
   if (event.delivery || event.read || event.message?.is_echo) return;
+
   if (event.message && event.sender?.id) {
     if (ctx.source === 'standby' && !ALLOW_REPLY_IN_STANDBY) return;
     if (ctx.source === 'standby' && AUTO_TAKE_THREAD_CONTROL) await takeThreadControl(event.sender.id).catch(() => {});
+
     const text = event.message.text || '';
-    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url;
-    if (!text && !imageUrl) return;
-    return handleTextMessage(event.sender.id, text, imageUrl, ctx);
+    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
+
+    // NEW: detect shared posts from attachments even if no text
+    const { urls: shareUrls, thumb: shareThumb } = extractSharedPostDataFromAttachments(event);
+
+    if (!text && !imageUrl && !shareUrls.length) return; // nothing to do
+
+    return handleTextMessage(event.sender.id, text, imageUrl, { req: ctx.req, shareUrls, shareThumb });
   }
+
   if (event.postback?.payload && event.sender?.id) {
-    return handleTextMessage(event.sender.id, 'help', null, ctx);
+    return handleTextMessage(event.sender.id, 'help', null, { req: ctx.req });
   }
 }
 
@@ -662,6 +698,7 @@ async function routePageChange(change) {
     if (isSelfComment(v, 'facebook')) return;
 
     if (AUTO_REPLY_ENABLED) {
+      // NEVER show prices publicly
       const dm = await askBrain({ text, surface: 'comment' });
       await replyToFacebookComment(v.comment_id, stripPricesFromPublic(dm.message));
     }
@@ -670,14 +707,21 @@ async function routePageChange(change) {
 
 async function routeInstagramMessage(event, ctx = { req: null }) {
   if (event.delivery || event.read || event.message?.is_echo) return;
+
   if (event.message && event.sender?.id) {
     const igUserId = event.sender.id;
     const text = event.message.text || '';
-    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url;
-    if (!text && !imageUrl) return;
-    return handleTextMessage(igUserId, text, imageUrl, ctx);
+    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
+
+    // NEW: detect shared posts from attachments
+    const { urls: shareUrls, thumb: shareThumb } = extractSharedPostDataFromAttachments(event);
+
+    if (!text && !imageUrl && !shareUrls.length) return;
+
+    return handleTextMessage(igUserId, text, imageUrl, { req: ctx.req, shareUrls, shareThumb });
   }
 }
+
 async function replyToInstagramComment(commentId, message) {
   const url = `https://graph.facebook.com/v19.0/${commentId}/replies`;
   await axios.post(url, { message: message.slice(0, MAX_OUT_CHAR) }, { params: { access_token: IG_MANAGE_TOKEN }, timeout: 10000 });
