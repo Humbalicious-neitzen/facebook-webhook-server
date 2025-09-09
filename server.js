@@ -477,40 +477,61 @@ function isFromBrand(metaOrText) {
   return aName.includes(BRAND_PAGE_NAME) || aUrl.includes(`/${BRAND_USERNAME}`);
 }
 function extractSharedPostDataFromAttachments(event) {
-  const atts = event?.message?.attachments || [];
+   const atts = event?.message?.attachments || [];
   const urls = new Set();
   let thumb = null;
   let isShare = false;
   let brandHint = false;
   const captions = [];
 
-  for (const a of atts) {
-    if (a?.type && a.type !== 'image') isShare = true;
+  // helper: gather all URLs & strings from nested payloads
+  function collect(obj) {
+    if (!obj || typeof obj !== 'object') return;
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === 'string') {
+        const s = v.trim();
+        if (!s) continue;
 
-    // Candidate URLs (payload can be nested)
-    if (a?.payload) {
-      const found = collectUrlsFromObject(a.payload);
-      for (const u of found) {
-        if (looksLikePostUrl(u)) urls.add(u);
-      }
-      // Brand hints from text fields
-      for (const key of ['title','description','subtitle','author','byline']) {
-        const txt = a.payload[key];
-        if (typeof txt === 'string' && txt.trim()) {
-          captions.push(txt.trim());
-          if (isFromBrand(txt)) brandHint = true;
+        // URLs
+        if (/^https?:\/\//i.test(s)) {
+          const u = unwrapRedirect(s);
+          if (looksLikePostUrl(u)) urls.add(u);
         }
-      }
-      // Thumbnails
-      const thumbCand = a.payload.image_url || a.payload.thumbnail_url || a.payload.preview_url || a.payload.og_image || a.payload.picture;
-      if (!thumb && typeof thumbCand === 'string') thumb = thumbCand;
-    }
 
-    // Some platforms put a.url directly
-    if (a?.url && looksLikePostUrl(a.url)) urls.add(unwrapRedirect(a.url));
+        // captions / brand hints
+        if (['title','name','label','caption','description','subtitle','author','byline','text'].includes(k) && s) {
+          captions.push(s);
+          if (isFromBrand(s)) brandHint = true;
+        }
+
+        // thumbnail-ish direct values sometimes sit under these keys as strings
+        if (!thumb && ['image_url','thumbnail_url','preview_url','picture','og_image','media_url','image'].includes(k) && /^https?:\/\//i.test(s)) {
+          thumb = s;
+        }
+      } else if (typeof v === 'object') {
+        collect(v);
+      }
+    }
   }
 
-  return { urls: [...urls], thumb, isShare, brandHint, captions: captions.filter(Boolean).join(' • ') };
+  for (const a of atts) {
+    // Any non-image attachment is likely a share/fallback/template
+    if (a?.type && a.type !== 'image') isShare = true;
+
+    // Top-level direct URL
+    if (a?.url && looksLikePostUrl(a.url)) urls.add(unwrapRedirect(a.url));
+
+    // Payload deep-scan
+    if (a?.payload) collect(a.payload);
+  }
+
+  return {
+    urls: [...urls],
+    thumb,
+    isShare,
+    brandHint,
+    captions: captions.filter(Boolean).join(' • ')
+  };
 }
 
 /* =========================
@@ -539,53 +560,91 @@ async function handleTextMessage(psid, text, rawImageUrl, ctx = { req: null, sha
   const combinedUrls = [...new Set([...(ctx.shareUrls || []), ...textUrls])];
 
   // (A) Post shares present? Unfurl & answer if from our brand
-  if (combinedUrls.length) {
-    for (const url of combinedUrls) {
-      const meta = await fetchOEmbed(url);
-      if (meta && isFromBrand(meta)) {
-        const caption = (meta.title || '').trim();
-        const thumbRemote = meta.thumbnail_url || ctx.shareThumb || null;
-        const thumb = thumbRemote ? toVisionableUrl(thumbRemote, ctx.req) : imageUrl;
+if (combinedUrls.length) {
+  let handled = false;
 
-        const postNote = [
-          'postMeta:',
-          `source: ${meta.source}`,
-          `author_name: ${meta.author_name || ''}`,
-          `author_url: ${meta.author_url || ''}`,
-          `permalink: ${url}`,
-          `caption: ${caption}`
-        ].join('\n');
+  for (const url of combinedUrls) {
+    const meta = await fetchOEmbed(url);
+    if (meta && isFromBrand(meta)) {
+      const caption = (meta.title || '').trim();
+      const thumbRemote = meta.thumbnail_url || ctx.shareThumb || null;
+      const thumb = thumbRemote ? toVisionableUrl(thumbRemote, ctx.req) : imageUrl;
 
-        const history = chatHistory.get(psid) || [];
-        const surface = 'dm';
+      const postNote = [
+        'postMeta:',
+        `source: ${meta.source}`,
+        `author_name: ${meta.author_name || ''}`,
+        `author_url: ${meta.author_url || ''}`,
+        `permalink: ${url}`,
+        `caption: ${caption}`
+      ].join('\n');
 
-        const response = await askBrain({
-          text: `${text || ''}\n\n${postNote}`,
-          imageUrl: thumb,
-          surface,
-          history
-        });
+      const history = chatHistory.get(psid) || [];
+      const surface = 'dm';
 
-        const { message } = response;
-        const newHistory = [
-          ...history,
-          constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: thumb, surface }),
-          { role: 'assistant', content: message }
-        ].slice(-20);
+      const response = await askBrain({
+        text: `${text || ''}\n\n${postNote}`,
+        imageUrl: thumb,
+        surface,
+        history
+      });
 
-        chatHistory.set(psid, newHistory);
-        return sendBatched(psid, message);
-      }
+      const { message } = response;
+      const newHistory = [
+        ...history,
+        constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: thumb, surface }),
+        { role: 'assistant', content: message }
+      ].slice(-20);
+
+      chatHistory.set(psid, newHistory);
+      await sendBatched(psid, message);
+      handled = true;
+      break;
     }
-    // Not our post — acknowledge & ask for screenshot
-    const lang = detectLanguage(text || '');
-    const reply = lang === 'ur'
-      ? 'آپ نے پوسٹ شیئر کی ہے۔ بہتر رہنمائی کے لیے براہِ کرم اس کا اسکرین شاٹ بھیج دیں۔'
-      : lang === 'roman-ur'
-        ? 'Aap ne post share ki hai. Behtar rehnumai ke liye screenshot bhej dein.'
-        : 'Thanks for sharing the post! Please send a screenshot so I can help with the details.';
-    return sendBatched(psid, `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`);
   }
+
+  // 🔁 NEW: brand-hint fallback when URLs exist but oEmbed fails / no brand meta returned
+  if (!handled && (ctx.brandHint || ctx.isShare) && (ctx.shareThumb || imageUrl)) {
+    const thumb = toVisionableUrl(ctx.shareThumb || imageUrl, ctx.req);
+    const postNote = [
+      'postMeta:',
+      `source: ig`,
+      `author_name: Roameo Resorts`,
+      `author_url: https://www.instagram.com/${BRAND_USERNAME}/`,
+      `permalink: `,
+      `caption: ${ctx.captions || ''}`
+    ].join('\n');
+
+    const history = chatHistory.get(psid) || [];
+    const surface = 'dm';
+
+    const response = await askBrain({
+      text: `${text || ''}\n\n${postNote}`,
+      imageUrl: thumb,
+      surface,
+      history
+    });
+
+    const { message } = response;
+    const newHistory = [
+      ...history,
+      constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: thumb, surface }),
+      { role: 'assistant', content: message }
+    ].slice(-20);
+
+    chatHistory.set(psid, newHistory);
+    return sendBatched(psid, message);
+  }
+
+  // Final fallback: acknowledge politely
+  const lang = detectLanguage(text || '');
+  const reply = lang === 'ur'
+    ? 'آپ نے پوسٹ شیئر کی ہے۔ بہتر رہنمائی کے لیے براہِ کرم اس کا اسکرین شاٹ بھیج دیں۔'
+    : lang === 'roman-ur'
+      ? 'Aap ne post share ki hai. Behtar rehnumai ke liye screenshot bhej dein.'
+      : 'Thanks for sharing the post! Please send a screenshot so I can help with the details.';
+  return sendBatched(psid, `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`);
+}
 
   // (A2) No URLs, but an IG share attachment detected with brand hints + thumbnail
   if ((ctx.isShare || ctx.brandHint) && (ctx.shareThumb || imageUrl)) {
