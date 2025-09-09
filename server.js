@@ -411,8 +411,23 @@ function intentFromText(text = '') {
 /* =========================
    DM HANDLER
    ========================= */
-async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
+async function handleTextMessage(psid, text, imageUrl, opts = { channel: 'messenger' }) {
   if (!AUTO_REPLY_ENABLED) return;
+
+  // Detect Instagram post links
+  const igPostRegex = /(https?:\/\/(www\.)?instagram\.com\/(p|reel)\/[a-zA-Z0-9_-]+)/;
+  const igMatch = text.match(igPostRegex);
+  if (igMatch && !imageUrl) { // Only trigger if there isn't an image
+    const lang = detectLanguage(text);
+    const reply = lang === 'ur'
+      ? 'اس پوسٹ کے بارے میں سوالات کے لیے، براہِ مہربانی اسکرین شاٹ بھیجیں۔'
+      : lang === 'roman-ur'
+        ? 'Is post ke baare mein sawalat ke liye, please screenshot send karein.'
+        : 'For questions about this post, please send a screenshot.';
+
+    const finalMessage = `${reply}\n\nAt Roameo Resorts, we're always ready to help you plan the perfect getaway!`;
+    return sendBatched(psid, finalMessage);
+  }
 
   const intents = intentFromText(text);
 
@@ -433,7 +448,7 @@ async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
   const history = chatHistory.get(psid) || [];
   const surface = 'dm';
 
-  const response = await askBrain({ text, surface, history });
+  const response = await askBrain({ text, imageUrl, surface, history });
   const { message } = response;
 
   // Update history
@@ -441,7 +456,7 @@ async function handleTextMessage(psid, text, opts = { channel: 'messenger' }) {
     ...history,
     // Note: userContent is a stringified JSON, which is what the API expects.
     // For assistant, we just need the message text.
-    { role: 'user', content: userContent({ text, surface }) },
+    { role: 'user', content: userContent({ text, imageUrl, surface }) },
     { role: 'assistant', content: message }
   ].slice(-10); // Keep it trimmed to the last 5 turns
 
@@ -510,13 +525,22 @@ function logErr(err) {
    ========================= */
 async function routeMessengerEvent(event, ctx = { source: 'messaging' }) {
   if (event.delivery || event.read || event.message?.is_echo) return;
+
   if (event.message && event.sender?.id) {
     if (ctx.source === 'standby' && !ALLOW_REPLY_IN_STANDBY) return;
     if (ctx.source === 'standby' && AUTO_TAKE_THREAD_CONTROL) await takeThreadControl(event.sender.id).catch(() => {});
-    return handleTextMessage(event.sender.id, event.message.text || '', { channel: 'messenger' });
+
+    const text = event.message.text || '';
+    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url;
+
+    // If there's no text and no image, don't do anything
+    if (!text && !imageUrl) return;
+
+    return handleTextMessage(event.sender.id, text, imageUrl, { channel: 'messenger' });
   }
+
   if (event.postback?.payload && event.sender?.id) {
-    return handleTextMessage(event.sender.id, 'help', { channel: 'messenger' });
+    return handleTextMessage(event.sender.id, 'help', null, { channel: 'messenger' });
   }
 }
 
@@ -568,9 +592,16 @@ async function routePageChange(change) {
    ========================= */
 async function routeInstagramMessage(event) {
   if (event.delivery || event.read || event.message?.is_echo) return;
+
   if (event.message && event.sender?.id) {
     const igUserId = event.sender.id;
-    return handleTextMessage(igUserId, event.message.text || '', { channel: 'instagram' });
+    const text = event.message.text || '';
+    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url;
+
+    // If there's no text and no image, don't do anything
+    if (!text && !imageUrl) return;
+
+    return handleTextMessage(igUserId, text, imageUrl, { channel: 'instagram' });
   }
 }
 async function replyToInstagramComment(commentId, message) {
