@@ -7,7 +7,7 @@ const axios = require('axios');
 const { LRUCache } = require('lru-cache');
 
 // 👇 use the centralized GPT brain (reads ROAMEO_PRICES_TEXT + ROAMEO_FACTS_JSON from ENV)
-const { askBrain, userContent } = require('./lib/brain');
+const { askBrain, constructUserMessage } = require('./lib/brain');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -454,9 +454,8 @@ async function handleTextMessage(psid, text, imageUrl, opts = { channel: 'messen
   // Update history
   const newHistory = [
     ...history,
-    // Note: userContent is a stringified JSON, which is what the API expects.
-    // For assistant, we just need the message text.
-    { role: 'user', content: userContent({ text, imageUrl, surface }) },
+    // The user message is now constructed by the imported function directly.
+    constructUserMessage({ text, imageUrl, surface }),
     { role: 'assistant', content: message }
   ].slice(-10); // Keep it trimmed to the last 5 turns
 
