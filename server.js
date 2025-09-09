@@ -1,6 +1,6 @@
-// server.js — Roameo Resorts omni-channel bot (v11)
-// FIX: detect post shares in DMs (attachments: share/fallback/template), unwrap FB redirectors,
-// unfurl via oEmbed, brand-check, proxy thumbnail to Vision, pass postMeta to brain.
+// server.js — Roameo Resorts omni-channel bot (v12)
+// IG post shares in DMs: detect *all* share-type attachments, unwrap links, deep-scan payloads,
+// brand-hint when no permalink, proxy thumbnail to Vision, always acknowledge share.
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -23,7 +23,7 @@ const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 
 const GEOAPIFY_API_KEY    = process.env.GEOAPIFY_API_KEY   || '';
 const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY|| '';
-const RESORT_COORDS       = (process.env.RESORT_COORDS || '').trim(); // "lat,lon"
+const RESORT_COORDS       = (process.env.RESORT_COORDS || '').trim();
 const RESORT_LOCATION_NAME= process.env.RESORT_LOCATION_NAME || 'Roameo Resorts, Tehjian (Neelum)';
 
 const AUTO_REPLY_ENABLED       = String(process.env.AUTO_REPLY_ENABLED       || 'true').toLowerCase() === 'true';
@@ -34,7 +34,7 @@ const IG_MANAGE_TOKEN = process.env.IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
 
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
-const BRAND_USERNAME   = (process.env.BRAND_USERNAME || 'roameoresorts').toLowerCase(); // e.g., roameoresorts
+const BRAND_USERNAME   = (process.env.BRAND_USERNAME || 'roameoresorts').toLowerCase();
 const BRAND_PAGE_NAME  = (process.env.BRAND_PAGE_NAME || 'Roameo Resorts').toLowerCase();
 
 const WHATSAPP_LINK   = process.env.ROAMEO_WHATSAPP_LINK || 'https://wa.me/923558000078';
@@ -56,9 +56,8 @@ if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
    CACHES & MIDDLEWARE
    ========================= */
 app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
-// Memory now 30 days per user/thread
 const dedupe      = new LRUCache({ max: 8000, ttl: 1000 * 60 * 60 * 24 * 30 });
-const tinyCache   = new LRUCache({ max: 1000, ttl: 1000 * 60 * 30 });
+const tinyCache   = new LRUCache({ max: 1200, ttl: 1000 * 60 * 30 });
 const chatHistory = new LRUCache({ max: 4000, ttl: 1000 * 60 * 60 * 24 * 30 });
 
 /* =========================
@@ -148,7 +147,7 @@ async function sendBatched(psid, textOrArray) {
 }
 
 /* =========================
-   IMAGE PROXY (allows Vision to read IG/FB CDN images)
+   IMAGE PROXY (Vision-friendly)
    ========================= */
 function cleanIncomingUrl(u = '') {
   let s = String(u || '').trim();
@@ -204,7 +203,7 @@ function toVisionableUrl(imageUrl, req) {
 }
 
 /* =========================
-   GEO/ROUTING (robust)
+   ROUTING HELPERS
    ========================= */
 function km(meters)    { return (meters / 1000).toFixed(0); }
 function hhmm(seconds) { const h = Math.floor(seconds/3600); const m = Math.round((seconds%3600)/60); return `${h}h ${m}m`; }
@@ -266,14 +265,14 @@ async function getRouteInfo(originLat, originLon, destLat, destLon) {
 }
 
 /* =========================
-   RATE CARD PARSER & CALCULATOR (PKR only)
+   RATE CALC (PKR)
    ========================= */
 function toNumberPKR(str) {
   return Number(String(str).replace(/[^\d]/g, '')) || 0;
 }
 function parsePriceCard(card) {
   const lines = (card || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-  const huts = {}; // { deluxe: { base, n1, n2, n3 }, executive: ... }
+  const huts = {};
   let current = null;
 
   for (const line of lines) {
@@ -296,9 +295,7 @@ function parsePriceCard(card) {
   }
   return huts;
 }
-function formatPKR(n) {
-  return 'PKR ' + n.toLocaleString('en-PK');
-}
+function formatPKR(n) { return 'PKR ' + n.toLocaleString('en-PK'); }
 function computeTotal(hutInfo, nights) {
   const n = Math.max(1, Number(nights) || 1);
   const n1 = hutInfo.n1 || hutInfo.base || 0;
@@ -312,9 +309,7 @@ function computeTotal(hutInfo, nights) {
   return { total, breakdown };
 }
 function buildCalcMessage(hutName, result) {
-  const lines = [];
-  lines.push(`• ${hutName}: ${result.breakdown.map(v => formatPKR(v)).join(' + ')} = **${formatPKR(result.total)}**`);
-  return lines.join('\n');
+  return `• ${hutName}: ${result.breakdown.map(v => formatPKR(v)).join(' + ')} = **${formatPKR(result.total)}**`;
 }
 
 /* =========================
@@ -438,6 +433,14 @@ function unwrapRedirect(u) {
 function looksLikePostUrl(u) {
   return POST_URL_RX.test(u || '');
 }
+function collectUrlsFromObject(obj, out = new Set()) {
+  if (!obj || typeof obj !== 'object') return out;
+  for (const [k, v] of Object.entries(obj)) {
+    if (typeof v === 'string' && /^https?:\/\//i.test(v)) out.add(unwrapRedirect(v));
+    else if (typeof v === 'object') collectUrlsFromObject(v, out);
+  }
+  return out;
+}
 function extractPostUrls(text='') {
   const out = [];
   const rxg = new RegExp(POST_URL_RX.source, 'ig');
@@ -462,35 +465,52 @@ async function fetchOEmbed(url) {
     return null;
   }
 }
-function isFromBrand(meta) {
-  if (!meta) return false;
+function isFromBrand(metaOrText) {
+  if (!metaOrText) return false;
+  if (typeof metaOrText === 'string') {
+    const s = metaOrText.toLowerCase();
+    return s.includes(BRAND_PAGE_NAME) || s.includes(`/${BRAND_USERNAME}`) || s.includes(BRAND_USERNAME);
+  }
+  const meta = metaOrText;
   const aName = (meta.author_name || '').toLowerCase();
   const aUrl  = (meta.author_url  || '').toLowerCase();
   return aName.includes(BRAND_PAGE_NAME) || aUrl.includes(`/${BRAND_USERNAME}`);
 }
 function extractSharedPostDataFromAttachments(event) {
-  const urls = [];
-  let thumb = null;
-
   const atts = event?.message?.attachments || [];
-  for (const a of atts) {
-    const p = a.payload || {};
-    const candidates = [
-      a.url, p.url, p.link, p.href, p.ogurl, p.target_url, p.share_url,
-      // FB link shim
-      p.fallback_url, p.open_graph_url
-    ].filter(Boolean);
+  const urls = new Set();
+  let thumb = null;
+  let isShare = false;
+  let brandHint = false;
+  const captions = [];
 
-    for (let c of candidates) {
-      c = unwrapRedirect(c);
-      if (looksLikePostUrl(c)) urls.push(c);
+  for (const a of atts) {
+    if (a?.type && a.type !== 'image') isShare = true;
+
+    // Candidate URLs (payload can be nested)
+    if (a?.payload) {
+      const found = collectUrlsFromObject(a.payload);
+      for (const u of found) {
+        if (looksLikePostUrl(u)) urls.add(u);
+      }
+      // Brand hints from text fields
+      for (const key of ['title','description','subtitle','author','byline']) {
+        const txt = a.payload[key];
+        if (typeof txt === 'string' && txt.trim()) {
+          captions.push(txt.trim());
+          if (isFromBrand(txt)) brandHint = true;
+        }
+      }
+      // Thumbnails
+      const thumbCand = a.payload.image_url || a.payload.thumbnail_url || a.payload.preview_url || a.payload.og_image || a.payload.picture;
+      if (!thumb && typeof thumbCand === 'string') thumb = thumbCand;
     }
-    if (!thumb && (p.image_url || p.preview_url || p.thumbnail_url)) {
-      thumb = p.image_url || p.preview_url || p.thumbnail_url;
-    }
+
+    // Some platforms put a.url directly
+    if (a?.url && looksLikePostUrl(a.url)) urls.add(unwrapRedirect(a.url));
   }
 
-  return { urls: [...new Set(urls)], thumb };
+  return { urls: [...urls], thumb, isShare, brandHint, captions: captions.filter(Boolean).join(' • ') };
 }
 
 /* =========================
@@ -509,7 +529,7 @@ function extractNightsAndHut(text='') {
   return { nights, hut };
 }
 
-async function handleTextMessage(psid, text, rawImageUrl, ctx = { req: null, shareUrls: [], shareThumb: null }) {
+async function handleTextMessage(psid, text, rawImageUrl, ctx = { req: null, shareUrls: [], shareThumb: null, isShare: false, brandHint: false, captions: '' }) {
   if (!AUTO_REPLY_ENABLED) return;
 
   const imageUrl = rawImageUrl ? toVisionableUrl(rawImageUrl, ctx.req) : null;
@@ -557,13 +577,57 @@ async function handleTextMessage(psid, text, rawImageUrl, ctx = { req: null, sha
         return sendBatched(psid, message);
       }
     }
-    // Not our post — ask for screenshot to help
+    // Not our post — acknowledge & ask for screenshot
     const lang = detectLanguage(text || '');
     const reply = lang === 'ur'
-      ? 'براہِ مہربانی پوسٹ کا اسکرین شاٹ شیئر کریں تاکہ ہم بہتر رہنمائی کر سکیں۔'
+      ? 'آپ نے پوسٹ شیئر کی ہے۔ بہتر رہنمائی کے لیے براہِ کرم اس کا اسکرین شاٹ بھیج دیں۔'
       : lang === 'roman-ur'
-        ? 'Meherbani se post ka screenshot bhej dein taake hum behtar guide kar saken.'
-        : 'Please share a screenshot of the post so we can help with the details.';
+        ? 'Aap ne post share ki hai. Behtar rehnumai ke liye screenshot bhej dein.'
+        : 'Thanks for sharing the post! Please send a screenshot so I can help with the details.';
+    return sendBatched(psid, `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`);
+  }
+
+  // (A2) No URLs, but an IG share attachment detected with brand hints + thumbnail
+  if ((ctx.isShare || ctx.brandHint) && (ctx.shareThumb || imageUrl)) {
+    const thumb = toVisionableUrl(ctx.shareThumb || imageUrl, ctx.req);
+    const postNote = [
+      'postMeta:',
+      `source: ig`,
+      `author_name: Roameo Resorts`,
+      `author_url: https://www.instagram.com/${BRAND_USERNAME}/`,
+      `permalink: `,
+      `caption: ${ctx.captions || ''}`
+    ].join('\n');
+
+    const history = chatHistory.get(psid) || [];
+    const surface = 'dm';
+
+    const response = await askBrain({
+      text: `${text || ''}\n\n${postNote}`,
+      imageUrl: thumb,
+      surface,
+      history
+    });
+
+    const { message } = response;
+    const newHistory = [
+      ...history,
+      constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: thumb, surface }),
+      { role: 'assistant', content: message }
+    ].slice(-20);
+
+    chatHistory.set(psid, newHistory);
+    return sendBatched(psid, message);
+  }
+
+  // (A3) Pure share with no detectable media: at least acknowledge
+  if (ctx.isShare && !text && !imageUrl) {
+    const lang = detectLanguage('');
+    const reply = lang === 'ur'
+      ? 'آپ نے پوسٹ شیئر کی ہے۔ براہِ کرم اپنا سوال لکھ دیں یا اسکرین شاٹ شیئر کریں۔'
+      : lang === 'roman-ur'
+        ? 'Aap ne post share ki hai. Bara-e-mehrbani apna sawal likh dein ya screenshot share karein.'
+        : 'I see you shared a post. Please type your question or share a screenshot so I can help.';
     return sendBatched(psid, `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`);
   }
 
@@ -663,12 +727,12 @@ async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null
     const text = event.message.text || '';
     const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
 
-    // NEW: detect shared posts from attachments even if no text
-    const { urls: shareUrls, thumb: shareThumb } = extractSharedPostDataFromAttachments(event);
+    // Detect shared posts from attachments
+    const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions } = extractSharedPostDataFromAttachments(event);
 
-    if (!text && !imageUrl && !shareUrls.length) return; // nothing to do
+    if (!text && !imageUrl && !(isShare || shareUrls.length)) return;
 
-    return handleTextMessage(event.sender.id, text, imageUrl, { req: ctx.req, shareUrls, shareThumb });
+    return handleTextMessage(event.sender.id, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions });
   }
 
   if (event.postback?.payload && event.sender?.id) {
@@ -698,7 +762,6 @@ async function routePageChange(change) {
     if (isSelfComment(v, 'facebook')) return;
 
     if (AUTO_REPLY_ENABLED) {
-      // NEVER show prices publicly
       const dm = await askBrain({ text, surface: 'comment' });
       await replyToFacebookComment(v.comment_id, stripPricesFromPublic(dm.message));
     }
@@ -713,12 +776,13 @@ async function routeInstagramMessage(event, ctx = { req: null }) {
     const text = event.message.text || '';
     const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
 
-    // NEW: detect shared posts from attachments
-    const { urls: shareUrls, thumb: shareThumb } = extractSharedPostDataFromAttachments(event);
+    // Detect shared posts from attachments
+    const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions } = extractSharedPostDataFromAttachments(event);
 
-    if (!text && !imageUrl && !shareUrls.length) return;
+    // IMPORTANT: do not drop just because there is no text/image/urls — acknowledge shares
+    if (!text && !imageUrl && !(isShare || shareUrls.length)) return;
 
-    return handleTextMessage(igUserId, text, imageUrl, { req: ctx.req, shareUrls, shareThumb });
+    return handleTextMessage(igUserId, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions });
   }
 }
 
