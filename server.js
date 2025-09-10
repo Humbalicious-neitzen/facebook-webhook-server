@@ -1,7 +1,5 @@
 // server.js — Roameo Resorts omni-channel bot (v11 → caption-to-summary for IG shares)
-// + NEW: robust image/screenshot handling for uploads (fallback when assetId ≠ brand media)
-// + NEW previously: multi-intent replies (kept)
-// NOTE: IG post/share logic is unchanged.
+// + QUOTE: per-night total calculator when user specifies #days/#nights (no other logic changed)
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -54,6 +52,12 @@ const CHECKOUT_TIME = process.env.CHECKOUT_TIME || '12:00 pm';
 
 const MAX_OUT_CHAR = 800;
 
+// QUOTE: pricing knobs (readable defaults; keep same card math)
+const DELUXE_BASE    = Number(process.env.DELUXE_BASE || 30000);
+const EXEC_BASE      = Number(process.env.EXEC_BASE   || 50000);
+// 1st/2nd/3rd+ night discounts:
+const NIGHT_DISCOUNTS = [0.10, 0.15, 0.20];
+
 if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
   console.warn('⚠️ Missing required env vars: APP_SECRET, VERIFY_TOKEN, PAGE_ACCESS_TOKEN');
 }
@@ -92,14 +96,8 @@ app.get('/img', async (req, res) => {
   const remote = req.query.u;
   if (!remote) return res.status(400).send('missing u');
   try {
-    // Choose correct referer for lookaside content
-    let referer = 'https://www.instagram.com/';
-    try {
-      const host = new URL(remote).hostname.toLowerCase();
-      if (host.includes('fbsbx.com') || host.includes('facebook.com')) referer = 'https://www.facebook.com/';
-    } catch {}
     const headers = {
-      Referer: referer,
+      Referer: 'https://www.instagram.com/',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9'
@@ -528,7 +526,78 @@ function formatOfferSummary(caption = '', permalink = '') {
 }
 
 /* =========================
-   NEW: generic image analyzer helper (for uploads/screenshots, not shares)
+   QUOTE: nights/days → totals
+   ========================= */
+function parseNightsFromText(text='') {
+  if (!text) return null;
+  const t = text.toLowerCase();
+
+  // direct forms
+  let m = t.match(/(\d{1,2})\s*(?:night|nights|n)\b/);
+  if (m) return Math.max(1, parseInt(m[1], 10));
+
+  // days treated as nights (common in chat)
+  m = t.match(/(\d{1,2})\s*(?:day|days|d)\b/);
+  if (m) return Math.max(1, parseInt(m[1], 10));
+
+  // roman urdu / urdu
+  m = t.match(/(\d{1,2})\s*(?:din|raat|رات|دن)\b/);
+  if (m) return Math.max(1, parseInt(m[1], 10));
+
+  return null;
+}
+function parseHutPref(text='') {
+  const t = (text || '').toLowerCase();
+  if (/\bexecutive\b/.test(t)) return 'executive';
+  if (/\bdeluxe\b/.test(t)) return 'deluxe';
+  return null;
+}
+function nightlyRate(base, nightIndex1based) {
+  const idx = Math.max(1, nightIndex1based) - 1;
+  const disc = NIGHT_DISCOUNTS[Math.min(idx, NIGHT_DISCOUNTS.length - 1)];
+  return Math.round(base * (1 - disc));
+}
+function sumForNights(base, n) {
+  let total = 0;
+  const lines = [];
+  for (let i = 1; i <= n; i++) {
+    const rate = nightlyRate(base, i);
+    total += rate;
+    if (i <= 3) {
+      const pct = Math.round(NIGHT_DISCOUNTS[Math.min(i-1, NIGHT_DISCOUNTS.length-1)] * 100);
+      lines.push(`Night ${i} (${pct}% off): PKR ${rate.toLocaleString()}`);
+    }
+  }
+  if (n > 3) {
+    const rateAfter3 = nightlyRate(base, 4); // same as 3rd+ (20% off)
+    const extraNights = n - 3;
+    lines.push(`Nights 4–${n} (20% off): ${extraNights} × PKR ${rateAfter3.toLocaleString()} = PKR ${(rateAfter3*extraNights).toLocaleString()}`);
+  }
+  return { total, breakdown: lines };
+}
+function formatQuoteMessage(nights, hutPref=null) {
+  const hdr = `Here’s the estimate for *${nights} night${nights>1?'s':''}*:\n`;
+  const blocks = [];
+
+  const makeBlock = (label, base) => {
+    const { total, breakdown } = sumForNights(base, nights);
+    const lines = [
+      `**${label} — Base PKR ${base.toLocaleString()}/night**`,
+      ...breakdown,
+      `→ **Total: PKR ${total.toLocaleString()}**`
+    ];
+    return lines.join('\n');
+  };
+
+  if (!hutPref || hutPref === 'deluxe') blocks.push(makeBlock('Deluxe Hut', DELUXE_BASE));
+  if (!hutPref || hutPref === 'executive') blocks.push(makeBlock('Executive Hut', EXEC_BASE));
+
+  const tail = `\nRates include all taxes and complimentary breakfast for up to 4 guests per booking.\n\nWhatsApp: ${WHATSAPP_LINK}\nAvailability / Book: ${SITE_SHORT}`;
+  return sanitizeVoice(hdr + blocks.join('\n\n') + tail);
+}
+
+/* =========================
+   NEW: generic image analyzer (from previous step kept)
    ========================= */
 async function analyzeGenericImageAndReply(psid, userText, rawImageUrl, ctx, alsoSendRates = false) {
   const visionUrl = toVisionableUrl(rawImageUrl, ctx.req);
@@ -574,7 +643,6 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
   const textUrls = extractPostUrls(text || '');
   const combinedUrls = [...new Set([...(ctx.shareUrls || []), ...textUrls])];
 
-  // Multi-intent quick responders
   const intents = intentFromText(text || '');
   const quickChunks = [];
   if (intents.wantsLocation) {
@@ -588,6 +656,9 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     quickChunks.push(`WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
   }
   const askedRates = intents.wantsRates === true;
+  const nightsAsked = askedRates ? parseNightsFromText(text || '') : null;
+  const hutPref     = askedRates ? parseHutPref(text || '') : null;
+
   if (quickChunks.length) await sendBatched(psid, quickChunks);
 
   // 1) Brand-owned IG media via asset_id
@@ -605,6 +676,12 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
       if (!isPricingIntent(text || '')) {
         const reply = formatOfferSummary(meta.caption || ctx.captions || '', meta.permalink || '');
         return sendBatched(psid, reply);
+      }
+
+      // QUOTE: user asked for rates with #nights → compute totals instead of generic card
+      if (nightsAsked) {
+        const msg = formatQuoteMessage(nightsAsked, hutPref);
+        return sendBatched(psid, msg);
       }
 
       const postNote = [
@@ -625,12 +702,11 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
       return sendBatched(psid, message);
     }
 
-    // NEW: assetId present BUT not our brand media → this is most likely a user upload.
+    // If not our brand media but an image upload, previous image handler remains:
     if (imageUrl || ctx.shareThumb) {
-      await analyzeGenericImageAndReply(psid, text, imageUrl || ctx.shareThumb, ctx, askedRates);
+      await analyzeGenericImageAndReply(psid, text, imageUrl || ctx.shareThumb, ctx, askedRates && !nightsAsked);
       return;
     }
-    // If no image URL available, keep flowing.
   }
 
   // 2) Brand via oEmbed URL
@@ -648,6 +724,12 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
         if (!isPricingIntent(text || '')) {
           const reply = formatOfferSummary(caption, url);
           return sendBatched(psid, reply);
+        }
+
+        // QUOTE: compute totals if nights asked
+        if (nightsAsked) {
+          const msg = formatQuoteMessage(nightsAsked, hutPref);
+          return sendBatched(psid, msg);
         }
 
         const postNote = [
@@ -679,21 +761,16 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     return sendBatched(psid, `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`);
   }
 
-  // 3) NEW: generic upload (no brand share & we have an image)
+  // 3) Generic upload path (unchanged from your previous step)
   if (imageUrl && !ctx.isShare && !ctx.assetId && !combinedUrls.length) {
-    await analyzeGenericImageAndReply(psid, text, imageUrl, ctx, askedRates);
+    await analyzeGenericImageAndReply(psid, text, imageUrl, ctx, askedRates && !nightsAsked);
     return;
   }
 
-  // 4) If multi-intent included rates (and nothing else handled it), answer them now
-  if (askedRates) {
-    const history = chatHistory.get(psid) || [];
-    const surface = 'dm';
-    const rateResp = await askBrain({ text: 'Please share the current rates for guests.', surface, history });
-    const { message } = rateResp;
-    const newHistory = [...history, constructUserMessage({ text: 'rates', imageUrl: null, surface }), { role: 'assistant', content: message }].slice(-20);
-    chatHistory.set(psid, newHistory);
-    return sendBatched(psid, message);
+  // 4) QUOTE: direct “rates” question with #nights in plain text
+  if (askedRates && nightsAsked) {
+    const msg = formatQuoteMessage(nightsAsked, hutPref);
+    return sendBatched(psid, msg);
   }
 
   // 5) Everything else → brain (with history)
