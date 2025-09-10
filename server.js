@@ -1,4 +1,4 @@
-// server.js — Roameo Resorts omni-channel bot (v10 — hardened HTTPS proxy + IG carousel child support)
+// server.js — Roameo Resorts omni-channel bot (v11 — HTTPS proxy + IG carousel child support + Vision debug)
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -458,6 +458,8 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
       const thumb = thumbRemote ? toVisionableUrl(thumbRemote, ctx.req) : imageUrl;
       const imgForVision = SEND_IMAGE_FOR_IG_SHARES ? thumb : null;
 
+      if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
+
       const postNote = [
         'postMeta:',
         `source: ig`,
@@ -486,6 +488,8 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
         const thumbRemote = meta.thumbnail_url || ctx.shareThumb || null;
         const thumb = thumbRemote ? toVisionableUrl(thumbRemote, ctx.req) : imageUrl;
         const imgForVision = SEND_IMAGE_FOR_IG_SHARES ? thumb : null;
+
+        if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
         const postNote = [
           'postMeta:',
