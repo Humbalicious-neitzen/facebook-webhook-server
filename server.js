@@ -1,4 +1,4 @@
-// server.js — Roameo Resorts omni-channel bot (v9 — IG share via asset_id + carousel child support)
+// server.js — Roameo Resorts omni-channel bot (v10 — hardened HTTPS proxy + IG carousel child support)
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -10,6 +10,9 @@ const { askBrain, constructUserMessage } = require('./lib/brain');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+
+// Trust Render/Proxy headers so we can honor X-Forwarded-Proto/Host
+app.set('trust proxy', true);
 
 /* =========================
    ENV & CONSTANTS
@@ -24,23 +27,24 @@ const OPENWEATHER_API_KEY= process.env.OPENWEATHER_API_KEY|| '';
 const RESORT_COORDS      = (process.env.RESORT_COORDS || '').trim(); // "lat,lon"
 const RESORT_LOCATION_NAME = process.env.RESORT_LOCATION_NAME || 'Roameo Resorts, Tehjian (Neelum)';
 
+// IG brand/media config
 const IG_USER_ID = process.env.IG_USER_ID || ''; // REQUIRED for brand-owned media lookup
+const IG_MANAGE_TOKEN = process.env.IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
+
+const IG_DEBUG_LOG = String(process.env.IG_DEBUG_LOG || 'false').toLowerCase() === 'true';
+const SEND_IMAGE_FOR_IG_SHARES = String(process.env.SEND_IMAGE_FOR_IG_SHARES || 'false').toLowerCase() === 'true';
+const PUBLIC_HOST = process.env.PUBLIC_HOST || ''; // optional override for proxy host
 
 // Toggles
 const AUTO_REPLY_ENABLED       = String(process.env.AUTO_REPLY_ENABLED       || 'true').toLowerCase() === 'true';
 const ALLOW_REPLY_IN_STANDBY   = String(process.env.ALLOW_REPLY_IN_STANDBY   || 'true').toLowerCase() === 'true';
 const AUTO_TAKE_THREAD_CONTROL = String(process.env.AUTO_TAKE_THREAD_CONTROL || 'false').toLowerCase() === 'true';
 
-const IG_DEBUG_LOG = String(process.env.IG_DEBUG_LOG || 'false').toLowerCase() === 'true';
-
-// IG token (can reuse PAGE token if scoped)
-const IG_MANAGE_TOKEN = process.env.IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
-
 // Admin
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
 // ==== Brand constants ====
-const BRAND_USERNAME = (process.env.BRAND_USERNAME || 'roameoresorts').toLowerCase();
+const BRAND_USERNAME  = (process.env.BRAND_USERNAME  || 'roameoresorts').toLowerCase();
 const BRAND_PAGE_NAME = (process.env.BRAND_PAGE_NAME || 'Roameo Resorts').toLowerCase();
 
 const WHATSAPP_LINK   = process.env.ROAMEO_WHATSAPP_LINK || 'https://wa.me/923558000078';
@@ -86,15 +90,31 @@ const chatHistory = new LRUCache({ max: 2000, ttl: 1000 * 60 * 60 * 24 * 30 }); 
    ========================= */
 app.get('/', (_req, res) => res.send('Roameo Omni Bot running'));
 
-/* Image proxy for Vision (handles lookaside/fb referers) */
+/* Image proxy for Vision (handles lookaside/fb/ig referers); always HTTPS */
 app.get('/img', async (req, res) => {
   const remote = req.query.u;
   if (!remote) return res.status(400).send('missing u');
+
   try {
-    const headers = { Referer: 'https://www.facebook.com/', 'User-Agent': 'Mozilla/5.0' };
-    const resp = await axios.get(remote, { responseType: 'arraybuffer', timeout: 10000, headers });
+    // Some CDNs are picky about headers; be generous.
+    const headers = {
+      Referer: 'https://www.instagram.com/',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9'
+    };
+
+    const resp = await axios.get(remote, {
+      responseType: 'arraybuffer',
+      timeout: 20000,
+      headers,
+      maxRedirects: 3,
+      validateStatus: s => s >= 200 && s < 400 // accept redirects
+    });
+
     const ct = resp.headers['content-type'] || 'image/jpeg';
     res.set('Content-Type', ct);
+    res.set('Cache-Control', 'public, max-age=300'); // 5 min
     res.send(Buffer.from(resp.data, 'binary'));
   } catch (e) {
     console.error('img proxy error', e?.response?.status, e?.message);
@@ -199,12 +219,10 @@ async function sendBatched(psid, textOrArray) {
 }
 function toVisionableUrl(remoteUrl, req) {
   if (!remoteUrl) return null;
-  // Prefer X-Forwarded-Proto (Render sets this), but ALWAYS force https for OpenAI fetcher
-  const host = (req?.get && req.get('host')) || process.env.PUBLIC_HOST || 'facebook-webhook-server.onrender.com';
-  const origin = `https://${host}`; // <- FORCE HTTPS
+  const host = (req?.get && req.get('host')) || PUBLIC_HOST || 'facebook-webhook-server.onrender.com';
+  const origin = `https://${host}`; // FORCE HTTPS so OpenAI accepts it
   return `${origin}/img?u=${encodeURIComponent(remoteUrl)}`;
 }
-
 function extractPostUrls(text='') {
   if (!text) return [];
   const rx = /(https?:\/\/(?:www\.)?instagram\.com\/(?:p|reel)\/[A-Za-z0-9_\-]+)/ig;
@@ -345,7 +363,7 @@ async function igLookupPostByAssetId(assetId) {
 }
 
 /* =========================
-   ENRICHMENT — route/drive-time (kept)
+   ENRICHMENT — route/drive-time
    ========================= */
 function km(meters)    { return (meters / 1000).toFixed(0); }
 function hhmm(seconds) { const h = Math.floor(seconds/3600); const m = Math.round((seconds%3600)/60); return `${h}h ${m}m`; }
@@ -438,6 +456,7 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
       const meta = lookup.post;
       const thumbRemote = meta.thumbnail_url || ctx.shareThumb || null;
       const thumb = thumbRemote ? toVisionableUrl(thumbRemote, ctx.req) : imageUrl;
+      const imgForVision = SEND_IMAGE_FOR_IG_SHARES ? thumb : null;
 
       const postNote = [
         'postMeta:',
@@ -450,9 +469,9 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
       const history = chatHistory.get(psid) || [];
       const surface = 'dm';
-      const response = await askBrain({ text: `${text || ''}\n\n${postNote}`, imageUrl: thumb, surface, history });
+      const response = await askBrain({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface, history });
       const { message } = response;
-      const newHistory = [...history, constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: thumb, surface }), { role: 'assistant', content: message }].slice(-20);
+      const newHistory = [...history, constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface }), { role: 'assistant', content: message }].slice(-20);
       chatHistory.set(psid, newHistory);
       return sendBatched(psid, message);
     }
@@ -466,6 +485,7 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
         const caption = (meta.title || '').trim();
         const thumbRemote = meta.thumbnail_url || ctx.shareThumb || null;
         const thumb = thumbRemote ? toVisionableUrl(thumbRemote, ctx.req) : imageUrl;
+        const imgForVision = SEND_IMAGE_FOR_IG_SHARES ? thumb : null;
 
         const postNote = [
           'postMeta:',
@@ -478,9 +498,9 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
         const history = chatHistory.get(psid) || [];
         const surface = 'dm';
-        const response = await askBrain({ text: `${text || ''}\n\n${postNote}`, imageUrl: thumb, surface, history });
+        const response = await askBrain({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface, history });
         const { message } = response;
-        const newHistory = [...history, constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: thumb, surface }), { role: 'assistant', content: message }].slice(-20);
+        const newHistory = [...history, constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface }), { role: 'assistant', content: message }].slice(-20);
         chatHistory.set(psid, newHistory);
         return sendBatched(psid, message);
       }
