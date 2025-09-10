@@ -199,9 +199,12 @@ async function sendBatched(psid, textOrArray) {
 }
 function toVisionableUrl(remoteUrl, req) {
   if (!remoteUrl) return null;
-  const origin = `${req?.protocol || 'https'}://${req?.get ? req.get('host') : ''}`;
+  // Prefer X-Forwarded-Proto (Render sets this), but ALWAYS force https for OpenAI fetcher
+  const host = (req?.get && req.get('host')) || process.env.PUBLIC_HOST || 'facebook-webhook-server.onrender.com';
+  const origin = `https://${host}`; // <- FORCE HTTPS
   return `${origin}/img?u=${encodeURIComponent(remoteUrl)}`;
 }
+
 function extractPostUrls(text='') {
   if (!text) return [];
   const rx = /(https?:\/\/(?:www\.)?instagram\.com\/(?:p|reel)\/[A-Za-z0-9_\-]+)/ig;
