@@ -1,7 +1,7 @@
 // server.js — Roameo Resorts omni-channel bot (v11 → caption-to-summary for IG shares)
-// + DM image/screenshot analysis
-// + multi-intent replies (location/route/contact combined)
-// NOTE: IG-share logic is unchanged.
+// + NEW: DM image/screenshot analysis (not IG shares)
+// + NEW: multi-intent replies (location/route/contact + optional rates)
+// IG share logic kept intact.
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -87,16 +87,25 @@ const chatHistory = new LRUCache({ max: 2000, ttl: 1000 * 60 * 60 * 24 * 30 });
    ========================= */
 app.get('/', (_req, res) => res.send('Roameo Omni Bot running'));
 
-/* Image proxy (always HTTPS) */
+/* Image proxy (always HTTPS) — tweaked referer per host for uploaded screenshots */
 app.get('/img', async (req, res) => {
   const remote = req.query.u;
   if (!remote) return res.status(400).send('missing u');
   try {
+    let referer = 'https://www.instagram.com/';
+    try {
+      const host = new URL(remote).hostname.toLowerCase();
+      // NEW: fb/wa lookaside often require facebook referer
+      if (host.includes('fbsbx.com') || host.includes('facebook.com')) {
+        referer = 'https://www.facebook.com/';
+      }
+    } catch {}
     const headers = {
-      Referer: 'https://www.instagram.com/',
+      Referer: referer,
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9'
+      'Accept-Language': 'en-US,en;q=0.9',
+      Connection: 'keep-alive'
     };
     const resp = await axios.get(remote, {
       responseType: 'arraybuffer',
@@ -178,7 +187,7 @@ function stripPricesFromPublic(text = '') {
 function isPricingIntent(text = '') {
   const t = normalize(text);
   if (t.length <= 2) return false;
-  const kw = ['price','prices','pricing','rate','rates','tariff','cost','rent','rental','per night','night price','kiraya','qeemat','kimat','keemat','قیمت','کرایہ','ریٹ','نرخ'];
+  const kw = ['price','prices','pricing','rate','rates','tariff','cost','rent','rental','per night','night price','kiraya','qeemat','kimat','keemat','قیمت','کرایہ','ریٹ','نرخ','charges'];
   if (kw.some(x => t.includes(x))) return true;
   if (/\b\d+\s*(night|nights|din|raat)\b/.test(t)) return true;
   if (/\bhow much\b/.test(t)) return true;
@@ -188,7 +197,14 @@ function splitToChunks(s, limit = MAX_OUT_CHAR) {
   const out = [];
   let str = (s || '').trim();
   while (str.length > limit) {
-    let cut = Math.max(str.lastIndexOf('\n', limit), str.lastIndexOf('. ', limit), str.lastIndexOf('•', limit), str.lastIndexOf('—', limit), str.lastIndexOf('!', limit), str.lastIndexOf('?', limit));
+    let cut = Math.max(
+      str.lastIndexOf('\n', limit),
+      str.lastIndexOf('. ', limit),
+      str.lastIndexOf('•', limit),
+      str.lastIndexOf('—', limit),
+      str.lastIndexOf('!', limit),
+      str.lastIndexOf('?', limit)
+    );
     if (cut <= 0) cut = limit;
     out.push(str.slice(0, cut).trim());
     str = str.slice(cut).trim();
@@ -234,14 +250,16 @@ async function fetchOEmbed(url) {
       params: { url, access_token: token, omitscript: true, hidecaption: false },
       timeout: 8000
     });
-    return data; // { author_name, author_url, title, thumbnail_url, ... }
+    return data;
   } catch (e) {
     if (IG_DEBUG_LOG) console.log('oEmbed error', e?.response?.data || e.message);
     return null;
   }
 }
 function isFromBrand(metaOrString) {
-  const s = (typeof metaOrString === 'string') ? metaOrString.toLowerCase() : `${metaOrString?.author_name || ''} ${metaOrString?.author_url || ''}`.toLowerCase();
+  const s = (typeof metaOrString === 'string')
+    ? metaOrString.toLowerCase()
+    : `${metaOrString?.author_name || ''} ${metaOrString?.author_url || ''}`.toLowerCase();
   return s.includes(BRAND_USERNAME) || s.includes(BRAND_PAGE_NAME);
 }
 
@@ -410,7 +428,7 @@ function intentFromText(text = '') {
 }
 
 /* =========================
-   NEW: caption → structured summary (no raw paste)
+   Caption → structured summary (unchanged)
    ========================= */
 const RX_PRICE_PER_PERSON = /(rs\.?|pkr|₨)\s*([0-9][0-9,]*)\s*(?:\/?\s*(?:per\s*person|pp|per\s*head))?/i;
 const RX_ANY_PRICE        = /(rs\.?|pkr|₨)\s*([0-9][0-9,]*)/i;
@@ -533,7 +551,7 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
   const textUrls = extractPostUrls(text || '');
   const combinedUrls = [...new Set([...(ctx.shareUrls || []), ...textUrls])];
 
-  // ========= NEW: multi-intent aggregator (no early returns) =========
+  // NEW: multi-intent aggregator (quick answers first; do not short-circuit rates)
   const intents = intentFromText(text || '');
   const quickChunks = [];
 
@@ -550,16 +568,12 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
   const askedRates = intents.wantsRates === true;
 
-  // If the user ONLY asked quick things, reply and finish.
-  if (quickChunks.length && !askedRates && !combinedUrls.length && !ctx.assetId && !imageUrl) {
-    return sendBatched(psid, quickChunks);
-  }
-  // Otherwise, send quick replies first, then continue with share/price/image logic.
+  // If user asked for any quick info, send it immediately (but continue if rates/share/image also apply)
   if (quickChunks.length) {
     await sendBatched(psid, quickChunks);
   }
 
-  // ======== IG brand-owned via asset_id (UNCHANGED) ========
+  // IG brand-owned via asset_id (UNCHANGED)
   if (ctx.assetId) {
     const lookup = await igLookupPostByAssetId(ctx.assetId);
     if (lookup && lookup.isBrand && lookup.post) {
@@ -594,7 +608,7 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     }
   }
 
-  // ======== Brand via oEmbed URL (UNCHANGED) ========
+  // Brand via oEmbed URL (UNCHANGED)
   if (combinedUrls.length) {
     for (const url of combinedUrls) {
       const meta = await fetchOEmbed(url);
@@ -639,23 +653,22 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     return sendBatched(psid, `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`);
   }
 
-  // ========= NEW: user uploaded an image/screenshot (NOT an IG share) =========
+  // NEW: user uploaded an image/screenshot (NOT an IG share) → analyze with Vision via proxy URL
   if (imageUrl && !ctx.isShare && !ctx.assetId && !combinedUrls.length) {
-    const visionUrl = toVisionableUrl(imageUrl, ctx.req); // proxy so Vision can fetch
+    const visionUrl = toVisionableUrl(imageUrl, ctx.req); // proxy so the model can fetch (avoids invalid_image_url)
     const history = chatHistory.get(psid) || [];
     const surface = 'dm';
 
-    // Guidance for the brain: identify + relate to Roameo; apologize if irrelevant.
-    const preface =
-      `imageUpload:
+    const guardrail =
+`imageUpload:
 - The user uploaded an image/screenshot. Identify what it shows in plain language.
-- Determine if it is relevant to Roameo Resorts (rooms/huts, interiors, views, river/valley, our logo/ad, booking receipt, map to us, price board, activities).
-- If relevant: answer helpfully using context (e.g., explain the room/offer, give next steps like booking, directions, or where to find more info).
-- If clearly unrelated: politely say it's not related to Roameo Resorts, briefly describe the image, and ask how we can help about the resort.
-- Keep the reply concise (5–7 lines) and friendly.`;
+- Decide if it’s related to Roameo Resorts (our rooms/huts, interiors, views, valley/river, logo/ad, booking receipt, map to us, price board, activities).
+- If related: answer helpfully with next steps (booking/directions/availability/rates) and add our contact links.
+- If unrelated: briefly describe it and politely say it’s not related to Roameo Resorts; ask how we can help about the resort.
+- Keep reply concise (5–7 lines).`;
 
     const response = await askBrain({
-      text: `${preface}\n\nUser message: ${text || '(no text)'}`,
+      text: `${guardrail}\n\nUser text: ${text || '(no text)'}`,
       imageUrl: visionUrl,
       surface,
       history
@@ -663,14 +676,34 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
     const { message } = response;
     const newHistory = [...history,
-      constructUserMessage({ text: `${preface}\n\nUser message: ${text || '(no text)'}`, imageUrl: visionUrl, surface }),
+      constructUserMessage({ text: `${guardrail}\n\nUser text: ${text || '(no text)'}`, imageUrl: visionUrl, surface }),
       { role: 'assistant', content: message }
     ].slice(-20);
+    chatHistory.set(psid, newHistory);
+
+    // If they also asked for rates in the same message, follow with pricing after the image reply.
+    if (askedRates) {
+      const rateHistory = chatHistory.get(psid) || [];
+      const rateResp = await askBrain({ text: 'Please share the current rates for guests.', surface: 'dm', history: rateHistory });
+      await sendBatched(psid, [message, rateResp.message]);
+      return;
+    }
+
+    return sendBatched(psid, message);
+  }
+
+  // NEW: If multi-intent includes rates (without IG share/image), fetch rates now so user gets both.
+  if (askedRates) {
+    const history = chatHistory.get(psid) || [];
+    const surface = 'dm';
+    const rateResp = await askBrain({ text: 'Please share the current rates for guests.', surface, history });
+    const { message } = rateResp;
+    const newHistory = [...history, constructUserMessage({ text: 'rates', imageUrl: null, surface }), { role: 'assistant', content: message }].slice(-20);
     chatHistory.set(psid, newHistory);
     return sendBatched(psid, message);
   }
 
-  // ======== Everything else → brain (with history) ========
+  // Everything else → brain (with history)
   const history = chatHistory.get(psid) || [];
   const surface = 'dm';
   const response = await askBrain({ text, imageUrl, surface, history });
