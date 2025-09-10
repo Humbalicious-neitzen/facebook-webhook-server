@@ -11,7 +11,7 @@ const axios = require('axios');
 const { LRUCache } = require('lru-cache');
 const url = require('url');
 
-// 👇 brain (OpenAI + rules; already updated with retries/fallbacks)
+// 👇 brain (OpenAI + rules; updated with retries/fallbacks in lib/brain.js)
 const { askBrain, constructUserMessage } = require('./lib/brain');
 
 const app = express();
@@ -148,17 +148,32 @@ function stripPricesFromPublic(text = '') {
   });
   return lines.join(' ');
 }
+
+/* ===== Pricing intent (UPDATED) ===== */
 function isPricingIntent(text = '') {
   const t = normalize(text);
   if (t.length <= 2) return false;
+
   const kw = [
-    'price','prices','pricing','rate','rates','tariff','cost','rent','rental','per night','night price',
+    'price','prices','price list','pricing',
+    'rate','rates','rate list','tariff',
+    'cost','costs',
+    'charge','charges',
+    'fee','fees',
+    'per night','night price',
+    'per person','per head','pp',
+    'rent','rental',
     'kiraya','qeemat','kimat','keemat',
     'قیمت','کرایہ','ریٹ','نرخ'
   ];
-  if (kw.some(x => t.includes(x))) return true;
-  if (/\b\d+\s*(night|nights|din|raat)\b/.test(t)) return true;
+  if (kw.some(k => t.includes(k))) return true;
+
   if (/\bhow much\b/.test(t)) return true;
+  if (/\b\d+\s*(night|nights|din|raat)\b/.test(t)) return true;
+
+  // currency + number (e.g., "rs 9000")
+  if (/\b(pkr|rs|₨)\b/i.test(text) && /\b\d{2,3}(?:[, ]?\d{3})\b/.test(text)) return true;
+
   return false;
 }
 
@@ -334,7 +349,6 @@ function intentFromText(text = '') {
 /* =========================
    IG SHARE HELPERS
    ========================= */
-// Very lightweight parse — we mainly need a direct image URL for Vision
 function extractSharedPostDataFromAttachments(event) {
   const atts = event?.message?.attachments || [];
   const share = atts.find(a => a.type === 'share');
@@ -342,13 +356,12 @@ function extractSharedPostDataFromAttachments(event) {
   const shareUrl = share.payload?.url || '';
   if (IG_DEBUG_LOG) console.log('[IG DM attachments]', JSON.stringify(atts, null, 2));
 
-  // For lookaside URLs we treat it as the renderable image itself
   const isLookaside = /lookaside\.fbsbx\.com\/ig_messaging_cdn/i.test(shareUrl);
   return {
     urls: [shareUrl].filter(Boolean),
     thumb: shareUrl,
     isShare: true,
-    brandHint: true, // we only react to brand-owned shares in DM; treat as ours
+    brandHint: true, // treat as our brand share
     captions: []
   };
 }
@@ -369,6 +382,7 @@ async function handleTextMessage(psid, text, imageUrl, opts = { channel: 'messen
   }
 
   const intents = intentFromText(text || '');
+  if (process.env.DEBUG_INTENTS === 'true') console.log('[intents]', intents, 'text:', text); // optional debug
 
   // MULTI-INTENT handling (location/contact/route + price card)
   const wantsRouteLike = intents.wantsRoute || intents.wantsDistance;
