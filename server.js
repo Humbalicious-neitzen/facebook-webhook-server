@@ -1,5 +1,4 @@
-// server.js — Roameo Resorts omni-channel bot (v11 — HTTPS proxy + IG carousel child support + Vision debug)
-// Updated: caption-first reply for shared IG posts (avoid generic night-rate card unless explicitly asked)
+// server.js — Roameo Resorts omni-channel bot (v11 → caption-to-summary for IG shares)
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -12,7 +11,6 @@ const { askBrain, constructUserMessage } = require('./lib/brain');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Trust Render/Proxy headers so we can honor X-Forwarded-Proto/Host
 app.set('trust proxy', true);
 
 /* =========================
@@ -22,29 +20,24 @@ const APP_SECRET = process.env.APP_SECRET;
 const VERIFY_TOKEN = process.env.verify_token || process.env.VERIFY_TOKEN || 'verify_dev';
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 
-// Optional enrichment keys
 const GEOAPIFY_API_KEY   = process.env.GEOAPIFY_API_KEY   || '';
 const OPENWEATHER_API_KEY= process.env.OPENWEATHER_API_KEY|| '';
-const RESORT_COORDS      = (process.env.RESORT_COORDS || '').trim(); // "lat,lon"
+const RESORT_COORDS      = (process.env.RESORT_COORDS || '').trim();
 const RESORT_LOCATION_NAME = process.env.RESORT_LOCATION_NAME || 'Roameo Resorts, Tehjian (Neelum)';
 
-// IG brand/media config
-const IG_USER_ID = process.env.IG_USER_ID || ''; // REQUIRED for brand-owned media lookup
+const IG_USER_ID = process.env.IG_USER_ID || '';
 const IG_MANAGE_TOKEN = process.env.IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
 
 const IG_DEBUG_LOG = String(process.env.IG_DEBUG_LOG || 'false').toLowerCase() === 'true';
 const SEND_IMAGE_FOR_IG_SHARES = String(process.env.SEND_IMAGE_FOR_IG_SHARES || 'false').toLowerCase() === 'true';
-const PUBLIC_HOST = process.env.PUBLIC_HOST || ''; // optional override for proxy host
+const PUBLIC_HOST = process.env.PUBLIC_HOST || '';
 
-// Toggles
 const AUTO_REPLY_ENABLED       = String(process.env.AUTO_REPLY_ENABLED       || 'true').toLowerCase() === 'true';
 const ALLOW_REPLY_IN_STANDBY   = String(process.env.ALLOW_REPLY_IN_STANDBY   || 'true').toLowerCase() === 'true';
 const AUTO_TAKE_THREAD_CONTROL = String(process.env.AUTO_TAKE_THREAD_CONTROL || 'false').toLowerCase() === 'true';
 
-// Admin
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
-// ==== Brand constants ====
 const BRAND_USERNAME  = (process.env.BRAND_USERNAME  || 'roameoresorts').toLowerCase();
 const BRAND_PAGE_NAME = (process.env.BRAND_PAGE_NAME || 'Roameo Resorts').toLowerCase();
 
@@ -82,40 +75,36 @@ const FACTS = {
    MIDDLEWARE & CACHES
    ========================= */
 app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
-const dedupe      = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });              // 1h
-const tinyCache   = new LRUCache({ max: 300,  ttl: 1000 * 60 * 15 });              // 15m
-const chatHistory = new LRUCache({ max: 2000, ttl: 1000 * 60 * 60 * 24 * 30 });    // 30d
+const dedupe      = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });
+const tinyCache   = new LRUCache({ max: 300,  ttl: 1000 * 60 * 15 });
+const chatHistory = new LRUCache({ max: 2000, ttl: 1000 * 60 * 60 * 24 * 30 });
 
 /* =========================
    BASIC ROUTES
    ========================= */
 app.get('/', (_req, res) => res.send('Roameo Omni Bot running'));
 
-/* Image proxy for Vision (handles lookaside/fb/ig referers); always HTTPS */
+/* Image proxy (always HTTPS) */
 app.get('/img', async (req, res) => {
   const remote = req.query.u;
   if (!remote) return res.status(400).send('missing u');
-
   try {
-    // Some CDNs are picky about headers; be generous.
     const headers = {
       Referer: 'https://www.instagram.com/',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9'
     };
-
     const resp = await axios.get(remote, {
       responseType: 'arraybuffer',
       timeout: 20000,
       headers,
       maxRedirects: 3,
-      validateStatus: s => s >= 200 && s < 400 // accept redirects
+      validateStatus: s => s >= 200 && s < 400
     });
-
     const ct = resp.headers['content-type'] || 'image/jpeg';
     res.set('Content-Type', ct);
-    res.set('Cache-Control', 'public, max-age=300'); // 5 min
+    res.set('Cache-Control', 'public, max-age=300');
     res.send(Buffer.from(resp.data, 'binary'));
   } catch (e) {
     console.error('img proxy error', e?.response?.status, e?.message);
@@ -221,7 +210,7 @@ async function sendBatched(psid, textOrArray) {
 function toVisionableUrl(remoteUrl, req) {
   if (!remoteUrl) return null;
   const host = (req?.get && req.get('host')) || PUBLIC_HOST || 'facebook-webhook-server.onrender.com';
-  const origin = `https://${host}`; // FORCE HTTPS so OpenAI accepts it
+  const origin = `https://${host}`;
   return `${origin}/img?u=${encodeURIComponent(remoteUrl)}`;
 }
 function extractPostUrls(text='') {
@@ -256,7 +245,6 @@ function isFromBrand(metaOrString) {
 /* =========================
    IG brand lookup via asset_id (with carousel child support)
    ========================= */
-// Build a map of your recent media, including CAROUSEL children → parent mapping
 async function igFetchRecentMediaMap(force = false) {
   const cacheKey = 'ig:recentMediaMapV2';
   if (!force) {
@@ -287,10 +275,8 @@ async function igFetchRecentMediaMap(force = false) {
         media_url: m.media_url || m.thumbnail_url || '',
         thumbnail_url: m.thumbnail_url || m.media_url || ''
       };
-      // index parent itself
       map[m.id] = parentMeta;
 
-      // ALSO index children → point to parent permalink/caption
       if (m.media_type === 'CAROUSEL_ALBUM') {
         try {
           const { data: chResp } = await axios.get(`https://graph.facebook.com/v19.0/${m.id}/children`, {
@@ -314,7 +300,7 @@ async function igFetchRecentMediaMap(force = false) {
       }
     }
 
-    tinyCache.set(cacheKey, map, { ttl: 1000 * 60 * 10 }); // 10 minutes
+    tinyCache.set(cacheKey, map, { ttl: 1000 * 60 * 10 });
     return map;
   } catch (e) {
     console.error('igFetchRecentMediaMap error', e?.response?.data || e.message);
@@ -322,7 +308,6 @@ async function igFetchRecentMediaMap(force = false) {
   }
 }
 
-// Child-safe fetch: request only fields allowed for carousel children
 async function igFetchMediaById(assetId) {
   const token = IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
   if (!assetId || !token) return null;
@@ -332,7 +317,7 @@ async function igFetchMediaById(assetId) {
     const { data } = await axios.get(url, { params, timeout: 10000 });
     return {
       id: data.id,
-      permalink: '', // unknown for child via this path
+      permalink: '',
       caption: '',
       media_type: data.media_type,
       media_url: data.media_url || data.thumbnail_url || '',
@@ -344,22 +329,14 @@ async function igFetchMediaById(assetId) {
   }
 }
 
-// Resolve an IG lookaside asset_id to your post (handles carousel children)
 async function igLookupPostByAssetId(assetId) {
   if (!assetId) return { isBrand: false, post: null };
-
-  // 1) Check cached recent map (parents + children)
   let map = await igFetchRecentMediaMap();
   if (map && map[assetId]) return { isBrand: true, post: map[assetId] };
-
-  // 2) Refresh once in case cache is stale
   map = await igFetchRecentMediaMap(true);
   if (map && map[assetId]) return { isBrand: true, post: map[assetId] };
-
-  // 3) Fallback: child-safe direct fetch (no caption/permalink here)
   const direct = await igFetchMediaById(assetId);
   if (direct) return { isBrand: true, post: direct };
-
   return { isBrand: false, post: null };
 }
 
@@ -430,17 +407,126 @@ function intentFromText(text = '') {
 }
 
 /* =========================
-   NEW: caption-first formatting for shared posts
+   NEW: caption → structured summary (no raw paste)
    ========================= */
-function formatCaptionReply(caption = '', permalink = '') {
-  const clean = sanitizeVoice(caption || '').trim();
-  const prefix = 'Thanks for sharing the post! Here are the details from that offer:';
-  const lines = [prefix, '', clean || ''];
-  const links = [];
-  if (permalink) links.push(`Post: ${permalink}`);
-  links.push(`WhatsApp: ${WHATSAPP_LINK}`);
-  links.push(`Website: ${SITE_SHORT}`);
-  return [lines.join('\n'), '', links.join('\n')].join('\n').trim();
+const RX_PRICE_PER_PERSON = /(rs\.?|pkr|₨)\s*([0-9][0-9,]*)\s*(?:\/?\s*(?:per\s*person|pp|per\s*head))?/i;
+const RX_ANY_PRICE        = /(rs\.?|pkr|₨)\s*([0-9][0-9,]*)/i;
+const RX_DURATION         = /\b(\d{1,2})\s*(?:din|day|days|night|nights|raat)\b/i;
+const RX_GROUP_SIZE       = /\b(\d{1,2})\s*[–-]\s*(\d{1,2})\s*(?:people|persons|guests|pax)\b/i;
+const RX_PHONE_PK         = /\b(?:\+?92|0)?3\d{9}\b/;
+
+const INCLUSION_KEYS = [
+  'breakfast','complimentary breakfast','free wifi','wifi','bbq','bonfire',
+  'parking','jeep','guide','driver','tea','chai','coffee','heater',
+  'river','waterfall','mountain','views','balcony','family','2–5 people','2-5 people'
+];
+
+function cleanLinesFromCaption(caption = '') {
+  const raw = (caption || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  // drop hashtags / links only lines
+  return raw.filter(l => !/^#/.test(l) && !/^https?:\/\//i.test(l));
+}
+
+function extractInfoFromCaption(caption = '') {
+  const info = {
+    title: '',
+    pricePerPerson: null,
+    anyPrice: null,
+    duration: null, // e.g., "3 days"
+    groupSize: null, // "2–5 people"
+    inclusions: new Set(),
+    phone: null,
+    keyPoints: []
+  };
+
+  const lines = cleanLinesFromCaption(caption);
+  if (lines.length) info.title = lines[0].replace(/^[•\-–\*]+/, '').trim();
+
+  const capLower = caption.toLowerCase();
+
+  // price
+  const mpp = caption.match(RX_PRICE_PER_PERSON);
+  if (mpp) info.pricePerPerson = `PKR ${Number(mpp[2].replace(/,/g,'')).toLocaleString()}/person`;
+  else {
+    const mp = caption.match(RX_ANY_PRICE);
+    if (mp) info.anyPrice = `PKR ${Number(mp[2].replace(/,/g,'')).toLocaleString()}`;
+  }
+
+  // duration
+  const md = caption.match(RX_DURATION);
+  if (md) {
+    const n = md[1];
+    const unit = md[0].toLowerCase().includes('night') || md[0].toLowerCase().includes('raat')
+      ? (Number(n) === 1 ? 'night' : 'nights')
+      : (Number(n) === 1 ? 'day' : 'days');
+    info.duration = `${n} ${unit}`;
+  }
+
+  // group size
+  const mg = caption.match(RX_GROUP_SIZE);
+  if (mg) info.groupSize = `${mg[1]}–${mg[2]} people`;
+
+  // inclusions
+  for (const key of INCLUSION_KEYS) {
+    if (capLower.includes(key)) info.inclusions.add(key.replace(/complimentary /i,''));
+  }
+
+  // phone
+  const ph = caption.match(RX_PHONE_PK);
+  if (ph) info.phone = ph[0];
+
+  // key points: pick up to 3 descriptive lines (not hashtags/links)
+  const pts = [];
+  for (const l of lines.slice(1)) {
+    if (pts.length >= 3) break;
+    const ll = l.toLowerCase();
+    const looksBullet = /[•\-–]|🍽|✨|⭐|👉|✅|📶|🏔|🔥|🧭|🚗|🚌|🏡|🌄|🌿|🍃|📍/.test(l);
+    const hasKeyword = INCLUSION_KEYS.some(k => ll.includes(k));
+    const isCallLine = /\bcall\b|\bwhatsapp\b/i.test(l);
+    if (!isCallLine && (looksBullet || hasKeyword)) pts.push(l);
+  }
+  info.keyPoints = pts;
+
+  return info;
+}
+
+function formatOfferSummary(caption = '', permalink = '') {
+  const c = sanitizeVoice(caption || '');
+  const info = extractInfoFromCaption(c);
+
+  const out = [];
+  out.push('Thanks for sharing the post! Here’s a quick summary of this offer:');
+
+  if (info.title) out.push(`\n• **Package:** ${info.title}`);
+  if (info.duration) out.push(`• **Duration:** ${info.duration}`);
+  if (info.pricePerPerson) {
+    out.push(`• **Price:** ${info.pricePerPerson}`);
+  } else if (info.anyPrice) {
+    out.push(`• **Price:** ${info.anyPrice}`);
+  }
+  if (info.groupSize) out.push(`• **Best for:** ${info.groupSize}`);
+
+  if (info.inclusions.size) {
+    const inc = Array.from(info.inclusions)
+      .map(x => x.replace(/\b(wifi)\b/i,'Wi-Fi'))
+      .map(s => s.replace(/\b(bbq)\b/i,'BBQ'))
+      .join(', ');
+    out.push(`• **Includes:** ${inc}`);
+  }
+
+  // Add up to 3 highlight lines (not the whole caption)
+  if (info.keyPoints.length) {
+    out.push('\nHighlights:');
+    info.keyPoints.forEach(p => out.push(`• ${p}`));
+  }
+
+  out.push('\nWant to book or have questions?');
+  if (info.phone) out.push(`• Call: ${info.phone}`);
+  out.push(`• WhatsApp: ${WHATSAPP_LINK}`);
+  out.push(`• Website: ${SITE_SHORT}`);
+  if (permalink) out.push(`• Post: ${permalink}`);
+
+  return out.join('\n');
 }
 
 /* =========================
@@ -449,22 +535,19 @@ function formatCaptionReply(caption = '', permalink = '') {
 async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareUrls: [], shareThumb: null, isShare: false, brandHint: false, captions: '', assetId: null }) {
   if (!AUTO_REPLY_ENABLED) return;
 
-  // If text contains an instagram permalink, collect it too
   const textUrls = extractPostUrls(text || '');
   const combinedUrls = [...new Set([...(ctx.shareUrls || []), ...textUrls])];
 
-  // Quick branches kept local (no history roundtrip)
   const intents = intentFromText(text || '');
   if (intents.wantsContact) return sendBatched(psid, `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
   if (intents.wantsLocation) return sendBatched(psid, `*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
 
-  // Route/distance helper
   if (intents.wantsRoute || intents.wantsDistance) {
     const msg = await dmRouteMessage(text);
     return sendBatched(psid, msg);
   }
 
-  // 1) *** Brand-owned IG media via asset_id (best path) ***
+  // 1) Brand-owned via asset_id
   if (ctx.assetId) {
     const lookup = await igLookupPostByAssetId(ctx.assetId);
     if (lookup && lookup.isBrand && lookup.post) {
@@ -475,13 +558,13 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
       if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
-      // NEW: if user did NOT ask for room rates, reply straight from CAPTION to avoid night-rate card
+      // If user didn't ask "rates", send structured caption summary (NOT the nightly rate card)
       if (!isPricingIntent(text || '')) {
-        const reply = formatCaptionReply(meta.caption || ctx.captions || '', meta.permalink || '');
+        const reply = formatOfferSummary(meta.caption || ctx.captions || '', meta.permalink || '');
         return sendBatched(psid, reply);
       }
 
-      // Pricing asked → go through brain as before
+      // Pricing asked → brain
       const postNote = [
         'postMeta:',
         `source: ig`,
@@ -501,7 +584,7 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     }
   }
 
-  // 2) If explicit URLs present → try oEmbed brand verify
+  // 2) Brand via oEmbed URL
   if (combinedUrls.length) {
     for (const url of combinedUrls) {
       const meta = await fetchOEmbed(url);
@@ -513,13 +596,11 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
         if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
-        // NEW: caption-first reply unless the user explicitly asked for rates
         if (!isPricingIntent(text || '')) {
-          const reply = formatCaptionReply(caption, url);
+          const reply = formatOfferSummary(caption, url);
           return sendBatched(psid, reply);
         }
 
-        // Pricing asked → use brain
         const postNote = [
           'postMeta:',
           `source: ig`,
@@ -539,7 +620,7 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
       }
     }
 
-    // No brand match via oEmbed
+    // Not our post
     const lang = detectLanguage(text || '');
     const reply = lang === 'ur'
       ? 'آپ نے جو پوسٹ شیئر کی ہے وہ ہماری نہیں لگتی۔ براہِ کرم اس کا اسکرین شاٹ بھیج دیں تاکہ رہنمائی کر سکیں۔'
@@ -549,7 +630,7 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     return sendBatched(psid, `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`);
   }
 
-  // 3) Fallback to brain for everything else (with history)
+  // 3) Everything else → brain (with history)
   const history = chatHistory.get(psid) || [];
   const surface = 'dm';
   const response = await askBrain({ text, imageUrl, surface, history });
@@ -626,7 +707,6 @@ async function routeInstagramMessage(event, ctx = { req: null }) {
 
     const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
 
-    // Do not drop — acknowledge shares too
     if (!text && !imageUrl && !(isShare || shareUrls.length || assetId)) return;
 
     return handleTextMessage(igUserId, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions, assetId });
