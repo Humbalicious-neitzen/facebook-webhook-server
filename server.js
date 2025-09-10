@@ -832,6 +832,10 @@ async function routeInstagramMessage(event, ctx = { req: null }) {
 
   if (event.message && event.sender?.id) {
     const igUserId = event.sender.id;
+  if (process.env.IG_DEBUG_LOG === 'true' && event.message?.attachments) {
+    console.log('[IG DM attachments]', JSON.stringify(event.message.attachments, null, 2));
+  }
+     
     const text = event.message.text || '';
     const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
 
