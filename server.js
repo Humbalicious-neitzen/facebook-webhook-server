@@ -1,4 +1,7 @@
 // server.js — Roameo Resorts omni-channel bot (v11 → caption-to-summary for IG shares)
+// + DM image/screenshot analysis
+// + multi-intent replies (location/route/contact combined)
+// NOTE: IG-share logic is unchanged.
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -423,7 +426,6 @@ const INCLUSION_KEYS = [
 
 function cleanLinesFromCaption(caption = '') {
   const raw = (caption || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-  // drop hashtags / links only lines
   return raw.filter(l => !/^#/.test(l) && !/^https?:\/\//i.test(l));
 }
 
@@ -432,8 +434,8 @@ function extractInfoFromCaption(caption = '') {
     title: '',
     pricePerPerson: null,
     anyPrice: null,
-    duration: null, // e.g., "3 days"
-    groupSize: null, // "2–5 people"
+    duration: null,
+    groupSize: null,
     inclusions: new Set(),
     phone: null,
     keyPoints: []
@@ -444,7 +446,6 @@ function extractInfoFromCaption(caption = '') {
 
   const capLower = caption.toLowerCase();
 
-  // price
   const mpp = caption.match(RX_PRICE_PER_PERSON);
   if (mpp) info.pricePerPerson = `PKR ${Number(mpp[2].replace(/,/g,'')).toLocaleString()}/person`;
   else {
@@ -452,7 +453,6 @@ function extractInfoFromCaption(caption = '') {
     if (mp) info.anyPrice = `PKR ${Number(mp[2].replace(/,/g,'')).toLocaleString()}`;
   }
 
-  // duration
   const md = caption.match(RX_DURATION);
   if (md) {
     const n = md[1];
@@ -462,20 +462,16 @@ function extractInfoFromCaption(caption = '') {
     info.duration = `${n} ${unit}`;
   }
 
-  // group size
   const mg = caption.match(RX_GROUP_SIZE);
   if (mg) info.groupSize = `${mg[1]}–${mg[2]} people`;
 
-  // inclusions
   for (const key of INCLUSION_KEYS) {
     if (capLower.includes(key)) info.inclusions.add(key.replace(/complimentary /i,''));
   }
 
-  // phone
   const ph = caption.match(RX_PHONE_PK);
   if (ph) info.phone = ph[0];
 
-  // key points: pick up to 3 descriptive lines (not hashtags/links)
   const pts = [];
   for (const l of lines.slice(1)) {
     if (pts.length >= 3) break;
@@ -514,7 +510,6 @@ function formatOfferSummary(caption = '', permalink = '') {
     out.push(`• **Includes:** ${inc}`);
   }
 
-  // Add up to 3 highlight lines (not the whole caption)
   if (info.keyPoints.length) {
     out.push('\nHighlights:');
     info.keyPoints.forEach(p => out.push(`• ${p}`));
@@ -538,16 +533,33 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
   const textUrls = extractPostUrls(text || '');
   const combinedUrls = [...new Set([...(ctx.shareUrls || []), ...textUrls])];
 
+  // ========= NEW: multi-intent aggregator (no early returns) =========
   const intents = intentFromText(text || '');
-  if (intents.wantsContact) return sendBatched(psid, `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
-  if (intents.wantsLocation) return sendBatched(psid, `*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+  const quickChunks = [];
 
+  if (intents.wantsLocation) {
+    quickChunks.push(`*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+  }
   if (intents.wantsRoute || intents.wantsDistance) {
     const msg = await dmRouteMessage(text);
-    return sendBatched(psid, msg);
+    quickChunks.push(msg);
+  }
+  if (intents.wantsContact) {
+    quickChunks.push(`WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
   }
 
-  // 1) Brand-owned via asset_id
+  const askedRates = intents.wantsRates === true;
+
+  // If the user ONLY asked quick things, reply and finish.
+  if (quickChunks.length && !askedRates && !combinedUrls.length && !ctx.assetId && !imageUrl) {
+    return sendBatched(psid, quickChunks);
+  }
+  // Otherwise, send quick replies first, then continue with share/price/image logic.
+  if (quickChunks.length) {
+    await sendBatched(psid, quickChunks);
+  }
+
+  // ======== IG brand-owned via asset_id (UNCHANGED) ========
   if (ctx.assetId) {
     const lookup = await igLookupPostByAssetId(ctx.assetId);
     if (lookup && lookup.isBrand && lookup.post) {
@@ -558,13 +570,11 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
       if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
-      // If user didn't ask "rates", send structured caption summary (NOT the nightly rate card)
       if (!isPricingIntent(text || '')) {
         const reply = formatOfferSummary(meta.caption || ctx.captions || '', meta.permalink || '');
         return sendBatched(psid, reply);
       }
 
-      // Pricing asked → brain
       const postNote = [
         'postMeta:',
         `source: ig`,
@@ -584,7 +594,7 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     }
   }
 
-  // 2) Brand via oEmbed URL
+  // ======== Brand via oEmbed URL (UNCHANGED) ========
   if (combinedUrls.length) {
     for (const url of combinedUrls) {
       const meta = await fetchOEmbed(url);
@@ -620,7 +630,6 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
       }
     }
 
-    // Not our post
     const lang = detectLanguage(text || '');
     const reply = lang === 'ur'
       ? 'آپ نے جو پوسٹ شیئر کی ہے وہ ہماری نہیں لگتی۔ براہِ کرم اس کا اسکرین شاٹ بھیج دیں تاکہ رہنمائی کر سکیں۔'
@@ -630,7 +639,38 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     return sendBatched(psid, `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`);
   }
 
-  // 3) Everything else → brain (with history)
+  // ========= NEW: user uploaded an image/screenshot (NOT an IG share) =========
+  if (imageUrl && !ctx.isShare && !ctx.assetId && !combinedUrls.length) {
+    const visionUrl = toVisionableUrl(imageUrl, ctx.req); // proxy so Vision can fetch
+    const history = chatHistory.get(psid) || [];
+    const surface = 'dm';
+
+    // Guidance for the brain: identify + relate to Roameo; apologize if irrelevant.
+    const preface =
+      `imageUpload:
+- The user uploaded an image/screenshot. Identify what it shows in plain language.
+- Determine if it is relevant to Roameo Resorts (rooms/huts, interiors, views, river/valley, our logo/ad, booking receipt, map to us, price board, activities).
+- If relevant: answer helpfully using context (e.g., explain the room/offer, give next steps like booking, directions, or where to find more info).
+- If clearly unrelated: politely say it's not related to Roameo Resorts, briefly describe the image, and ask how we can help about the resort.
+- Keep the reply concise (5–7 lines) and friendly.`;
+
+    const response = await askBrain({
+      text: `${preface}\n\nUser message: ${text || '(no text)'}`,
+      imageUrl: visionUrl,
+      surface,
+      history
+    });
+
+    const { message } = response;
+    const newHistory = [...history,
+      constructUserMessage({ text: `${preface}\n\nUser message: ${text || '(no text)'}`, imageUrl: visionUrl, surface }),
+      { role: 'assistant', content: message }
+    ].slice(-20);
+    chatHistory.set(psid, newHistory);
+    return sendBatched(psid, message);
+  }
+
+  // ======== Everything else → brain (with history) ========
   const history = chatHistory.get(psid) || [];
   const surface = 'dm';
   const response = await askBrain({ text, imageUrl, surface, history });
