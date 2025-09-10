@@ -1,11 +1,10 @@
-// server.js — Roameo Resorts omni-channel bot (v8 — IG share via asset_id)
+// server.js — Roameo Resorts omni-channel bot (v9 — IG share via asset_id + carousel child support)
 
 const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const axios = require('axios');
 const { LRUCache } = require('lru-cache');
-const qs = require('querystring');
 
 const { askBrain, constructUserMessage } = require('./lib/brain');
 
@@ -25,7 +24,7 @@ const OPENWEATHER_API_KEY= process.env.OPENWEATHER_API_KEY|| '';
 const RESORT_COORDS      = (process.env.RESORT_COORDS || '').trim(); // "lat,lon"
 const RESORT_LOCATION_NAME = process.env.RESORT_LOCATION_NAME || 'Roameo Resorts, Tehjian (Neelum)';
 
-const IG_USER_ID = process.env.IG_USER_ID || ''; // << REQUIRED for brand-owned media lookup
+const IG_USER_ID = process.env.IG_USER_ID || ''; // REQUIRED for brand-owned media lookup
 
 // Toggles
 const AUTO_REPLY_ENABLED       = String(process.env.AUTO_REPLY_ENABLED       || 'true').toLowerCase() === 'true';
@@ -233,22 +232,32 @@ function isFromBrand(metaOrString) {
 }
 
 /* =========================
-   IG brand lookup via asset_id
+   IG brand lookup via asset_id (with carousel child support)
    ========================= */
-async function igFetchRecentMediaMap() {
-  const cacheKey = 'ig:recentMediaMap';
-  const cached = tinyCache.get(cacheKey);
-  if (cached) return cached;
+// Build a map of your recent media, including CAROUSEL children → parent mapping
+async function igFetchRecentMediaMap(force = false) {
+  const cacheKey = 'ig:recentMediaMapV2';
+  if (!force) {
+    const cached = tinyCache.get(cacheKey);
+    if (cached) return cached;
+  }
   if (!IG_USER_ID) return null;
 
   const token = IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
   try {
     const url = `https://graph.facebook.com/v19.0/${IG_USER_ID}/media`;
-    const params = { access_token: token, fields: 'id,permalink,caption,media_type,media_url,thumbnail_url,timestamp', limit: 50 };
+    const params = {
+      access_token: token,
+      fields: 'id,permalink,caption,media_type,media_url,thumbnail_url,timestamp',
+      limit: 100
+    };
     const { data } = await axios.get(url, { params, timeout: 10000 });
+
     const map = {};
-    for (const m of (data?.data || [])) {
-      map[m.id] = {
+    const parents = data?.data || [];
+
+    for (const m of parents) {
+      const parentMeta = {
         id: m.id,
         permalink: m.permalink,
         caption: m.caption || '',
@@ -256,25 +265,53 @@ async function igFetchRecentMediaMap() {
         media_url: m.media_url || m.thumbnail_url || '',
         thumbnail_url: m.thumbnail_url || m.media_url || ''
       };
+      // index parent itself
+      map[m.id] = parentMeta;
+
+      // ALSO index children → point to parent permalink/caption
+      if (m.media_type === 'CAROUSEL_ALBUM') {
+        try {
+          const { data: chResp } = await axios.get(`https://graph.facebook.com/v19.0/${m.id}/children`, {
+            params: { access_token: token, fields: 'id,media_type,media_url,thumbnail_url' },
+            timeout: 10000
+          });
+          for (const c of (chResp?.data || [])) {
+            map[c.id] = {
+              id: c.id,
+              parent_id: m.id,
+              permalink: m.permalink,
+              caption: m.caption || '',
+              media_type: c.media_type,
+              media_url: c.media_url || c.thumbnail_url || '',
+              thumbnail_url: c.thumbnail_url || c.media_url || ''
+            };
+          }
+        } catch (e) {
+          if (IG_DEBUG_LOG) console.log('ig children fetch error', e?.response?.data || e.message);
+        }
+      }
     }
-    tinyCache.set(cacheKey, map, { ttl: 1000 * 60 * 10 }); // 10 min
+
+    tinyCache.set(cacheKey, map, { ttl: 1000 * 60 * 10 }); // 10 minutes
     return map;
   } catch (e) {
     console.error('igFetchRecentMediaMap error', e?.response?.data || e.message);
     return null;
   }
 }
+
+// Child-safe fetch: request only fields allowed for carousel children
 async function igFetchMediaById(assetId) {
   const token = IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
   if (!assetId || !token) return null;
   try {
     const url = `https://graph.facebook.com/v19.0/${assetId}`;
-    const params = { access_token: token, fields: 'id,permalink,caption,media_type,media_url,thumbnail_url' };
+    const params = { access_token: token, fields: 'id,media_type,media_url,thumbnail_url' };
     const { data } = await axios.get(url, { params, timeout: 10000 });
     return {
       id: data.id,
-      permalink: data.permalink,
-      caption: data.caption || '',
+      permalink: '', // unknown for child via this path
+      caption: '',
       media_type: data.media_type,
       media_url: data.media_url || data.thumbnail_url || '',
       thumbnail_url: data.thumbnail_url || data.media_url || ''
@@ -284,12 +321,23 @@ async function igFetchMediaById(assetId) {
     return null;
   }
 }
+
+// Resolve an IG lookaside asset_id to your post (handles carousel children)
 async function igLookupPostByAssetId(assetId) {
   if (!assetId) return { isBrand: false, post: null };
-  const recent = await igFetchRecentMediaMap();
-  if (recent && recent[assetId]) return { isBrand: true, post: recent[assetId] };
+
+  // 1) Check cached recent map (parents + children)
+  let map = await igFetchRecentMediaMap();
+  if (map && map[assetId]) return { isBrand: true, post: map[assetId] };
+
+  // 2) Refresh once in case cache is stale
+  map = await igFetchRecentMediaMap(true);
+  if (map && map[assetId]) return { isBrand: true, post: map[assetId] };
+
+  // 3) Fallback: child-safe direct fetch (no caption/permalink here)
   const direct = await igFetchMediaById(assetId);
   if (direct) return { isBrand: true, post: direct };
+
   return { isBrand: false, post: null };
 }
 
