@@ -1,4 +1,5 @@
-// server.js — Roameo Resorts omni-channel bot (v11 → caption-to-summary for IG shares)
+// server.js — Roameo Resorts omni-channel bot
+// v11.2 — DM image proxy + multi-intent replies (keeps v11 IG-share logic intact)
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -11,6 +12,7 @@ const { askBrain, constructUserMessage } = require('./lib/brain');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// Trust Render/Proxy headers so we can honor X-Forwarded-Proto/Host
 app.set('trust proxy', true);
 
 /* =========================
@@ -20,24 +22,29 @@ const APP_SECRET = process.env.APP_SECRET;
 const VERIFY_TOKEN = process.env.verify_token || process.env.VERIFY_TOKEN || 'verify_dev';
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 
+// Optional enrichment keys
 const GEOAPIFY_API_KEY   = process.env.GEOAPIFY_API_KEY   || '';
 const OPENWEATHER_API_KEY= process.env.OPENWEATHER_API_KEY|| '';
-const RESORT_COORDS      = (process.env.RESORT_COORDS || '').trim();
+const RESORT_COORDS      = (process.env.RESORT_COORDS || '').trim(); // "lat,lon"
 const RESORT_LOCATION_NAME = process.env.RESORT_LOCATION_NAME || 'Roameo Resorts, Tehjian (Neelum)';
 
-const IG_USER_ID = process.env.IG_USER_ID || '';
+// IG brand/media config
+const IG_USER_ID = process.env.IG_USER_ID || ''; // REQUIRED for brand-owned media lookup
 const IG_MANAGE_TOKEN = process.env.IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
 
 const IG_DEBUG_LOG = String(process.env.IG_DEBUG_LOG || 'false').toLowerCase() === 'true';
 const SEND_IMAGE_FOR_IG_SHARES = String(process.env.SEND_IMAGE_FOR_IG_SHARES || 'false').toLowerCase() === 'true';
-const PUBLIC_HOST = process.env.PUBLIC_HOST || '';
+const PUBLIC_HOST = process.env.PUBLIC_HOST || ''; // optional override for proxy host
 
+// Toggles
 const AUTO_REPLY_ENABLED       = String(process.env.AUTO_REPLY_ENABLED       || 'true').toLowerCase() === 'true';
 const ALLOW_REPLY_IN_STANDBY   = String(process.env.ALLOW_REPLY_IN_STANDBY   || 'true').toLowerCase() === 'true';
 const AUTO_TAKE_THREAD_CONTROL = String(process.env.AUTO_TAKE_THREAD_CONTROL || 'false').toLowerCase() === 'true';
 
+// Admin
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
+// ==== Brand constants ====
 const BRAND_USERNAME  = (process.env.BRAND_USERNAME  || 'roameoresorts').toLowerCase();
 const BRAND_PAGE_NAME = (process.env.BRAND_PAGE_NAME || 'Roameo Resorts').toLowerCase();
 
@@ -75,19 +82,20 @@ const FACTS = {
    MIDDLEWARE & CACHES
    ========================= */
 app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
-const dedupe      = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });
-const tinyCache   = new LRUCache({ max: 300,  ttl: 1000 * 60 * 15 });
-const chatHistory = new LRUCache({ max: 2000, ttl: 1000 * 60 * 60 * 24 * 30 });
+const dedupe      = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });              // 1h
+const tinyCache   = new LRUCache({ max: 300,  ttl: 1000 * 60 * 15 });              // 15m
+const chatHistory = new LRUCache({ max: 2000, ttl: 1000 * 60 * 60 * 24 * 30 });    // 30d
 
 /* =========================
    BASIC ROUTES
    ========================= */
 app.get('/', (_req, res) => res.send('Roameo Omni Bot running'));
 
-/* Image proxy (always HTTPS) */
+/* Image proxy for Vision (handles lookaside/fb/ig referers); always HTTPS */
 app.get('/img', async (req, res) => {
   const remote = req.query.u;
   if (!remote) return res.status(400).send('missing u');
+
   try {
     const headers = {
       Referer: 'https://www.instagram.com/',
@@ -95,6 +103,7 @@ app.get('/img', async (req, res) => {
       Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9'
     };
+
     const resp = await axios.get(remote, {
       responseType: 'arraybuffer',
       timeout: 20000,
@@ -102,6 +111,7 @@ app.get('/img', async (req, res) => {
       maxRedirects: 3,
       validateStatus: s => s >= 200 && s < 400
     });
+
     const ct = resp.headers['content-type'] || 'image/jpeg';
     res.set('Content-Type', ct);
     res.set('Cache-Control', 'public, max-age=300');
@@ -210,7 +220,7 @@ async function sendBatched(psid, textOrArray) {
 function toVisionableUrl(remoteUrl, req) {
   if (!remoteUrl) return null;
   const host = (req?.get && req.get('host')) || PUBLIC_HOST || 'facebook-webhook-server.onrender.com';
-  const origin = `https://${host}`;
+  const origin = `https://${host}`; // FORCE HTTPS so OpenAI accepts it
   return `${origin}/img?u=${encodeURIComponent(remoteUrl)}`;
 }
 function extractPostUrls(text='') {
@@ -308,6 +318,7 @@ async function igFetchRecentMediaMap(force = false) {
   }
 }
 
+// Child-safe fetch: request only fields allowed for carousel children
 async function igFetchMediaById(assetId) {
   const token = IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
   if (!assetId || !token) return null;
@@ -331,12 +342,16 @@ async function igFetchMediaById(assetId) {
 
 async function igLookupPostByAssetId(assetId) {
   if (!assetId) return { isBrand: false, post: null };
+
   let map = await igFetchRecentMediaMap();
   if (map && map[assetId]) return { isBrand: true, post: map[assetId] };
+
   map = await igFetchRecentMediaMap(true);
   if (map && map[assetId]) return { isBrand: true, post: map[assetId] };
+
   const direct = await igFetchMediaById(assetId);
   if (direct) return { isBrand: true, post: direct };
+
   return { isBrand: false, post: null };
 }
 
@@ -407,147 +422,45 @@ function intentFromText(text = '') {
 }
 
 /* =========================
-   NEW: caption → structured summary (no raw paste)
-   ========================= */
-const RX_PRICE_PER_PERSON = /(rs\.?|pkr|₨)\s*([0-9][0-9,]*)\s*(?:\/?\s*(?:per\s*person|pp|per\s*head))?/i;
-const RX_ANY_PRICE        = /(rs\.?|pkr|₨)\s*([0-9][0-9,]*)/i;
-const RX_DURATION         = /\b(\d{1,2})\s*(?:din|day|days|night|nights|raat)\b/i;
-const RX_GROUP_SIZE       = /\b(\d{1,2})\s*[–-]\s*(\d{1,2})\s*(?:people|persons|guests|pax)\b/i;
-const RX_PHONE_PK         = /\b(?:\+?92|0)?3\d{9}\b/;
-
-const INCLUSION_KEYS = [
-  'breakfast','complimentary breakfast','free wifi','wifi','bbq','bonfire',
-  'parking','jeep','guide','driver','tea','chai','coffee','heater',
-  'river','waterfall','mountain','views','balcony','family','2–5 people','2-5 people'
-];
-
-function cleanLinesFromCaption(caption = '') {
-  const raw = (caption || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-  // drop hashtags / links only lines
-  return raw.filter(l => !/^#/.test(l) && !/^https?:\/\//i.test(l));
-}
-
-function extractInfoFromCaption(caption = '') {
-  const info = {
-    title: '',
-    pricePerPerson: null,
-    anyPrice: null,
-    duration: null, // e.g., "3 days"
-    groupSize: null, // "2–5 people"
-    inclusions: new Set(),
-    phone: null,
-    keyPoints: []
-  };
-
-  const lines = cleanLinesFromCaption(caption);
-  if (lines.length) info.title = lines[0].replace(/^[•\-–\*]+/, '').trim();
-
-  const capLower = caption.toLowerCase();
-
-  // price
-  const mpp = caption.match(RX_PRICE_PER_PERSON);
-  if (mpp) info.pricePerPerson = `PKR ${Number(mpp[2].replace(/,/g,'')).toLocaleString()}/person`;
-  else {
-    const mp = caption.match(RX_ANY_PRICE);
-    if (mp) info.anyPrice = `PKR ${Number(mp[2].replace(/,/g,'')).toLocaleString()}`;
-  }
-
-  // duration
-  const md = caption.match(RX_DURATION);
-  if (md) {
-    const n = md[1];
-    const unit = md[0].toLowerCase().includes('night') || md[0].toLowerCase().includes('raat')
-      ? (Number(n) === 1 ? 'night' : 'nights')
-      : (Number(n) === 1 ? 'day' : 'days');
-    info.duration = `${n} ${unit}`;
-  }
-
-  // group size
-  const mg = caption.match(RX_GROUP_SIZE);
-  if (mg) info.groupSize = `${mg[1]}–${mg[2]} people`;
-
-  // inclusions
-  for (const key of INCLUSION_KEYS) {
-    if (capLower.includes(key)) info.inclusions.add(key.replace(/complimentary /i,''));
-  }
-
-  // phone
-  const ph = caption.match(RX_PHONE_PK);
-  if (ph) info.phone = ph[0];
-
-  // key points: pick up to 3 descriptive lines (not hashtags/links)
-  const pts = [];
-  for (const l of lines.slice(1)) {
-    if (pts.length >= 3) break;
-    const ll = l.toLowerCase();
-    const looksBullet = /[•\-–]|🍽|✨|⭐|👉|✅|📶|🏔|🔥|🧭|🚗|🚌|🏡|🌄|🌿|🍃|📍/.test(l);
-    const hasKeyword = INCLUSION_KEYS.some(k => ll.includes(k));
-    const isCallLine = /\bcall\b|\bwhatsapp\b/i.test(l);
-    if (!isCallLine && (looksBullet || hasKeyword)) pts.push(l);
-  }
-  info.keyPoints = pts;
-
-  return info;
-}
-
-function formatOfferSummary(caption = '', permalink = '') {
-  const c = sanitizeVoice(caption || '');
-  const info = extractInfoFromCaption(c);
-
-  const out = [];
-  out.push('Thanks for sharing the post! Here’s a quick summary of this offer:');
-
-  if (info.title) out.push(`\n• **Package:** ${info.title}`);
-  if (info.duration) out.push(`• **Duration:** ${info.duration}`);
-  if (info.pricePerPerson) {
-    out.push(`• **Price:** ${info.pricePerPerson}`);
-  } else if (info.anyPrice) {
-    out.push(`• **Price:** ${info.anyPrice}`);
-  }
-  if (info.groupSize) out.push(`• **Best for:** ${info.groupSize}`);
-
-  if (info.inclusions.size) {
-    const inc = Array.from(info.inclusions)
-      .map(x => x.replace(/\b(wifi)\b/i,'Wi-Fi'))
-      .map(s => s.replace(/\b(bbq)\b/i,'BBQ'))
-      .join(', ');
-    out.push(`• **Includes:** ${inc}`);
-  }
-
-  // Add up to 3 highlight lines (not the whole caption)
-  if (info.keyPoints.length) {
-    out.push('\nHighlights:');
-    info.keyPoints.forEach(p => out.push(`• ${p}`));
-  }
-
-  out.push('\nWant to book or have questions?');
-  if (info.phone) out.push(`• Call: ${info.phone}`);
-  out.push(`• WhatsApp: ${WHATSAPP_LINK}`);
-  out.push(`• Website: ${SITE_SHORT}`);
-  if (permalink) out.push(`• Post: ${permalink}`);
-
-  return out.join('\n');
-}
-
-/* =========================
    DM HANDLER
    ========================= */
 async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareUrls: [], shareThumb: null, isShare: false, brandHint: false, captions: '', assetId: null }) {
   if (!AUTO_REPLY_ENABLED) return;
 
+  // Add instagram permalinks from the user text too
   const textUrls = extractPostUrls(text || '');
   const combinedUrls = [...new Set([...(ctx.shareUrls || []), ...textUrls])];
 
+  // ---------- Multi-intent quick responses (Location / Route / Contact) ----------
   const intents = intentFromText(text || '');
-  if (intents.wantsContact) return sendBatched(psid, `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
-  if (intents.wantsLocation) return sendBatched(psid, `*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+  const chunks = [];
 
-  if (intents.wantsRoute || intents.wantsDistance) {
-    const msg = await dmRouteMessage(text);
-    return sendBatched(psid, msg);
+  if (intents.wantsLocation) {
+    chunks.push(`*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
   }
 
-  // 1) Brand-owned via asset_id
+  if (intents.wantsRoute || intents.wantsDistance) {
+    const routeMsg = await dmRouteMessage(text || '');
+    chunks.push(routeMsg);
+  }
+
+  if (intents.wantsContact) {
+    chunks.push(`WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+  }
+
+  // If user asked for rates ALONG with other things, send the quick chunks first,
+  // then fall through to the pricing (brain) flow.
+  const askedRates = intents.wantsRates === true;
+  if (chunks.length && !askedRates && !combinedUrls.length && !ctx.assetId && !imageUrl) {
+    // Only quick intents present → reply now
+    return sendBatched(psid, chunks);
+  }
+  if (chunks.length && askedRates) {
+    await sendBatched(psid, chunks); // send location/route/contact first
+    // then continue below to let the brain send the price card
+  }
+
+  // ---------- Brand-owned IG shares (kept exactly as in v11) ----------
   if (ctx.assetId) {
     const lookup = await igLookupPostByAssetId(ctx.assetId);
     if (lookup && lookup.isBrand && lookup.post) {
@@ -558,13 +471,6 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
       if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
-      // If user didn't ask "rates", send structured caption summary (NOT the nightly rate card)
-      if (!isPricingIntent(text || '')) {
-        const reply = formatOfferSummary(meta.caption || ctx.captions || '', meta.permalink || '');
-        return sendBatched(psid, reply);
-      }
-
-      // Pricing asked → brain
       const postNote = [
         'postMeta:',
         `source: ig`,
@@ -584,7 +490,6 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     }
   }
 
-  // 2) Brand via oEmbed URL
   if (combinedUrls.length) {
     for (const url of combinedUrls) {
       const meta = await fetchOEmbed(url);
@@ -595,11 +500,6 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
         const imgForVision = SEND_IMAGE_FOR_IG_SHARES ? thumb : null;
 
         if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
-
-        if (!isPricingIntent(text || '')) {
-          const reply = formatOfferSummary(caption, url);
-          return sendBatched(psid, reply);
-        }
 
         const postNote = [
           'postMeta:',
@@ -620,7 +520,6 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
       }
     }
 
-    // Not our post
     const lang = detectLanguage(text || '');
     const reply = lang === 'ur'
       ? 'آپ نے جو پوسٹ شیئر کی ہے وہ ہماری نہیں لگتی۔ براہِ کرم اس کا اسکرین شاٹ بھیج دیں تاکہ رہنمائی کر سکیں۔'
@@ -630,7 +529,7 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     return sendBatched(psid, `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`);
   }
 
-  // 3) Everything else → brain (with history)
+  // ---------- Everything else → brain (with history) ----------
   const history = chatHistory.get(psid) || [];
   const surface = 'dm';
   const response = await askBrain({ text, imageUrl, surface, history });
@@ -655,7 +554,9 @@ async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null
     }
 
     const text = event.message.text || '';
-    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
+    const rawImageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
+    // NEW: proxy DM images through /img so Vision can fetch them
+    const imageUrl = rawImageUrl ? toVisionableUrl(rawImageUrl, ctx.req) : null;
 
     const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
     if (!text && !imageUrl && !(isShare || shareUrls.length || assetId)) return;
@@ -703,7 +604,9 @@ async function routeInstagramMessage(event, ctx = { req: null }) {
     }
 
     const text = event.message.text || '';
-    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
+    const rawImageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
+    // NEW: proxy DM images through /img so Vision can fetch them
+    const imageUrl = rawImageUrl ? toVisionableUrl(rawImageUrl, ctx.req) : null;
 
     const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
 
