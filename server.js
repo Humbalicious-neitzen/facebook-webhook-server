@@ -1,6 +1,6 @@
 // server.js — Roameo Resorts omni-channel bot
 // - Multi-intent DM handling (location + contact + route + price card)
-// - IG share detection + Vision image proxy (/img)
+// - IG share detection + caption fetch + Vision image proxy (/img)
 // - Conversation history per user
 // - Safe public comments (no numeric prices)
 
@@ -9,9 +9,8 @@ const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const axios = require('axios');
 const { LRUCache } = require('lru-cache');
-const url = require('url');
 
-// 👇 brain (OpenAI + rules; updated with retries/fallbacks in lib/brain.js)
+// 👇 brain
 const { askBrain, constructUserMessage } = require('./lib/brain');
 
 const app = express();
@@ -27,12 +26,12 @@ const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 // Optional enrichment keys
 const GEOAPIFY_API_KEY   = process.env.GEOAPIFY_API_KEY   || '';
 const OPENWEATHER_API_KEY= process.env.OPENWEATHER_API_KEY|| '';
-const RESORT_COORDS      = (process.env.RESORT_COORDS || '').trim(); // "lat,lon"
+const RESORT_COORDS      = (process.env.RESORT_COORDS || '').trim();
 const RESORT_LOCATION_NAME = process.env.RESORT_LOCATION_NAME || 'Roameo Resorts, Tehjian (Neelum)';
 
 // Instagram brand helpers
 const IG_MANAGE_TOKEN = process.env.IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
-const IG_USER_ID = process.env.IG_USER_ID || ''; // your business IG user id (1784...)
+const IG_USER_ID = process.env.IG_USER_ID || ''; // e.g., "17841469682154159"
 const IG_DEBUG_LOG = String(process.env.IG_DEBUG_LOG || 'true').toLowerCase() === 'true';
 const SEND_IMAGE_FOR_IG_SHARES = String(process.env.SEND_IMAGE_FOR_IG_SHARES || 'true').toLowerCase() === 'true';
 
@@ -46,7 +45,6 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
 // ==== Brand constants ====
 const BRAND_USERNAME = 'roameoresorts';
-const WHATSAPP_NUMBER = '03558000078';
 const WHATSAPP_LINK   = 'https://wa.me/923558000078';
 const SITE_URL        = 'https://www.roameoresorts.com/';
 const SITE_SHORT      = 'roameoresorts.com';
@@ -55,7 +53,6 @@ const MAPS_LINK       = 'https://maps.app.goo.gl/Y49pQPd541p1tvUf6';
 const CHECKIN_TIME  = process.env.CHECKIN_TIME  || '3:00 pm';
 const CHECKOUT_TIME = process.env.CHECKOUT_TIME || '12:00 pm';
 
-// Outgoing message limits
 const MAX_OUT_CHAR = 800;
 
 if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
@@ -63,25 +60,12 @@ if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
 }
 
 /* =========================
-   BASIC FACTS
-   ========================= */
-const FACTS = {
-  site: SITE_URL,
-  map: MAPS_LINK,
-  resort_coords: RESORT_COORDS,
-  location_name: RESORT_LOCATION_NAME,
-  river_name: 'Neelam River',
-  checkin: CHECKIN_TIME,
-  checkout: CHECKOUT_TIME
-};
-
-/* =========================
    MIDDLEWARE & CACHES
    ========================= */
 app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
-const dedupe      = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });        // 1h
-const tinyCache   = new LRUCache({ max: 300,  ttl: 1000 * 60 * 15 });        // 15m
-const chatHistory = new LRUCache({ max: 1000, ttl: 1000 * 60 * 60 * 24 });   // 24h
+const dedupe      = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });
+const tinyCache   = new LRUCache({ max: 300,  ttl: 1000 * 60 * 15 });
+const chatHistory = new LRUCache({ max: 1000, ttl: 1000 * 60 * 60 * 24 });
 
 /* =========================
    ROOT / VERIFY
@@ -122,20 +106,13 @@ function sanitizeVoice(text = '') {
   return s.replace(/__URL(\d+)__/g, (_, i) => urls[Number(i)]);
 }
 function normalize(s='') {
-  return String(s).normalize('NFKD')
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase();
+  return String(s).normalize('NFKD').replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 function detectLanguage(text = '') {
   const t = (text || '').trim();
   const hasUrduScript = /[\u0600-\u06FF\u0750-\u077F]/.test(t);
   if (hasUrduScript) return 'ur';
-  const romanUrduTokens = [
-    'aap','ap','apka','apki','apke','kiraya','qeemat','rate','price','btao','batao',
-    'kitna','kitni','kitne','raha','hai','hain'
-  ];
+  const romanUrduTokens = ['aap','ap','apka','apki','apke','kiraya','qeemat','rate','price','btao','batao','kitna','kitni','kitne','raha','hai','hain'];
   const hit = romanUrduTokens.some(w => new RegExp(`\\b${w}\\b`, 'i').test(t));
   return hit ? 'roman-ur' : 'en';
 }
@@ -149,35 +126,25 @@ function stripPricesFromPublic(text = '') {
   return lines.join(' ');
 }
 
-/* ===== Pricing intent (UPDATED) ===== */
+/* ===== Pricing intent (updated) ===== */
 function isPricingIntent(text = '') {
   const t = normalize(text);
   if (t.length <= 2) return false;
-
   const kw = [
     'price','prices','price list','pricing',
     'rate','rates','rate list','tariff',
-    'cost','costs',
-    'charge','charges',
-    'fee','fees',
-    'per night','night price',
-    'per person','per head','pp',
-    'rent','rental',
-    'kiraya','qeemat','kimat','keemat',
-    'قیمت','کرایہ','ریٹ','نرخ'
+    'cost','costs','charge','charges','fee','fees',
+    'per night','night price','per person','per head','pp',
+    'rent','rental','kiraya','qeemat','kimat','keemat','قیمت','کرایہ','ریٹ','نرخ'
   ];
   if (kw.some(k => t.includes(k))) return true;
-
   if (/\bhow much\b/.test(t)) return true;
   if (/\b\d+\s*(night|nights|din|raat)\b/.test(t)) return true;
-
-  // currency + number (e.g., "rs 9000")
   if (/\b(pkr|rs|₨)\b/i.test(text) && /\b\d{2,3}(?:[, ]?\d{3})\b/.test(text)) return true;
-
   return false;
 }
 
-/* ===== Routing helpers ===== */
+/* ===== Route helpers ===== */
 function km(meters)    { return (meters / 1000).toFixed(0); }
 function hhmm(seconds) { const h = Math.floor(seconds/3600); const m = Math.round((seconds%3600)/60); return `${h}h ${m}m`; }
 
@@ -186,8 +153,8 @@ async function geocodePlace(place) {
   const key = `geo:${place.toLowerCase()}`;
   if (tinyCache.has(key)) return tinyCache.get(key);
   try {
-    const gUrl = 'https://api.geoapify.com/v1/geocode/search';
-    const { data } = await axios.get(gUrl, { params: { text: place, limit: 1, apiKey: GEOAPIFY_API_KEY }, timeout: 10000 });
+    const url = 'https://api.geoapify.com/v1/geocode/search';
+    const { data } = await axios.get(url, { params: { text: place, limit: 1, apiKey: GEOAPIFY_API_KEY }, timeout: 10000 });
     const feat = data?.features?.[0];
     if (!feat) return null;
     const [lon, lat] = feat.geometry.coordinates || [];
@@ -196,21 +163,17 @@ async function geocodePlace(place) {
     return res;
   } catch (e) { console.error('geoapify geocode error', e?.response?.data || e.message); return null; }
 }
-
 async function getRouteInfo(originLat, originLon, destLat, destLon) {
   if (!GEOAPIFY_API_KEY) return null;
   const key = `route:${originLat},${originLon}->${destLat},${destLon}`;
   if (tinyCache.has(key)) return tinyCache.get(key);
   try {
     const waypoints = `${originLat},${originLon}|${destLat},${destLon}`;
-    const urlR = 'https://api.geoapify.com/v1/routing';
+    const url = 'https://api.geoapify.com/v1/routing';
     const modes = ['drive', 'walk', 'transit'];
     const routePromises = modes.map(async (mode) => {
       try {
-        const { data } = await axios.get(urlR, { 
-          params: { waypoints, mode, apiKey: GEOAPIFY_API_KEY, traffic: mode === 'drive' ? 'approximated' : undefined },
-          timeout: 12000 
-        });
+        const { data } = await axios.get(url, { params: { waypoints, mode, apiKey: GEOAPIFY_API_KEY, traffic: mode === 'drive' ? 'approximated' : undefined }, timeout: 12000 });
         const ft = data?.features?.[0]?.properties;
         if (!ft) return null;
         return { mode, distance: ft.distance, duration: ft.time, distance_km: Number(km(ft.distance)), duration_formatted: hhmm(ft.time) };
@@ -226,29 +189,18 @@ async function getRouteInfo(originLat, originLon, destLat, destLon) {
     return result;
   } catch (e) { console.error('geoapify routing error', e?.response?.data || e.message); return null; }
 }
-
 function extractOrigin(text='') {
   const t = text.trim();
   const rx = [
-    /route\s+from\s+(.+)$/i,
-    /rasta\s+from\s+(.+)$/i,
-    /directions?\s+from\s+(.+)$/i,
-    /how\s+to\s+reach\s+from\s+(.+)$/i,
-    /how\s+to\s+get\s+there\s+from\s+(.+)$/i,
-    /(?:i\s+am\s+)?coming\s+from\s+(.+)$/i,
-    /(?:i\s+am\s+)?travell?ing\s+from\s+(.+)$/i,
+    /route\s+from\s+(.+)$/i, /rasta\s+from\s+(.+)$/i, /directions?\s+from\s+(.+)$/i,
+    /how\s+to\s+reach\s+from\s+(.+)$/i, /how\s+to\s+get\s+there\s+from\s+(.+)$/i,
+    /(?:i\s+am\s+)?coming\s+from\s+(.+)$/i, /(?:i\s+am\s+)?travell?ing\s+from\s+(.+)$/i,
     /from\s+(.+)\s+(?:to|till|for)?\s*(?:roameo|resort|neelum|tehjian|here)?$/i,
-    /(.+)\s+(?:se|say)\s+(?:rasta|route|directions?)/i,
-    /(.+)\s+to\s+(?:roameo|resort|neelum|tehjian)/i,
-    /how\s+far\s+is\s+(.+)\s+(?:from|to)/i,
-    /distance\s+from\s+(.+)$/i,
-    /how\s+long\s+to\s+reach\s+from\s+(.+)$/i,
-    /travel\s+time\s+from\s+(.+)$/i,
-    /(.+)\s+سے\s+(?:راستہ|فاصلہ|دور|کتنے|کتنا)/i,
-    /(.+)\s+سے\s+(?:کتنے|کتنا)\s+(?:کلومیٹر|گھنٹے)/i,
-    /(.+)\s+سے\s+(?:روامو|ریسورٹ)/i,
-    /(.+)\s+se\s+(?:rasta|distance|far|kitna|kitne)/i,
-    /(.+)\s+se\s+(?:kitna|kitne)\s+(?:km|kilometer|ghante)/i,
+    /(.+)\s+(?:se|say)\s+(?:rasta|route|directions?)/i, /(.+)\s+to\s+(?:roameo|resort|neelum|tehjian)/i,
+    /how\s+far\s+is\s+(.+)\s+(?:from|to)/i, /distance\s+from\s+(.+)$/i, /how\s+long\s+to\s+reach\s+from\s+(.+)$/i,
+    /travel\s+time\s+from\s+(.+)$/i, /(.+)\s+سے\s+(?:راستہ|فاصلہ|دور|کتنے|کتنا)/i,
+    /(.+)\s+سے\s+(?:کتنے|کتنا)\s+(?:کلومیٹر|گھنٹے)/i, /(.+)\s+سے\s+(?:روامو|ریسورٹ)/i,
+    /(.+)\s+se\s+(?:rasta|distance|far|kitna|kitne)/i, /(.+)\s+se\s+(?:kitna|kitne)\s+(?:km|kilometer|ghante)/i,
     /(.+)\s+se\s+(?:roameo|resort)/i
   ];
   for (const r of rx) {
@@ -261,7 +213,6 @@ function extractOrigin(text='') {
   }
   return null;
 }
-
 async function dmRouteMessage(userText = '') {
   const lang = detectLanguage(userText);
   let origin = extractOrigin(userText);
@@ -273,11 +224,9 @@ async function dmRouteMessage(userText = '') {
         : 'Please tell us your departure city. Example: "route from Lahore".';
     return ask;
   }
-
   const destParts = (RESORT_COORDS || '').split(',').map(s => s.trim());
   if (destParts.length !== 2) return 'Location temporarily unavailable. Please try later.';
   const [dLat, dLon] = destParts.map(parseFloat);
-
   const originGeo = await geocodePlace(origin);
   if (!originGeo) {
     return lang === 'ur'
@@ -286,7 +235,6 @@ async function dmRouteMessage(userText = '') {
         ? `"${origin}" ka location nahi mila. Sahi shehar ka naam use karein.\n\nLocation: ${MAPS_LINK}`
         : `Could not find location for "${origin}". Please use the correct city name.\n\nLocation: ${MAPS_LINK}`;
   }
-
   const routeInfo = await getRouteInfo(originGeo.lat, originGeo.lon, dLat, dLon);
   if (!routeInfo) {
     return lang === 'ur'
@@ -295,7 +243,6 @@ async function dmRouteMessage(userText = '') {
         ? `Route info nahi mila. Baad mein try karein.\n\nLocation: ${MAPS_LINK}`
         : `Route information not available. Please try again later.\n\nLocation: ${MAPS_LINK}`;
   }
-
   let response = '';
   if (lang === 'ur') {
     response = `*${origin}* سے Roameo Resorts تک:\n\n`;
@@ -319,18 +266,16 @@ async function dmRouteMessage(userText = '') {
     });
     response += `\nLocation: ${MAPS_LINK}`;
   }
-
   const additionalInfo = lang === 'ur'
     ? `\n\n💡 ٹپ: گاڑی سے آنا بہترین ہے۔ راستہ خوبصورت ہے!`
     : lang === 'roman-ur'
       ? `\n\n💡 Tip: Car se ana best hai. Rasta khoobsurat hai!`
       : `\n\n💡 Tip: Driving is the best option. The route is beautiful!`;
-
   return sanitizeVoice(`${response}${additionalInfo}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
 }
 
 /* =========================
-   INTENTS (minimal)
+   INTENTS
    ========================= */
 function intentFromText(text = '') {
   const t = normalize(text);
@@ -352,113 +297,153 @@ function intentFromText(text = '') {
 function extractSharedPostDataFromAttachments(event) {
   const atts = event?.message?.attachments || [];
   const share = atts.find(a => a.type === 'share');
-  if (!share) return { urls: [], thumb: null, isShare: false, brandHint: false, captions: [] };
+  if (!share) return { urls: [], thumb: null, isShare: false };
   const shareUrl = share.payload?.url || '';
   if (IG_DEBUG_LOG) console.log('[IG DM attachments]', JSON.stringify(atts, null, 2));
-
-  const isLookaside = /lookaside\.fbsbx\.com\/ig_messaging_cdn/i.test(shareUrl);
-  return {
-    urls: [shareUrl].filter(Boolean),
-    thumb: shareUrl,
-    isShare: true,
-    brandHint: true, // treat as our brand share
-    captions: []
-  };
+  return { urls: [shareUrl].filter(Boolean), thumb: shareUrl, isShare: true };
+}
+function extractAssetIdFromLookaside(u = '') {
+  const m = u.match(/asset_id=(\d+)/);
+  return m ? m[1] : null;
+}
+async function igFetchCaptionViaOembed(permalink) {
+  if (!permalink) return null;
+  try {
+    const token = process.env.IG_OEMBED_TOKEN || IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
+    const { data } = await axios.get('https://graph.facebook.com/v19.0/instagram_oembed', {
+      params: { url: permalink, access_token: token }, timeout: 8000
+    });
+    return data?.title || null;
+  } catch { return null; }
+}
+async function igFetchMediaInfo(mediaId) {
+  if (!IG_MANAGE_TOKEN || !mediaId) return null;
+  // Try full fields first
+  try {
+    const { data } = await axios.get(`https://graph.facebook.com/v19.0/${mediaId}`, {
+      params: { access_token: IG_MANAGE_TOKEN, fields: 'id,media_type,owner,permalink,caption' },
+      timeout: 8000
+    });
+    return data;
+  } catch (e) {
+    // Fallback for carousel children: request fewer fields then fetch caption via oEmbed
+    try {
+      const { data } = await axios.get(`https://graph.facebook.com/v19.0/${mediaId}`, {
+        params: { access_token: IG_MANAGE_TOKEN, fields: 'id,media_type,owner,permalink' },
+        timeout: 8000
+      });
+      const caption = await igFetchCaptionViaOembed(data?.permalink);
+      return { ...data, caption: caption || null };
+    } catch { return null; }
+  }
 }
 
 /* =========================
-   DM HANDLER (multi-intent)
+   DM HANDLER (multi-intent + share-aware)
    ========================= */
-async function handleTextMessage(psid, text, imageUrl, opts = { channel: 'messenger', shareUrls: [], shareThumb: null, isShare: false, brandHint: false, captions: [], req: null }) {
+async function handleTextMessage(psid, text, imageUrl, opts = { channel: 'instagram', shareUrls: [], shareThumb: null, isShare: false, req: null }) {
   if (!AUTO_REPLY_ENABLED) return;
 
-  // Convert brand IG share into an image for Vision (via proxy), if asked
+  // Build image (for Vision) if share
   let imageForBrain = imageUrl;
   if (!imageForBrain && SEND_IMAGE_FOR_IG_SHARES && opts.isShare && opts.shareThumb) {
-    const direct = `/img?u=${encodeURIComponent(opts.shareThumb)}`;
-    const host = opts.req ? (opts.req.headers['x-forwarded-proto'] || 'https') + '://' + opts.req.headers.host : 'https://facebook-webhook-server.onrender.com';
-    imageForBrain = `${host}${direct}`;
+    const proto = (opts.req && (opts.req.headers['x-forwarded-proto'] || 'https')) || 'https';
+    const host = (opts.req && opts.req.headers.host) || '';
+    const base = host ? `${proto}://${host}` : 'https://facebook-webhook-server.onrender.com';
+    imageForBrain = `${base}/img?u=${encodeURIComponent(opts.shareThumb)}`;
     if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imageForBrain);
   }
 
-  const intents = intentFromText(text || '');
-  if (process.env.DEBUG_INTENTS === 'true') console.log('[intents]', intents, 'text:', text); // optional debug
+  // If this is a share, try to fetch caption + owner to ensure it's our post
+  let shareMeta = null;
+  if (opts.isShare && opts.shareThumb) {
+    const assetId = extractAssetIdFromLookaside(opts.shareThumb);
+    if (assetId) {
+      const info = await igFetchMediaInfo(assetId);
+      if (info && info.owner?.id && IG_USER_ID && info.owner.id !== IG_USER_ID) {
+        // Not our post → don't treat as brand share
+        shareMeta = null;
+      } else {
+        shareMeta = {
+          caption: info?.caption || null,
+          permalink: info?.permalink || null,
+          media_type: info?.media_type || null
+        };
+      }
+    }
+  }
 
-  // MULTI-INTENT handling (location/contact/route + price card)
+  const intents = intentFromText(text || '');
+  if (process.env.DEBUG_INTENTS === 'true') console.log('[intents]', intents, 'text:', text);
+
+  // Block price card for pure shares (unless user actually asks pricing)
+  const allowPriceCard = !(opts.isShare && (!text || !isPricingIntent(text)));
+
+  // MULTI-INTENT (location / route / contact + optional price)
   const wantsRouteLike = intents.wantsRoute || intents.wantsDistance;
   const quickFlags = [intents.wantsLocation, wantsRouteLike, intents.wantsContact, intents.wantsRates].filter(Boolean);
   const multiIntent = quickFlags.length > 1;
 
   if (multiIntent) {
     const pieces = [];
-
     if (intents.wantsLocation) {
       pieces.push(`*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
     }
-
     if (wantsRouteLike) {
       pieces.push(await dmRouteMessage(text));
     }
-
     if (intents.wantsContact) {
       pieces.push(`WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
     }
-
     if (pieces.length) await sendBatched(psid, pieces);
 
-    // Prices: send verbatim price card via brain (no extra text) as its own message
     if (intents.wantsRates) {
       const history = chatHistory.get(psid) || [];
-      const dm = await askBrain({ text, imageUrl: null, surface: 'dm', history });
+      const dm = await askBrain({ text, imageUrl: null, surface: 'dm', history, shareMeta, allowPriceCard: true });
       await sendBatched(psid, dm.message);
-
-      // add to history
       const newHistory = [
         ...history,
-        constructUserMessage({ text, imageUrl: null, surface: 'dm' }),
+        constructUserMessage({ text, imageUrl: null, surface: 'dm', extraRules: { allow_price_card: true }, shareMeta }),
         { role: 'assistant', content: dm.message }
       ].slice(-10);
       chatHistory.set(psid, newHistory);
     }
 
-    // If also a share image was provided, follow up with brand-friendly bridge via brain
-    if (imageForBrain && !intents.wantsRates) {
+    // If a brand post was shared, send a friendly, caption-aware reply (no price card unless asked)
+    if ((opts.isShare || imageForBrain) && !intents.wantsRates) {
       const history = chatHistory.get(psid) || [];
-      const dmImg = await askBrain({ text, imageUrl: imageForBrain, surface: 'dm', history });
+      const dmImg = await askBrain({ text: text || '', imageUrl: imageForBrain, surface: 'dm', history, shareMeta, allowPriceCard });
       await sendBatched(psid, dmImg.message);
       const newHistory2 = [
         ...history,
-        constructUserMessage({ text, imageUrl: imageForBrain, surface: 'dm' }),
+        constructUserMessage({ text: text || '', imageUrl: imageForBrain, surface: 'dm', extraRules: { allow_price_card: allowPriceCard }, shareMeta }),
         { role: 'assistant', content: dmImg.message }
       ].slice(-10);
       chatHistory.set(psid, newHistory2);
     }
-
     return;
   }
 
   // Single-intent quick paths
   if (intents.wantsContact) {
-    const msg = `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`;
-    return sendBatched(psid, msg);
+    return sendBatched(psid, `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
   }
   if (intents.wantsLocation) {
-    const msg = `*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`;
-    return sendBatched(psid, msg);
+    return sendBatched(psid, `*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
   }
   if (wantsRouteLike) {
     return sendBatched(psid, await dmRouteMessage(text));
   }
 
-  // Everything else → brain (with optional image/post)
+  // Everything else → brain (with optional post image + caption)
   const history = chatHistory.get(psid) || [];
   const surface = 'dm';
-  const response = await askBrain({ text, imageUrl: imageForBrain, surface, history });
+  const response = await askBrain({ text: text || '', imageUrl: imageForBrain, surface, history, shareMeta, allowPriceCard });
   const { message } = response;
 
   const newHistory = [
     ...history,
-    constructUserMessage({ text, imageUrl: imageForBrain, surface }),
+    constructUserMessage({ text: text || '', imageUrl: imageForBrain, surface, extraRules: { allow_price_card: allowPriceCard }, shareMeta }),
     { role: 'assistant', content: message }
   ].slice(-10);
 
@@ -534,11 +519,10 @@ async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null
     const text = event.message.text || '';
     const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
 
-    const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions } = extractSharedPostDataFromAttachments(event);
-
+    const { urls: shareUrls, thumb: shareThumb, isShare } = extractSharedPostDataFromAttachments(event);
     if (!text && !imageUrl && !(isShare || (shareUrls || []).length)) return;
 
-    return handleTextMessage(event.sender.id, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions });
+    return handleTextMessage(event.sender.id, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare });
   }
 
   if (event.postback?.payload && event.sender?.id) {
@@ -588,17 +572,16 @@ async function routeInstagramMessage(event, ctx = { req: null }) {
     const text = event.message.text || '';
     const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
 
-    const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions } = extractSharedPostDataFromAttachments(event);
+    const { urls: shareUrls, thumb: shareThumb, isShare } = extractSharedPostDataFromAttachments(event);
     if (!text && !imageUrl && !(isShare || (shareUrls || []).length)) return;
 
     if (IG_DEBUG_LOG && event.message?.attachments) {
       console.log('[IG DM attachments]', JSON.stringify(event.message.attachments, null, 2));
     }
 
-    return handleTextMessage(igUserId, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions });
+    return handleTextMessage(igUserId, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare });
   }
 }
-
 async function replyToInstagramComment(commentId, message) {
   const url = `https://graph.facebook.com/v19.0/${commentId}/replies`;
   await axios.post(url, { message: message.slice(0, MAX_OUT_CHAR) }, { params: { access_token: IG_MANAGE_TOKEN }, timeout: 10000 });
