@@ -1,4 +1,5 @@
 // server.js — Roameo Resorts omni-channel bot (v11 — HTTPS proxy + IG carousel child support + Vision debug)
+// Updated: caption-first reply for shared IG posts (avoid generic night-rate card unless explicitly asked)
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -429,6 +430,20 @@ function intentFromText(text = '') {
 }
 
 /* =========================
+   NEW: caption-first formatting for shared posts
+   ========================= */
+function formatCaptionReply(caption = '', permalink = '') {
+  const clean = sanitizeVoice(caption || '').trim();
+  const prefix = 'Thanks for sharing the post! Here are the details from that offer:';
+  const lines = [prefix, '', clean || ''];
+  const links = [];
+  if (permalink) links.push(`Post: ${permalink}`);
+  links.push(`WhatsApp: ${WHATSAPP_LINK}`);
+  links.push(`Website: ${SITE_SHORT}`);
+  return [lines.join('\n'), '', links.join('\n')].join('\n').trim();
+}
+
+/* =========================
    DM HANDLER
    ========================= */
 async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareUrls: [], shareThumb: null, isShare: false, brandHint: false, captions: '', assetId: null }) {
@@ -460,6 +475,13 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
       if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
+      // NEW: if user did NOT ask for room rates, reply straight from CAPTION to avoid night-rate card
+      if (!isPricingIntent(text || '')) {
+        const reply = formatCaptionReply(meta.caption || ctx.captions || '', meta.permalink || '');
+        return sendBatched(psid, reply);
+      }
+
+      // Pricing asked → go through brain as before
       const postNote = [
         'postMeta:',
         `source: ig`,
@@ -491,6 +513,13 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
         if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
+        // NEW: caption-first reply unless the user explicitly asked for rates
+        if (!isPricingIntent(text || '')) {
+          const reply = formatCaptionReply(caption, url);
+          return sendBatched(psid, reply);
+        }
+
+        // Pricing asked → use brain
         const postNote = [
           'postMeta:',
           `source: ig`,
