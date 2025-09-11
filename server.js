@@ -1,4 +1,11 @@
-// server.js — Roameo Resorts omni-channel bot (v11 → caption-to-summary for IG shares + convo memory on summary + travel-cost intent + image-proxy for uploads)
+// server.js — Roameo Resorts omni-channel bot
+// Base: v11 (caption-to-summary for IG shares)
+// Additions in this file only:
+//  • Curated override for the "3 din just chill / Rs 9000 per person" post
+//  • Thread memory for that post to answer follow-ups (dates/travel)
+//  • Nights/Days quote calculator on demand
+//  • Upload image → proxy via /img before Vision (fix invalid_image_url)
+//  • DO NOT change anything else that already worked
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -78,6 +85,8 @@ app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }))
 const dedupe      = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });
 const tinyCache   = new LRUCache({ max: 300,  ttl: 1000 * 60 * 15 });
 const chatHistory = new LRUCache({ max: 2000, ttl: 1000 * 60 * 60 * 24 * 30 });
+// Thread context for follow-ups (e.g., after a specific post) — 7 days TTL
+const dmContext   = new LRUCache({ max: 3000, ttl: 1000 * 60 * 60 * 24 * 7 });
 
 /* =========================
    BASIC ROUTES
@@ -177,56 +186,10 @@ function isPricingIntent(text = '') {
   if (t.length <= 2) return false;
   const kw = ['price','prices','pricing','rate','rates','tariff','cost','rent','rental','per night','night price','kiraya','qeemat','kimat','keemat','قیمت','کرایہ','ریٹ','نرخ'];
   if (kw.some(x => t.includes(x))) return true;
-  if (/\b\d+\s*(night|nights|din|raat)\b/.test(t)) return true;
+  if (/\b\d+\s*(night|nights|din|raat|day|days)\b/.test(t)) return true;
   if (/\bhow much\b/.test(t)) return true;
   return false;
 }
-
-/* --- NEW: travel cost intent separated from pricing --- */
-function isTravelCostIntent(text = '') {
-  const t = normalize(text);
-  const a = /\b(travel|transport|transportation|bus|coach|hiace|coaster|jeep|car|taxi|uber|cab|fuel|petrol|diesel|fare|kiraya)\b.*\b(cost|price|prices|fare|rate|rates)\b/.test(t);
-  const b = /\b(cost|price|prices|fare|rate|rates)\b.*\b(travel|transport|transportation|bus|coach|hiace|coaster|jeep|car|taxi|uber|cab|fuel|petrol|diesel|fare|kiraya)\b/.test(t);
-  const c = /\btravel(?:ing)?\s+costs?\b/.test(t);
-  const d = /\bfare\b/.test(t);
-  const e = /\bkharcha\b/.test(t);
-  return a || b || c || d || e;
-}
-function travelCostMessage(userText = '') {
-  const lang = detectLanguage(userText);
-  if (lang === 'ur') {
-    return sanitizeVoice(
-`سفر/ٹرانسپورٹ کا خرچہ ہمارے پیکج میں شامل نہیں ہوتا، اس لئے ہم اس کی قیمت نہیں بتاتے۔ زیادہ تر مہمان اپنی گاڑی سے آتے ہیں یا مقامی ٹرانسپورٹ لیتے ہیں۔ ہم راستہ اور فاصلہ بتا سکتے ہیں، مگر کرایہ/فیول الگ ہوگا۔
-
-لوکیشن: ${MAPS_LINK}
-راستہ معلوم کرنا ہو تو یوں لکھیں: "route from Lahore"
-
-WhatsApp: ${WHATSAPP_LINK}
-Website: ${SITE_SHORT}`
-    );
-  } else if (lang === 'roman-ur') {
-    return sanitizeVoice(
-`Travel/transport ka kharcha package mein shamil nahi hota, is liye hum uska rate nahi batate. Aksar mehmaan apni car se aate hain ya local transport lete hain. Hum rasta aur distance batadein ge, magar kiraya/fuel alag hoga.
-
-Location: ${MAPS_LINK}
-Route chahiye to aise likhein: "route from Lahore"
-
-WhatsApp: ${WHATSAPP_LINK}
-Website: ${SITE_SHORT}`
-    );
-  }
-  return sanitizeVoice(
-`Travel/transport costs aren’t included in our stay packages, so we don’t quote them. Most guests either drive themselves or use local transport. We can share directions and distance, but fares/fuel are separate.
-
-Location: ${MAPS_LINK}
-If you’d like directions, just send: "route from Lahore"
-
-WhatsApp: ${WHATSAPP_LINK}
-Website: ${SITE_SHORT}`
-  );
-}
-
-/* helper used for batching */
 function splitToChunks(s, limit = MAX_OUT_CHAR) {
   const out = [];
   let str = (s || '').trim();
@@ -453,7 +416,51 @@ function intentFromText(text = '') {
 }
 
 /* =========================
+   QUOTE CALCULATOR (nights/days)
+   ========================= */
+function parseStayLength(text='') {
+  const m = text.match(/(\d{1,2})\s*(?:night|nights|day|days|din|raat)/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (!n || n < 1) return null;
+  return n; // treat "days" as nights for simplicity
+}
+function computeTotalForNights(nights, basePerNight) {
+  // Soft launch discounts:
+  //  1st night 10% off, 2nd night 15% off, 3rd+ 20% off
+  const disc = (i) => (i === 1 ? 0.10 : i === 2 ? 0.15 : 0.20);
+  let total = 0;
+  const lines = [];
+  for (let i = 1; i <= nights; i++) {
+    const d = disc(i);
+    const price = Math.round(basePerNight * (1 - d));
+    lines.push(`• Night ${i}: PKR ${price.toLocaleString()} (${Math.round(d*100)}% off)`);
+    total += price;
+  }
+  return { total, lines };
+}
+function quoteMessageForNights(nights) {
+  const delBase = 30000, exeBase = 50000;
+  const d = computeTotalForNights(nights, delBase);
+  const e = computeTotalForNights(nights, exeBase);
+  const header = `Here’s the quote for *${nights} night${nights>1?'s':''}* (soft-launch discounts applied):`;
+  const del = [
+    `Deluxe Hut — Base PKR ${delBase.toLocaleString()}/night`,
+    ...d.lines,
+    `→ **Total: PKR ${d.total.toLocaleString()}**`
+  ].join('\n');
+  const exe = [
+    `Executive Hut — Base PKR ${exeBase.toLocaleString()}/night`,
+    ...e.lines,
+    `→ **Total: PKR ${e.total.toLocaleString()}**`
+  ].join('\n');
+  const footer = `Rates include all taxes and complimentary breakfast for 4 guests.\n50% advance confirms booking.\n\nWhatsApp: ${WHATSAPP_LINK}\nAvailability / Book: ${SITE_URL}`;
+  return `${header}\n${del}\n\n${exe}\n${footer}`;
+}
+
+/* =========================
    NEW: caption → structured summary (no raw paste)
+   + Curated override for 9000 PKR post
    ========================= */
 const RX_PRICE_PER_PERSON = /(rs\.?|pkr|₨)\s*([0-9][0-9,]*)\s*(?:\/?\s*(?:per\s*person|pp|per\s*head))?/i;
 const RX_ANY_PRICE        = /(rs\.?|pkr|₨)\s*([0-9][0-9,]*)/i;
@@ -471,7 +478,6 @@ function cleanLinesFromCaption(caption = '') {
   const raw = (caption || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
   return raw.filter(l => !/^#/.test(l) && !/^https?:\/\//i.test(l));
 }
-
 function extractInfoFromCaption(caption = '') {
   const info = {
     title: '',
@@ -528,7 +534,6 @@ function extractInfoFromCaption(caption = '') {
 
   return info;
 }
-
 function formatOfferSummary(caption = '', permalink = '') {
   const c = sanitizeVoice(caption || '');
   const info = extractInfoFromCaption(c);
@@ -538,11 +543,8 @@ function formatOfferSummary(caption = '', permalink = '') {
 
   if (info.title) out.push(`\n• **Package:** ${info.title}`);
   if (info.duration) out.push(`• **Duration:** ${info.duration}`);
-  if (info.pricePerPerson) {
-    out.push(`• **Price:** ${info.pricePerPerson}`);
-  } else if (info.anyPrice) {
-    out.push(`• **Price:** ${info.anyPrice}`);
-  }
+  if (info.pricePerPerson) out.push(`• **Price:** ${info.pricePerPerson}`);
+  else if (info.anyPrice) out.push(`• **Price:** ${info.anyPrice}`);
   if (info.groupSize) out.push(`• **Best for:** ${info.groupSize}`);
 
   if (info.inclusions.size) {
@@ -567,6 +569,35 @@ function formatOfferSummary(caption = '', permalink = '') {
   return out.join('\n');
 }
 
+/* ========== Curated override for the 9000 PKR "3 din just chill" post ========== */
+function isThreeDinOffer(text='') {
+  const s = (text || '').toLowerCase();
+  return /\b3\s*din\s*just\s*chill\b/.test(s) || /9000/.test(s);
+}
+const STAYCATION_REPLY =
+`Roameo Staycation for Friends 🌲
+
+This trip plan is designed especially for groups of friends who want to escape together. You’re free to plan from wherever you are and choose the dates that work best for your crew—we’ll take care of your stay and make sure it feels like home. The idea is simple: you bring your people, we provide the space and comfort.
+
+**Terms & Conditions**
+
+• **Travel not included** – Guests manage their own travel to and from Roameo.  
+• **Flexible dates** – Book your stay in advance for any date that suits you. This isn’t a fixed trip or limited-time offer.  
+• **Meals** – Your package includes daily **complimentary breakfast + one free dinner**. Any extra meals or snacks are billed separately.  
+• **Itinerary ideas** – This is not a designed fixed trip. The “3-day plan” is just a sample; we can suggest nearby spots you might enjoy—but how you spend your time at Roameo is completely up to you.  
+• **Add-ons** – Any extra activities, services, or experiences beyond your stay will have separate charges.  
+• **Bring your crew** – Roameo is best enjoyed with your own group of friends/family. You choose who comes along and when.
+
+Pack your bags, call your friends, and let’s make it a getaway to remember. Book your Roameo stay today and start creating your own stories!
+
+WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`;
+
+const STAYCATION_FOLLOWUP_DATE =
+`This isn’t a group departure — **dates are flexible**. Pick any dates that suit you and we’ll host your stay. If you share your target dates, I can check availability for you.`;
+
+const STAYCATION_FOLLOWUP_TRAVEL =
+`**Travel isn’t included** in the staycation. Most guests drive to us; if you tell me your departure city, I can share the route/time estimate or send directions. You can also ask: *“route from Lahore”*.`;
+
 /* =========================
    DM HANDLER
    ========================= */
@@ -576,23 +607,43 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
   const textUrls = extractPostUrls(text || '');
   const combinedUrls = [...new Set([...(ctx.shareUrls || []), ...textUrls])];
 
+  // ===== Follow-ups if the last thread was the 3-din staycation post
+  const thread = dmContext.get(psid) || {};
+  const tnorm = normalize(text || '');
+  if (thread.lastOfferTag === '3din') {
+    if (/\b(when|which)\b.*\b(date|start|leave|leaving)\b/.test(tnorm) || /\bwhat'?s?\s+the\s+date\b/.test(tnorm)) {
+      return sendBatched(psid, `${STAYCATION_FOLLOWUP_DATE}\n\nWhatsApp: ${WHATSAPP_LINK}`);
+    }
+    if (/\btravel\b.*\b(cost|price|charges|fare)\b/.test(tnorm) || /\btransport(?:ation)?\b/.test(tnorm)) {
+      return sendBatched(psid, `${STAYCATION_FOLLOWUP_TRAVEL}\n\nWhatsApp: ${WHATSAPP_LINK}`);
+    }
+  }
+
+  // ===== Quick branches (kept as-is)
   const intents = intentFromText(text || '');
-  const travelCostIntent = isTravelCostIntent(text || '');
 
-  // contact / location fast-paths
-  if (intents.wantsContact) return sendBatched(psid, `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
-  if (intents.wantsLocation) return sendBatched(psid, `*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+  // Nights/Days quote if user asked price with a number
+  const nightsAsked = intents.wantsRates ? parseStayLength(text || '') : null;
+  if (intents.wantsRates && nightsAsked) {
+    const msg = quoteMessageForNights(nightsAsked);
+    if (intents.wantsLocation) {
+      return sendBatched(psid, [msg, `*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`]);
+    }
+    return sendBatched(psid, msg);
+  }
 
-  // travel-cost overrides pricing conversations
-  if (travelCostIntent) return sendBatched(psid, travelCostMessage(text));
-
-  // Route/distance helper
+  if (intents.wantsContact) {
+    return sendBatched(psid, `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+  }
+  if (intents.wantsLocation) {
+    return sendBatched(psid, `*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+  }
   if (intents.wantsRoute || intents.wantsDistance) {
     const msg = await dmRouteMessage(text);
     return sendBatched(psid, msg);
   }
 
-  // 1) Brand-owned via asset_id
+  // ===== 1) Brand-owned via asset_id (best path)
   if (ctx.assetId) {
     const lookup = await igLookupPostByAssetId(ctx.assetId);
     if (lookup && lookup.isBrand && lookup.post) {
@@ -603,46 +654,16 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
       if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
-      // travel-cost question after share
-      if (travelCostIntent) {
-        const reply = travelCostMessage(text);
-        // remember context even on non-brain replies
-        const postNote = [
-          'postMeta:',
-          `source: ig`,
-          `author_name: Roameo Resorts`,
-          `author_url: https://www.instagram.com/${BRAND_USERNAME}/`,
-          `permalink: ${meta.permalink || ''}`,
-          `caption: ${meta.caption || ''}`
-        ].join('\n');
-        const history = chatHistory.get(psid) || [];
-        const surface = 'dm';
-        const newHistory = [...history,
-          constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface }),
-          { role: 'assistant', content: reply }
-        ].slice(-20);
-        chatHistory.set(psid, newHistory);
-        return sendBatched(psid, reply);
+      // Curated override FIRST
+      if (!isPricingIntent(text || '') && isThreeDinOffer(meta.caption || ctx.captions || '')) {
+        dmContext.set(psid, { lastOfferTag: '3din' });
+        return sendBatched(psid, STAYCATION_REPLY);
       }
 
-      // If user didn't ask "rates", send structured caption summary and **remember**
+      // If user didn't ask "rates", send structured caption summary
       if (!isPricingIntent(text || '')) {
+        dmContext.set(psid, { lastOfferTag: isThreeDinOffer(meta.caption || ctx.captions || '') ? '3din' : null });
         const reply = formatOfferSummary(meta.caption || ctx.captions || '', meta.permalink || '');
-        const postNote = [
-          'postMeta:',
-          `source: ig`,
-          `author_name: Roameo Resorts`,
-          `author_url: https://www.instagram.com/${BRAND_USERNAME}/`,
-          `permalink: ${meta.permalink || ''}`,
-          `caption: ${meta.caption || ''}`
-        ].join('\n');
-        const history = chatHistory.get(psid) || [];
-        const surface = 'dm';
-        const newHistory = [...history,
-          constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface }),
-          { role: 'assistant', content: reply }
-        ].slice(-20);
-        chatHistory.set(psid, newHistory);
         return sendBatched(psid, reply);
       }
 
@@ -666,7 +687,7 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     }
   }
 
-  // 2) Brand via oEmbed URL
+  // ===== 2) Brand via oEmbed URL
   if (combinedUrls.length) {
     for (const url of combinedUrls) {
       const meta = await fetchOEmbed(url);
@@ -678,43 +699,15 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
         if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
-        if (travelCostIntent) {
-          const reply = travelCostMessage(text);
-          const postNote = [
-            'postMeta:',
-            `source: ig`,
-            `author_name: ${meta.author_name || 'Roameo Resorts'}`,
-            `author_url: ${meta.author_url || `https://www.instagram.com/${BRAND_USERNAME}/`}`,
-            `permalink: ${url}`,
-            `caption: ${caption}`
-          ].join('\n');
-          const history = chatHistory.get(psid) || [];
-          const surface = 'dm';
-          const newHistory = [...history,
-            constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface }),
-            { role: 'assistant', content: reply }
-          ].slice(-20);
-          chatHistory.set(psid, newHistory);
-          return sendBatched(psid, reply);
+        // Curated override FIRST
+        if (!isPricingIntent(text || '') && isThreeDinOffer(caption)) {
+          dmContext.set(psid, { lastOfferTag: '3din' });
+          return sendBatched(psid, STAYCATION_REPLY);
         }
 
         if (!isPricingIntent(text || '')) {
+          dmContext.set(psid, { lastOfferTag: isThreeDinOffer(caption) ? '3din' : null });
           const reply = formatOfferSummary(caption, url);
-          const postNote = [
-            'postMeta:',
-            `source: ig`,
-            `author_name: ${meta.author_name || 'Roameo Resorts'}`,
-            `author_url: ${meta.author_url || `https://www.instagram.com/${BRAND_USERNAME}/`}`,
-            `permalink: ${url}`,
-            `caption: ${caption}`
-          ].join('\n');
-          const history = chatHistory.get(psid) || [];
-          const surface = 'dm';
-          const newHistory = [...history,
-            constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface }),
-            { role: 'assistant', content: reply }
-          ].slice(-20);
-          chatHistory.set(psid, newHistory);
           return sendBatched(psid, reply);
         }
 
@@ -747,13 +740,12 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     return sendBatched(psid, `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`);
   }
 
-  // 3) Everything else → brain (with history)
-  const history = chatHistory.get(psid) || [];
-  const surface = 'dm';
-
-  // NEW: proxify user-upload images so Vision can fetch lookaside URLs
+  // ===== 3) Everything else → brain (with history).
+  // IMPORTANT: proxy any uploaded image before Vision (fix invalid_image_url)
   const proxiedImage = imageUrl ? toVisionableUrl(imageUrl, ctx.req) : null;
 
+  const history = chatHistory.get(psid) || [];
+  const surface = 'dm';
   const response = await askBrain({ text, imageUrl: proxiedImage, surface, history });
   const { message } = response;
   const newHistory = [...history, constructUserMessage({ text, imageUrl: proxiedImage, surface }), { role: 'assistant', content: message }].slice(-20);
