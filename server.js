@@ -1,5 +1,8 @@
-// server.js — Roameo Resorts omni-channel bot (v11 → caption-to-summary for IG shares)
-// + QUOTE: per-night total calculator when user specifies #days/#nights (no other logic changed)
+// server.js — Roameo Resorts omni-channel bot
+// v11 → caption-to-summary for IG shares
+// + custom message for "3 din just chill" post
+// + persistent chat history (optional Redis)
+// (no other logic changed)
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -52,11 +55,12 @@ const CHECKOUT_TIME = process.env.CHECKOUT_TIME || '12:00 pm';
 
 const MAX_OUT_CHAR = 800;
 
-// QUOTE: pricing knobs (readable defaults; keep same card math)
+/* =========================
+   QUOTE: pricing knobs
+   ========================= */
 const DELUXE_BASE    = Number(process.env.DELUXE_BASE || 30000);
 const EXEC_BASE      = Number(process.env.EXEC_BASE   || 50000);
-// 1st/2nd/3rd+ night discounts:
-const NIGHT_DISCOUNTS = [0.10, 0.15, 0.20];
+const NIGHT_DISCOUNTS = [0.10, 0.15, 0.20]; // 1st, 2nd, 3rd+ night
 
 if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
   console.warn('⚠️ Missing required env vars: APP_SECRET, VERIFY_TOKEN, PAGE_ACCESS_TOKEN');
@@ -84,7 +88,56 @@ const FACTS = {
 app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 const dedupe      = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });
 const tinyCache   = new LRUCache({ max: 300,  ttl: 1000 * 60 * 15 });
-const chatHistory = new LRUCache({ max: 2000, ttl: 1000 * 60 * 60 * 24 * 30 });
+
+// In-memory history (fallback)
+const lruHistory  = new LRUCache({ max: 2000, ttl: 1000 * 60 * 60 * 24 * 30 }); // 30d
+
+/* =========================
+   OPTIONAL REDIS (persistent history)
+   ========================= */
+let redis = null;
+try {
+  const REDIS_URL = process.env.REDIS_URL || process.env.UPSTASH_REDIS_URL || '';
+  if (REDIS_URL) {
+    const Redis = require('ioredis');
+    redis = new Redis(REDIS_URL, { maxRetriesPerRequest: 2 });
+    redis.on('error', e => console.warn('Redis error (non-fatal):', e.message));
+    console.log('✅ Redis history enabled');
+  }
+} catch (e) {
+  console.warn('Redis not available, using in-memory history only.');
+}
+
+const HISTORY_TTL_SEC = 60 * 60 * 24 * 90; // 90 days
+
+async function getHistory(psid) {
+  const key = `chatHistory:${psid}`;
+  const local = lruHistory.get(psid);
+  if (local) return local;
+  if (!redis) return [];
+  try {
+    const raw = await redis.get(key);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    lruHistory.set(psid, arr);
+    return arr;
+  } catch { return []; }
+}
+async function saveHistory(psid, arr) {
+  lruHistory.set(psid, arr);
+  if (redis) {
+    try { await redis.set(`chatHistory:${psid}`, JSON.stringify(arr), 'EX', HISTORY_TTL_SEC); } catch {}
+  }
+}
+async function pushHistory(psid, userText, assistantText, imageUrl=null, surface='dm') {
+  const history = await getHistory(psid);
+  const newHistory = [
+    ...history,
+    constructUserMessage({ text: userText, imageUrl, surface }),
+    { role: 'assistant', content: assistantText }
+  ].slice(-20);
+  await saveHistory(psid, newHistory);
+}
 
 /* =========================
    BASIC ROUTES
@@ -532,15 +585,12 @@ function parseNightsFromText(text='') {
   if (!text) return null;
   const t = text.toLowerCase();
 
-  // direct forms
   let m = t.match(/(\d{1,2})\s*(?:night|nights|n)\b/);
   if (m) return Math.max(1, parseInt(m[1], 10));
 
-  // days treated as nights (common in chat)
   m = t.match(/(\d{1,2})\s*(?:day|days|d)\b/);
   if (m) return Math.max(1, parseInt(m[1], 10));
 
-  // roman urdu / urdu
   m = t.match(/(\d{1,2})\s*(?:din|raat|رات|دن)\b/);
   if (m) return Math.max(1, parseInt(m[1], 10));
 
@@ -569,7 +619,7 @@ function sumForNights(base, n) {
     }
   }
   if (n > 3) {
-    const rateAfter3 = nightlyRate(base, 4); // same as 3rd+ (20% off)
+    const rateAfter3 = nightlyRate(base, 4);
     const extraNights = n - 3;
     lines.push(`Nights 4–${n} (20% off): ${extraNights} × PKR ${rateAfter3.toLocaleString()} = PKR ${(rateAfter3*extraNights).toLocaleString()}`);
   }
@@ -597,11 +647,50 @@ function formatQuoteMessage(nights, hutPref=null) {
 }
 
 /* =========================
-   NEW: generic image analyzer (from previous step kept)
+   CUSTOM MESSAGE for specific post
+   ========================= */
+const STAYCATION_MSG =
+`Roameo Staycation for Friends 🌲
+
+This trip plan is designed especially for groups of friends who want to escape together. You’re free to plan from wherever you are and choose the dates that work best for your crew—we’ll take care of your stay and make sure it feels like home. The idea is simple: you bring your people, we provide the space and comfort.
+
+Terms & Conditions
+
+Travel not included – Guests manage their own travel to and from Roameo.
+
+Flexible dates – Book your stay in advance for any date that suits you. This isn’t a fixed trip or limited-time offer.
+
+Meals – Your package includes daily complimentary breakfast + one free dinner. Any extra meals or snacks are billed separately.
+
+Itinerary ideas – This is not a designed fixed trip. This was just a sample 3-day plan and we can suggest nearby spots you might enjoy—but how you spend your time at Roameo is completely up to you.
+
+Add-ons – Any extra activities, services, or experiences beyond your stay will have separate charges.
+
+Bring your crew – Roameo is best enjoyed with your own group of friends/family. You choose who comes along and when.
+
+Pack your bags, call your friends, and let’s make it a getaway to remember. Book your Roameo stay today and start creating your own stories!`;
+
+function codeFromPermalink(url='') {
+  try {
+    const u = new URL(url);
+    const parts = u.pathname.split('/').filter(Boolean);
+    const idx = parts.findIndex(p => p === 'p' || p === 'reel');
+    if (idx >= 0 && parts[idx+1]) return parts[idx+1];
+  } catch {}
+  return '';
+}
+function isStaycationPost(permalink='', caption='') {
+  const code = codeFromPermalink(permalink);
+  if (code && code.toUpperCase() === 'DOQL0O0IMXB'.toUpperCase()) return true;
+  return /3\s*din\s*just\s*chill/i.test(caption || '');
+}
+
+/* =========================
+   Generic image analyzer
    ========================= */
 async function analyzeGenericImageAndReply(psid, userText, rawImageUrl, ctx, alsoSendRates = false) {
   const visionUrl = toVisionableUrl(rawImageUrl, ctx.req);
-  const history = chatHistory.get(psid) || [];
+  const history = await getHistory(psid);
   const surface = 'dm';
 
   const guardrail =
@@ -624,7 +713,7 @@ async function analyzeGenericImageAndReply(psid, userText, rawImageUrl, ctx, als
     constructUserMessage({ text: `${guardrail}\n\nUser text: ${userText || '(no text)'}`, imageUrl: visionUrl, surface }),
     { role: 'assistant', content: message }
   ].slice(-20);
-  chatHistory.set(psid, newHistory);
+  await saveHistory(psid, newHistory);
 
   if (alsoSendRates) {
     const rateResp = await askBrain({ text: 'Please share the current rates for guests.', surface: 'dm', history: newHistory });
@@ -655,32 +744,39 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
   if (intents.wantsContact) {
     quickChunks.push(`WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
   }
-  const askedRates = intents.wantsRates === true;
+  const askedRates  = intents.wantsRates === true;
   const nightsAsked = askedRates ? parseNightsFromText(text || '') : null;
   const hutPref     = askedRates ? parseHutPref(text || '') : null;
 
   if (quickChunks.length) await sendBatched(psid, quickChunks);
 
-  // 1) Brand-owned IG media via asset_id
+  // 1) Brand-owned via asset_id
   if (ctx.assetId) {
     const lookup = await igLookupPostByAssetId(ctx.assetId);
-
     if (lookup && lookup.isBrand && lookup.post) {
       const meta = lookup.post;
+      const caption = meta.caption || ctx.captions || '';
       const thumbRemote = meta.thumbnail_url || ctx.shareThumb || null;
       const thumb = thumbRemote ? toVisionableUrl(thumbRemote, ctx.req) : imageUrl;
       const imgForVision = SEND_IMAGE_FOR_IG_SHARES ? thumb : null;
 
       if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
+      // CUSTOM: Staycation message for the "3 din just chill" post (unless user explicitly asked for rates)
+      if (!isPricingIntent(text || '') && isStaycationPost(meta.permalink || '', caption)) {
+        await pushHistory(psid, `${text || ''}\n\npostContext:staycation_friends_v1\npermalink:${meta.permalink || ''}\ncaption:${caption}`, STAYCATION_MSG, imgForVision);
+        return sendBatched(psid, STAYCATION_MSG);
+      }
+
       if (!isPricingIntent(text || '')) {
-        const reply = formatOfferSummary(meta.caption || ctx.captions || '', meta.permalink || '');
+        const reply = formatOfferSummary(caption, meta.permalink || '');
+        await pushHistory(psid, `${text || ''}\n\npostMeta:${meta.permalink || ''}`, reply, imgForVision);
         return sendBatched(psid, reply);
       }
 
-      // QUOTE: user asked for rates with #nights → compute totals instead of generic card
       if (nightsAsked) {
         const msg = formatQuoteMessage(nightsAsked, hutPref);
+        await pushHistory(psid, text || 'rates', msg, null);
         return sendBatched(psid, msg);
       }
 
@@ -690,19 +786,18 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
         `author_name: Roameo Resorts`,
         `author_url: https://www.instagram.com/${BRAND_USERNAME}/`,
         `permalink: ${meta.permalink || ''}`,
-        `caption: ${meta.caption || ''}`
+        `caption: ${caption}`
       ].join('\n');
 
-      const history = chatHistory.get(psid) || [];
+      const history = await getHistory(psid);
       const surface = 'dm';
       const response = await askBrain({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface, history });
       const { message } = response;
       const newHistory = [...history, constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface }), { role: 'assistant', content: message }].slice(-20);
-      chatHistory.set(psid, newHistory);
+      await saveHistory(psid, newHistory);
       return sendBatched(psid, message);
     }
 
-    // If not our brand media but an image upload, previous image handler remains:
     if (imageUrl || ctx.shareThumb) {
       await analyzeGenericImageAndReply(psid, text, imageUrl || ctx.shareThumb, ctx, askedRates && !nightsAsked);
       return;
@@ -721,14 +816,21 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
         if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
+        // CUSTOM: Staycation message
+        if (!isPricingIntent(text || '') && isStaycationPost(url, caption)) {
+          await pushHistory(psid, `${text || ''}\n\npostContext:staycation_friends_v1\npermalink:${url}\ncaption:${caption}`, STAYCATION_MSG, imgForVision);
+          return sendBatched(psid, STAYCATION_MSG);
+        }
+
         if (!isPricingIntent(text || '')) {
           const reply = formatOfferSummary(caption, url);
+          await pushHistory(psid, `${text || ''}\n\npostMeta:${url}`, reply, imgForVision);
           return sendBatched(psid, reply);
         }
 
-        // QUOTE: compute totals if nights asked
         if (nightsAsked) {
           const msg = formatQuoteMessage(nightsAsked, hutPref);
+          await pushHistory(psid, text || 'rates', msg, null);
           return sendBatched(psid, msg);
         }
 
@@ -741,12 +843,12 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
           `caption: ${caption}`
         ].join('\n');
 
-        const history = chatHistory.get(psid) || [];
+        const history = await getHistory(psid);
         const surface = 'dm';
         const response = await askBrain({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface, history });
         const { message } = response;
         const newHistory = [...history, constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface }), { role: 'assistant', content: message }].slice(-20);
-        chatHistory.set(psid, newHistory);
+        await saveHistory(psid, newHistory);
         return sendBatched(psid, message);
       }
     }
@@ -761,25 +863,26 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     return sendBatched(psid, `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`);
   }
 
-  // 3) Generic upload path (unchanged from your previous step)
+  // 3) Generic upload path
   if (imageUrl && !ctx.isShare && !ctx.assetId && !combinedUrls.length) {
     await analyzeGenericImageAndReply(psid, text, imageUrl, ctx, askedRates && !nightsAsked);
     return;
   }
 
-  // 4) QUOTE: direct “rates” question with #nights in plain text
+  // 4) Direct “rates” with nights
   if (askedRates && nightsAsked) {
     const msg = formatQuoteMessage(nightsAsked, hutPref);
+    await pushHistory(psid, text || 'rates', msg, null);
     return sendBatched(psid, msg);
   }
 
-  // 5) Everything else → brain (with history)
-  const history = chatHistory.get(psid) || [];
+  // 5) Everything else → brain
+  const history = await getHistory(psid);
   const surface = 'dm';
   const response = await askBrain({ text, imageUrl, surface, history });
   const { message } = response;
   const newHistory = [...history, constructUserMessage({ text, imageUrl, surface }), { role: 'assistant', content: message }].slice(-20);
-  chatHistory.set(psid, newHistory);
+  await saveHistory(psid, newHistory);
   return sendBatched(psid, message);
 }
 
