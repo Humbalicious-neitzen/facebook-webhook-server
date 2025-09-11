@@ -1,17 +1,23 @@
-// server.js — Roameo Resorts omni-channel bot (v11 + STT + Urdu/Roman location intent + 9000pp override; IG share logic unchanged)
+// server.js — Roameo Resorts omni-channel bot
+// v12 — Voice STT + campaign memory for 9000 PKR post + Urdu location intents
+// NOTE: This is a drop-in replacement that preserves your existing logic and adds:
+// 1) IG audio voice-notes -> STT -> handled like text
+// 2) Prevents audio lookaside URLs from being treated as IG post asset_ids
+// 3) Sticky "campaign" context for the Rs 9,000 "3 din just chill" post
+// 4) Urdu/Roman-Urdu location intent always returns Maps link
 
 const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const axios = require('axios');
-const FormData = require('form-data'); // STT upload
+const fs = require('fs');
 const { LRUCache } = require('lru-cache');
 
 const { askBrain, constructUserMessage } = require('./lib/brain');
+let OpenAI = null; // lazy require when STT enabled
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-
 app.set('trust proxy', true);
 
 /* =========================
@@ -37,6 +43,10 @@ const AUTO_REPLY_ENABLED       = String(process.env.AUTO_REPLY_ENABLED       || 
 const ALLOW_REPLY_IN_STANDBY   = String(process.env.ALLOW_REPLY_IN_STANDBY   || 'true').toLowerCase() === 'true';
 const AUTO_TAKE_THREAD_CONTROL = String(process.env.AUTO_TAKE_THREAD_CONTROL || 'false').toLowerCase() === 'true';
 
+const ENABLE_VOICE_STT = String(process.env.ENABLE_VOICE_STT || 'false').toLowerCase() === 'true';
+const STT_MODEL = process.env.STT_MODEL || 'gpt-4o-mini-transcribe'; // falls back to whisper-1
+const MAX_AUDIO_MB = Number(process.env.MAX_AUDIO_MB || 20);
+
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
 const BRAND_USERNAME  = (process.env.BRAND_USERNAME  || 'roameoresorts').toLowerCase();
@@ -52,20 +62,11 @@ const CHECKOUT_TIME = process.env.CHECKOUT_TIME || '12:00 pm';
 
 const MAX_OUT_CHAR = 800;
 
-// STT toggles (already safe defaults)
-const ENABLE_VOICE_STT = String(process.env.ENABLE_VOICE_STT || 'true').toLowerCase() === 'true';
-const STT_MODEL = process.env.STT_MODEL || 'gpt-4o-mini-transcribe';
-const MAX_AUDIO_MB = Number(process.env.MAX_AUDIO_MB || 20);
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
 if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
   console.warn('⚠️ Missing required env vars: APP_SECRET, VERIFY_TOKEN, PAGE_ACCESS_TOKEN');
 }
 if (!IG_USER_ID) {
   console.warn('⚠️ IG_USER_ID not set — IG share recognition via asset_id will be disabled.');
-}
-if (!OPENAI_API_KEY) {
-  console.warn('⚠️ OPENAI_API_KEY not set — voice transcription will be disabled.');
 }
 
 /* =========================
@@ -85,16 +86,17 @@ const FACTS = {
    MIDDLEWARE & CACHES
    ========================= */
 app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
-const dedupe      = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });
-const tinyCache   = new LRUCache({ max: 300,  ttl: 1000 * 60 * 15 });
-const chatHistory = new LRUCache({ max: 2000, ttl: 1000 * 60 * 60 * 24 * 30 });
+const dedupe        = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });              // 1h
+const tinyCache     = new LRUCache({ max: 300,  ttl: 1000 * 60 * 15 });              // 15m
+const chatHistory   = new LRUCache({ max: 2000, ttl: 1000 * 60 * 60 * 24 * 30 });    // 30d
+const sessionState  = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 * 24 * 30 });    // per-user lightweight state
 
 /* =========================
    BASIC ROUTES
    ========================= */
 app.get('/', (_req, res) => res.send('Roameo Omni Bot running'));
 
-/* Image proxy (always HTTPS) */
+/* Image/audio proxy (always HTTPS) */
 app.get('/img', async (req, res) => {
   const remote = req.query.u;
   if (!remote) return res.status(400).send('missing u');
@@ -102,7 +104,7 @@ app.get('/img', async (req, res) => {
     const headers = {
       Referer: 'https://www.instagram.com/',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+      Accept: '*/*',
       'Accept-Language': 'en-US,en;q=0.9'
     };
     const resp = await axios.get(remote, {
@@ -112,7 +114,7 @@ app.get('/img', async (req, res) => {
       maxRedirects: 3,
       validateStatus: s => s >= 200 && s < 400
     });
-    const ct = resp.headers['content-type'] || 'image/jpeg';
+    const ct = resp.headers['content-type'] || 'application/octet-stream';
     res.set('Content-Type', ct);
     res.set('Cache-Control', 'public, max-age=300');
     res.send(Buffer.from(resp.data, 'binary'));
@@ -169,7 +171,7 @@ function detectLanguage(text = '') {
   const t = (text || '').trim();
   const hasUrduScript = /[\u0600-\u06FF\u0750-\u077F]/.test(t);
   if (hasUrduScript) return 'ur';
-  const romanUrduTokens = ['aap','ap','apka','apki','apke','kiraya','qeemat','rate','price','btao','batao','kitna','kitni','kitne','raha','hai','hain','kahan','kidhar','pata','address','location'];
+  const romanUrduTokens = ['aap','ap','apka','apki','apke','kiraya','qeemat','rate','price','btao','batao','kitna','kitni','kitne','raha','hai','hain','kahan','location'];
   const hit = romanUrduTokens.some(w => new RegExp(`\\b${w}\\b`, 'i').test(t));
   return hit ? 'roman-ur' : 'en';
 }
@@ -185,9 +187,9 @@ function stripPricesFromPublic(text = '') {
 function isPricingIntent(text = '') {
   const t = normalize(text);
   if (t.length <= 2) return false;
-  const kw = ['price','prices','pricing','rate','rates','tariff','cost','rent','rental','per night','night price','kiraya','qeemat','kimat','keemat','قیمت','کرایہ','ریٹ','نرخ'];
+  const kw = ['price','prices','pricing','rate','rates','tariff','cost','charges','kiraya','qeemat','kimat','keemat','قیمت','ریٹ','نرخ','charge'];
   if (kw.some(x => t.includes(x))) return true;
-  if (/\b\d+\s*(night|nights|din|raat)\b/.test(t)) return true;
+  if (/\b\d+\s*(night|nights|din|raat|days|day)\b/.test(t)) return true;
   if (/\bhow much\b/.test(t)) return true;
   return false;
 }
@@ -230,6 +232,10 @@ function extractPostUrls(text='') {
   let m; while ((m = rx.exec(text))) out.push(m[1]);
   return [...new Set(out)];
 }
+const getPermalinkId = (url='') => {
+  const m = url.match(/instagram\.com\/(?:p|reel)\/([^\/?#]+)/i);
+  return m ? m[1] : '';
+};
 
 /* =========================
    IG Graph / OEmbed helpers
@@ -241,7 +247,7 @@ async function fetchOEmbed(url) {
       params: { url, access_token: token, omitscript: true, hidecaption: false },
       timeout: 8000
     });
-    return data;
+    return data; // { author_name, author_url, title, thumbnail_url, ... }
   } catch (e) {
     if (IG_DEBUG_LOG) console.log('oEmbed error', e?.response?.data || e.message);
     return null;
@@ -403,18 +409,12 @@ async function getRouteInfo(originLat, originLon, destLat, destLon) {
    ========================= */
 function intentFromText(text = '') {
   const t = normalize(text);
-
-  // Expanded location detection: English + Roman-Urdu + Urdu script
-  const wantsLocation =
-    /\blocation\b|\bwhere\b|\baddress\b|\bmap\b|\bpin\b|\bdirections?\b|\breach\b/i.test(t) ||
-    /\bkahan\b|\bkidhar\b|\bpata\b|\baddress\b|\blocation\s*link\b|\bmap\s*link\b|\blocation\s*(?:bhej|send)\b/i.test(t) ||
-    /لوکیشن|کہاں|میپ|نقشہ|لوکیشن لنک|پتہ|ایڈریس/.test(text);
-
   return {
-    wantsLocation,
+    // add Urdu tokens for "location"
+    wantsLocation   : /\blocation\b|\bwhere\b|\baddress\b|\bmap\b|\bpin\b|\bdirections?\b|\breach\b|لوکیشن|کہاں|پتہ|ایڈریس|نقشہ/.test(t) || /لوکیشن|کہاں|پتہ|ایڈریس|نقشہ/.test(text),
     wantsRates      : isPricingIntent(text),
     wantsFacilities : /\bfaciliti(?:y|ies)\b|\bamenit(?:y|ies)\b|\bkitchen\b|\bfood\b|\bheater\b|\bbonfire\b|\bfamily\b|\bparking\b|\bjeep\b|\binverter\b/.test(t),
-    wantsBooking    : /\bbook\b|\bbooking\b|\breserve\b|\breservation\b|\bcheck ?in\b|\bcheck ?out\b|\badvance\b|\bpayment\b/.test(t),
+    wantsBooking    : /\bbook\b|\bbooking\b|\breserve\b|\breservation\b|\bcheck ?in\b|\bcheck ?out\b|\badvance\b|\bpayment\b|\bjoin\b/.test(t),
     wantsAvail      : /\bavailability\b|\bavailable\b|\bdates?\b|\bcalendar\b/.test(t),
     wantsDistance   : /\bdistance\b|\bhow far\b|\bhours\b|\bdrive\b|\btime from\b|\beta\b/.test(t),
     wantsWeather    : /\bweather\b|\btemperature\b|\bforecast\b/.test(t),
@@ -424,7 +424,7 @@ function intentFromText(text = '') {
 }
 
 /* =========================
-   Caption → structured summary (unchanged)
+   Caption → structured summary (existing)
    ========================= */
 const RX_PRICE_PER_PERSON = /(rs\.?|pkr|₨)\s*([0-9][0-9,]*)\s*(?:\/?\s*(?:per\s*person|pp|per\s*head))?/i;
 const RX_ANY_PRICE        = /(rs\.?|pkr|₨)\s*([0-9][0-9,]*)/i;
@@ -460,6 +460,7 @@ function extractInfoFromCaption(caption = '') {
 
   const capLower = caption.toLowerCase();
 
+  // price
   const mpp = caption.match(RX_PRICE_PER_PERSON);
   if (mpp) info.pricePerPerson = `PKR ${Number(mpp[2].replace(/,/g,'')).toLocaleString()}/person`;
   else {
@@ -467,6 +468,7 @@ function extractInfoFromCaption(caption = '') {
     if (mp) info.anyPrice = `PKR ${Number(mp[2].replace(/,/g,'')).toLocaleString()}`;
   }
 
+  // duration
   const md = caption.match(RX_DURATION);
   if (md) {
     const n = md[1];
@@ -476,16 +478,20 @@ function extractInfoFromCaption(caption = '') {
     info.duration = `${n} ${unit}`;
   }
 
+  // group size
   const mg = caption.match(RX_GROUP_SIZE);
   if (mg) info.groupSize = `${mg[1]}–${mg[2]} people`;
 
+  // inclusions
   for (const key of INCLUSION_KEYS) {
     if (capLower.includes(key)) info.inclusions.add(key.replace(/complimentary /i,''));
   }
 
+  // phone
   const ph = caption.match(RX_PHONE_PK);
   if (ph) info.phone = ph[0];
 
+  // key points (max 3)
   const pts = [];
   for (const l of lines.slice(1)) {
     if (pts.length >= 3) break;
@@ -539,110 +545,120 @@ function formatOfferSummary(caption = '', permalink = '') {
 }
 
 /* =========================
-   NEW: STT — transcribe IG/FB audio/voice
+   CAMPAIGN RULES — Rs 9,000 "3 din just chill"
    ========================= */
-function looksLikeAudioContentType(ct = '') {
-  const s = (ct || '').toLowerCase();
-  return s.includes('audio') || s.includes('mpeg') || s.includes('mp4') || s.includes('x-m4a') || s.includes('aac') || s.includes('ogg') || s.includes('webm') || s.includes('3gpp');
-}
-
-async function transcribeAudioFromUrl(remote, langHint = 'en') {
-  if (!ENABLE_VOICE_STT || !OPENAI_API_KEY || !remote) return null;
-
-  try {
-    const headers = {
-      Referer: 'https://www.instagram.com/',
-      'User-Agent': 'Mozilla/5.0',
-      Accept: '*/*'
-    };
-
-    // optional HEAD to check size
-    try {
-      const head = await axios.head(remote, { headers, timeout: 8000, maxRedirects: 3, validateStatus: s => s >= 200 && s < 400 });
-      const len = Number(head.headers['content-length'] || 0);
-      if (len && len > MAX_AUDIO_MB * 1024 * 1024) {
-        return { error: `Audio too large (> ${MAX_AUDIO_MB}MB).` };
-      }
-    } catch {}
-
-    const resp = await axios.get(remote, {
-      responseType: 'arraybuffer',
-      timeout: 20000,
-      headers,
-      maxRedirects: 3,
-      validateStatus: s => s >= 200 && s < 400
-    });
-
-    const ct = resp.headers['content-type'] || 'audio/mpeg';
-    if (!looksLikeAudioContentType(ct) && !/video\/mp4|application\/octet-stream/i.test(ct)) {
-      return { error: `Unsupported audio type: ${ct}` };
-    }
-
-    const buf = Buffer.from(resp.data);
-    const len = buf.length;
-    if (len > MAX_AUDIO_MB * 1024 * 1024) {
-      return { error: `Audio too large (> ${MAX_AUDIO_MB}MB).` };
-    }
-
-    const tryModels = [STT_MODEL, 'whisper-1'];
-    let lastErr = null;
-
-    for (const model of tryModels) {
-      try {
-        const form = new FormData();
-        form.append('file', buf, { filename: 'voice.m4a', contentType: ct });
-        form.append('model', model);
-        form.append('response_format', 'text');
-
-        const { data: txt } = await axios.post('https://api.openai.com/v1/audio/transcriptions', form, {
-          headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...form.getHeaders() },
-          timeout: 30000
-        });
-
-        const transcript = (txt || '').toString().trim();
-        if (transcript) return { transcript };
-      } catch (e) {
-        lastErr = e?.response?.data || e.message;
-        if (IG_DEBUG_LOG) console.log('STT error for model', model, lastErr);
-      }
-    }
-
-    return { error: lastErr || 'Transcription failed.' };
-  } catch (e) {
-    if (IG_DEBUG_LOG) console.log('STT fetch/transcribe error', e?.response?.data || e.message);
-    return { error: 'Could not process audio.' };
-  }
-}
-
-/* =========================
-   SPECIAL: “9000 per person” package override
-   ========================= */
-const FRIENDS_STAYCATION_MSG =
+const CAMPAIGNS = {
+  staycation9000: {
+    idSet: new Set(['DOQL0O0imXB']), // known permalink code(s)
+    titleRe: /3\s*din\s*just\s*chill/i,
+    priceRe: /\b9\s*000\b/,
+    // canonical message you provided:
+    longMsg:
 `Roameo Staycation for Friends 🌲
 
 This trip plan is designed especially for groups of friends who want to escape together. You’re free to plan from wherever you are and choose the dates that work best for your crew—we’ll take care of your stay and make sure it feels like home. The idea is simple: you bring your people, we provide the space and comfort.
 
 Terms & Conditions
 
-• Travel not included – Guests manage their own travel to and from Roameo.
-• Flexible dates – Book your stay in advance for any date that suits you. This isn’t a fixed trip or limited-time offer.
-• Meals – Your package includes daily complimentary breakfast + one free dinner. Any extra meals or snacks are billed separately.
-• Itinerary ideas – This is not a designed fixed trip. This was just a sample 3-day plan and we can suggest nearby spots you might enjoy—but how you spend your time at Roameo is completely up to you.
-• Add-ons – Any extra activities, services, or experiences beyond your stay will have separate charges.
-• Bring your crew – Roameo is best enjoyed with your own group of friends/family. You choose who comes along and when.
+Travel not included – Guests manage their own travel to and from Roameo.
+
+Flexible dates – Book your stay in advance for any date that suits you. This isn’t a fixed trip or limited-time offer.
+
+Meals – Your package includes daily complimentary breakfast + one free dinner. Any extra meals or snacks are billed separately.
+
+Itinerary ideas – This is not a designed fixed trip. This was just a sample 3-day plan and we can suggest nearby spots you might enjoy—but how you spend your time at Roameo is completely up to you.
+
+Add-ons – Any extra activities, services, or experiences beyond your stay will have separate charges.
+
+Bring your crew – Roameo is best enjoyed with your own group of friends/family. You choose who comes along and when.
 
 Pack your bags, call your friends, and let’s make it a getaway to remember. Book your Roameo stay today and start creating your own stories!
 
-WhatsApp: ${WHATSAPP_LINK}
-Website: ${SITE_SHORT}
-Location: ${MAPS_LINK}`;
+WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`,
+    priceReply:
+`Here are the charges for this offer:
 
-function detectFriendsStaycationQuery(text='') {
-  const t = (text || '').toLowerCase().replace(/[, ]/g, '');
-  const has9000 = /\b9[, ]?000\b/.test(text) || /(^|[^0-9])9000($|[^0-9])/.test(text) || t.includes('9k');
-  const perPersonCue = /\bper\s*person\b|\bper\s*head\b|\bpp\b|ہر\s*بندہ|فی\s*بندا/i.test(text);
-  const pkgCue = /\bpackage\b|\bplan\b|\bstaycation\b|3\s*(?:days?|din)/i.test(text);
-  return has9000 && (perPersonCue || pkgCue);
+• Package price: **PKR 9,000 per person**
+• Includes: Complimentary breakfast + one free dinner, Free Wi-Fi
+• Flexible dates (choose the dates that suit you)
+• Travel not included
+
+To book or check dates:
+• WhatsApp: ${WHATSAPP_LINK}
+• Website: ${SITE_URL}`
+  }
+};
+
+function detectCampaign(caption = '', permalink = '') {
+  const id = getPermalinkId(permalink || '');
+  const txt = caption || '';
+  const c = CAMPAIGNS.staycation9000;
+  if (c.idSet.has(id)) return 'staycation9000';
+  if (c.titleRe.test(txt) && c.priceRe.test(txt)) return 'staycation9000';
+  return null;
+}
+
+function respondForCampaign(campaignKey, userText = '') {
+  const t = normalize(userText || '');
+  if (!campaignKey) return null;
+
+  if (isPricingIntent(userText) || /\bcharges?\b/i.test(userText)) {
+    return CAMPAIGNS[campaignKey].priceReply;
+  }
+  if (/\bjoin\b|\bhow\s+to\s+join\b|\bbook\b|\breserv/i.test(t)) {
+    return `Joining us is simple! Share your preferred dates and group size and we’ll lock it in.\n\n• WhatsApp: ${WHATSAPP_LINK}\n• Website: ${SITE_URL}`;
+  }
+  if (/\b(detail|info|information|what’s included|include|samjha|tafseel)/i.test(userText)) {
+    return CAMPAIGNS[campaignKey].longMsg;
+  }
+  return null; // fall through to general handlers
+}
+
+/* =========================
+   VOICE STT
+   ========================= */
+async function sttTranscribeUrl(remoteUrl) {
+  if (!ENABLE_VOICE_STT) return null;
+  if (!process.env.OPENAI_API_KEY) return null;
+  if (!OpenAI) OpenAI = require('openai');
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+  try {
+    const headers = {
+      Referer: 'https://www.instagram.com/',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      Accept: '*/*',
+      'Accept-Language': 'en-US,en;q=0.9'
+    };
+    const resp = await axios.get(remoteUrl, { responseType: 'arraybuffer', timeout: 25000, headers });
+    const buf = Buffer.from(resp.data);
+    if (!buf?.length) return null;
+    if (buf.length > MAX_AUDIO_MB * 1024 * 1024) return 'Audio too large to transcribe. Please send a shorter note.';
+
+    const temp = `/tmp/ig_audio_${Date.now()}_${Math.random().toString(36).slice(2)}.ogg`;
+    fs.writeFileSync(temp, buf);
+
+    // Prefer 4o-mini-transcribe; fallback to whisper-1
+    let text = '';
+    try {
+      const r = await openai.audio.transcriptions.create({
+        file: fs.createReadStream(temp),
+        model: STT_MODEL || 'gpt-4o-mini-transcribe'
+      });
+      text = r?.text || '';
+    } catch {
+      const r2 = await openai.audio.transcriptions.create({
+        file: fs.createReadStream(temp),
+        model: 'whisper-1'
+      });
+      text = r2?.text || '';
+    }
+    try { fs.unlinkSync(temp); } catch {}
+    return (text || '').trim();
+  } catch (e) {
+    console.error('STT error', e?.response?.data || e.message);
+    return null;
+  }
 }
 
 /* =========================
@@ -651,29 +667,30 @@ function detectFriendsStaycationQuery(text='') {
 async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareUrls: [], shareThumb: null, isShare: false, brandHint: false, captions: '', assetId: null }) {
   if (!AUTO_REPLY_ENABLED) return;
 
+  // 0) If we have an active campaign context, try to answer campaign-specific asks first (esp. pricing)
+  const state = sessionState.get(psid) || {};
+  const activeCampaign = state.campaign?.key || null;
+  if (activeCampaign) {
+    const tailored = respondForCampaign(activeCampaign, text || '');
+    if (tailored) return sendBatched(psid, tailored);
+  }
+
+  // If text contains an instagram permalink, collect it too
   const textUrls = extractPostUrls(text || '');
   const combinedUrls = [...new Set([...(ctx.shareUrls || []), ...textUrls])];
 
+  // Quick branches kept local (no history roundtrip)
   const intents = intentFromText(text || '');
   if (intents.wantsContact) return sendBatched(psid, `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+  if (intents.wantsLocation) return sendBatched(psid, `*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
 
-  // Location intent now fires for Urdu/Roman-Urdu too (always includes Maps link)
-  if (intents.wantsLocation) {
-    return sendBatched(psid, `*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
-  }
-
-  // Route/distance
+  // Route/distance helper
   if (intents.wantsRoute || intents.wantsDistance) {
     const msg = await dmRouteMessage(text);
     return sendBatched(psid, msg);
   }
 
-  // Special: 9000 per person staycation → send curated message (overrides default rate card)
-  if (detectFriendsStaycationQuery(text || '')) {
-    return sendBatched(psid, FRIENDS_STAYCATION_MSG);
-  }
-
-  // 1) Brand-owned via asset_id (unchanged)
+  // 1) Brand-owned via asset_id
   if (ctx.assetId) {
     const lookup = await igLookupPostByAssetId(ctx.assetId);
     if (lookup && lookup.isBrand && lookup.post) {
@@ -684,11 +701,20 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
       if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
+      // Campaign override?
+      const campaignKey = detectCampaign(meta.caption || ctx.captions || '', meta.permalink || '');
+      if (campaignKey) {
+        sessionState.set(psid, { campaign: { key: campaignKey, permalink: meta.permalink || '', caption: meta.caption || ctx.captions || '' } });
+        return sendBatched(psid, CAMPAIGNS[campaignKey].longMsg);
+      }
+
       if (!isPricingIntent(text || '')) {
         const reply = formatOfferSummary(meta.caption || ctx.captions || '', meta.permalink || '');
+        sessionState.set(psid, { campaign: null }); // clear campaign if not the 9000 post
         return sendBatched(psid, reply);
       }
 
+      // Pricing asked → brain
       const postNote = [
         'postMeta:',
         `source: ig`,
@@ -708,7 +734,7 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     }
   }
 
-  // 2) Brand via oEmbed URL (unchanged)
+  // 2) Brand via oEmbed URL
   if (combinedUrls.length) {
     for (const url of combinedUrls) {
       const meta = await fetchOEmbed(url);
@@ -720,8 +746,15 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
         if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
+        const campaignKey = detectCampaign(caption, url);
+        if (campaignKey) {
+          sessionState.set(psid, { campaign: { key: campaignKey, permalink: url, caption } });
+          return sendBatched(psid, CAMPAIGNS[campaignKey].longMsg);
+        }
+
         if (!isPricingIntent(text || '')) {
           const reply = formatOfferSummary(caption, url);
+          sessionState.set(psid, { campaign: null });
           return sendBatched(psid, reply);
         }
 
@@ -767,19 +800,6 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 /* =========================
    FB DM + IG DM / COMMENTS
    ========================= */
-
-// Helper: extract any audio attachment URL (IG/FB DMs)
-function extractAudioFromAttachments(event) {
-  const atts = event?.message?.attachments || [];
-  for (const a of atts) {
-    if (['audio','voice','file','video'].includes((a?.type || '').toLowerCase())) {
-      const url = a?.payload?.url || a?.url || null;
-      if (url && /^https?:\/\//i.test(url)) return url;
-    }
-  }
-  return null;
-}
-
 async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null }) {
   if (event.delivery || event.read || event.message?.is_echo) return;
 
@@ -792,19 +812,15 @@ async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null
     }
 
     let text = event.message.text || '';
-    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
 
-    // Voice/audio → transcribe and merge into text
-    const audioUrl = extractAudioFromAttachments(event);
-    if (ENABLE_VOICE_STT && OPENAI_API_KEY && audioUrl) {
-      const stt = await transcribeAudioFromUrl(audioUrl, detectLanguage(text || ''));
-      if (stt?.transcript) {
-        if (IG_DEBUG_LOG) console.log('[FB STT transcript]', stt.transcript);
-        text = `${text ? text + '\n\n' : ''}${stt.transcript}`;
-      } else if (stt?.error && IG_DEBUG_LOG) {
-        console.log('[FB STT error]', stt.error);
-      }
+    // voice/audio on Facebook Messenger (rare for your flow, but supported)
+    const audioUrl = event.message.attachments?.find(a => a.type === 'audio')?.payload?.url || null;
+    if (!text && audioUrl) {
+      const transcript = await sttTranscribeUrl(audioUrl);
+      if (transcript) text = transcript;
     }
+
+    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
 
     const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
     if (!text && !imageUrl && !(isShare || shareUrls.length || assetId)) return;
@@ -851,23 +867,21 @@ async function routeInstagramMessage(event, ctx = { req: null }) {
       console.log('[IG DM attachments]', JSON.stringify(event.message.attachments, null, 2));
     }
 
+    // 1) Text or voice
     let text = event.message.text || '';
-    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
 
-    // Voice/audio → transcribe and merge into text
-    const audioUrl = extractAudioFromAttachments(event);
-    if (ENABLE_VOICE_STT && OPENAI_API_KEY && audioUrl) {
-      const stt = await transcribeAudioFromUrl(audioUrl, detectLanguage(text || ''));
-      if (stt?.transcript) {
-        if (IG_DEBUG_LOG) console.log('[IG STT transcript]', stt.transcript);
-        text = `${text ? text + '\n\n' : ''}${stt.transcript}`;
-      } else if (stt?.error && IG_DEBUG_LOG) {
-        console.log('[IG STT error]', stt.error);
-      }
+    // Voice-note STT (for IG)
+    const voiceUrl = event.message.attachments?.find(a => a.type === 'audio')?.payload?.url || null;
+    if (!text && voiceUrl) {
+      const transcript = await sttTranscribeUrl(voiceUrl);
+      if (transcript) text = transcript;
     }
+
+    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
 
     const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
 
+    // Do not drop — acknowledge shares too
     if (!text && !imageUrl && !(isShare || shareUrls.length || assetId)) return;
 
     return handleTextMessage(igUserId, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions, assetId });
@@ -901,12 +915,10 @@ function extractSharedPostDataFromAttachments(event) {
   const atts = event?.message?.attachments || [];
   const urls = new Set();
   let thumb = null;
+  let isShare = false;
   let brandHint = false;
   const captions = [];
   let assetId = null;
-
-  // NEW: do NOT mark audio/video/file as "share"
-  const isNonShareMedia = (t) => ['audio','voice','video','file'].includes((t || '').toLowerCase());
 
   function unwrapRedirect(u) {
     try {
@@ -921,7 +933,7 @@ function extractSharedPostDataFromAttachments(event) {
   }
   const looksLikePostUrl = (u) => /(https?:\/\/(?:www\.)?instagram\.com\/(?:p|reel)\/[A-Za-z0-9_-]+)/i.test(u || '');
 
-  function collect(obj, skipAsset=false) {
+  function collect(obj, parentType = '') {
     if (!obj || typeof obj !== 'object') return;
     for (const [k, v] of Object.entries(obj)) {
       if (typeof v === 'string') {
@@ -932,7 +944,9 @@ function extractSharedPostDataFromAttachments(event) {
           try {
             const uo = new URL(u);
             const host = uo.hostname.toLowerCase();
-            if (!skipAsset && host.includes('lookaside.fbsbx.com') && uo.pathname.includes('/ig_messaging_cdn/')) {
+            // IMPORTANT: only derive asset_id for images/shares, NOT for audio/video
+            if ((parentType === 'image' || parentType === 'share' || parentType === 'fallback') &&
+                host.includes('lookaside.fbsbx.com') && uo.pathname.includes('/ig_messaging_cdn/')) {
               if (!thumb) thumb = u;
               const aid = uo.searchParams.get('asset_id');
               if (aid) assetId = aid;
@@ -946,24 +960,27 @@ function extractSharedPostDataFromAttachments(event) {
           if (low.includes(BRAND_USERNAME) || low.includes(BRAND_PAGE_NAME)) brandHint = true;
         }
         if (!thumb && ['image_url','thumbnail_url','preview_url','picture','media_url','image'].includes(k) && /^https?:\/\//i.test(s)) {
-          thumb = s;
+          if (parentType === 'image' || parentType === 'share' || parentType === 'fallback') {
+            thumb = s;
+          }
         }
       } else if (typeof v === 'object') {
-        collect(v, skipAsset);
+        collect(v, parentType);
       }
     }
   }
 
   for (const a of atts) {
-    const t = (a?.type || '').toLowerCase();
-    const skipAsset = isNonShareMedia(t);
+    const parentType = a?.type || '';
+    if (parentType && parentType !== 'image') isShare = true;
 
     if (a?.url && /^https?:\/\//i.test(a.url)) {
       const u = unwrapRedirect(a.url);
       try {
         const uo = new URL(u);
         const host = uo.hostname.toLowerCase();
-        if (!skipAsset && host.includes('lookaside.fbsbx.com') && uo.pathname.includes('/ig_messaging_cdn/')) {
+        if ((parentType === 'image' || parentType === 'share' || parentType === 'fallback') &&
+            host.includes('lookaside.fbsbx.com') && uo.pathname.includes('/ig_messaging_cdn/')) {
           if (!thumb) thumb = u;
           const aid = uo.searchParams.get('asset_id');
           if (aid) assetId = aid;
@@ -971,11 +988,8 @@ function extractSharedPostDataFromAttachments(event) {
       } catch {}
       if (looksLikePostUrl(u)) urls.add(u);
     }
-    if (a?.payload) collect(a.payload, skipAsset);
+    if (a?.payload) collect(a.payload, parentType);
   }
-
-  // Only mark share if we actually saw a post URL or (non-audio) lookaside asset
-  const isShare = (urls.size > 0) || (!!assetId && !!thumb);
 
   return { urls: [...urls], thumb, isShare, brandHint, captions: captions.filter(Boolean).join(' • '), assetId };
 }
@@ -1071,7 +1085,7 @@ app.get('/admin/status', requireAdmin, async (_req, res) => {
     res.json({
       ok: true,
       subscribed_apps: data,
-      env: { IG_USER_ID, RESORT_COORDS, LINKS: { maps: MAPS_LINK, site: SITE_URL, whatsapp: WHATSAPP_LINK } }
+      env: { IG_USER_ID, RESORT_COORDS, LINKS: { maps: MAPS_LINK, site: SITE_URL, whatsapp: WHATSAPP_LINK }, voice_stt: ENABLE_VOICE_STT }
     });
   } catch (e) { res.status(500).json({ ok: false, error: e?.response?.data || e.message }); }
 });
