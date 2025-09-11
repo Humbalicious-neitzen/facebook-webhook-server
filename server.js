@@ -1,10 +1,10 @@
-// server.js — Roameo Resorts omni-channel bot
-// v11.3 — IG caption summary intact + SPECIAL OFFER override + offer-aware follow-ups
+// server.js — Roameo Resorts omni-channel bot (v11 + STT for voice notes; caption-to-summary for IG shares intact)
 
 const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const axios = require('axios');
+const FormData = require('form-data');            // <-- NEW: for OpenAI audio transcription
 const { LRUCache } = require('lru-cache');
 
 const { askBrain, constructUserMessage } = require('./lib/brain');
@@ -52,11 +52,20 @@ const CHECKOUT_TIME = process.env.CHECKOUT_TIME || '12:00 pm';
 
 const MAX_OUT_CHAR = 800;
 
+// NEW: Voice/STT toggles (optional; default ON)
+const ENABLE_VOICE_STT = String(process.env.ENABLE_VOICE_STT || 'true').toLowerCase() === 'true';
+const STT_MODEL = process.env.STT_MODEL || 'gpt-4o-mini-transcribe';
+const MAX_AUDIO_MB = Number(process.env.MAX_AUDIO_MB || 20);
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
 if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
   console.warn('⚠️ Missing required env vars: APP_SECRET, VERIFY_TOKEN, PAGE_ACCESS_TOKEN');
 }
 if (!IG_USER_ID) {
   console.warn('⚠️ IG_USER_ID not set — IG share recognition via asset_id will be disabled.');
+}
+if (!OPENAI_API_KEY) {
+  console.warn('⚠️ OPENAI_API_KEY not set — voice transcription will be disabled.');
 }
 
 /* =========================
@@ -79,9 +88,6 @@ app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }))
 const dedupe      = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });
 const tinyCache   = new LRUCache({ max: 300,  ttl: 1000 * 60 * 15 });
 const chatHistory = new LRUCache({ max: 2000, ttl: 1000 * 60 * 60 * 24 * 30 });
-
-// NEW: lightweight per-user conversational state (offer context etc.)
-const userContext = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 * 24 }); // 24h
 
 /* =========================
    BASIC ROUTES
@@ -179,9 +185,9 @@ function stripPricesFromPublic(text = '') {
 function isPricingIntent(text = '') {
   const t = normalize(text);
   if (t.length <= 2) return false;
-  const kw = ['price','prices','pricing','rate','rates','tariff','cost','rent','rental','per night','night price','kiraya','qeemat','kimat','keemat','قیمت','کرایہ','ریٹ','نرخ','charges','charo']; // includes “charges/charo”
+  const kw = ['price','prices','pricing','rate','rates','tariff','cost','rent','rental','per night','night price','kiraya','qeemat','kimat','keemat','قیمت','کرایہ','ریٹ','نرخ'];
   if (kw.some(x => t.includes(x))) return true;
-  if (/\b\d+\s*(night|nights|din|raat|day|days)\b/.test(t)) return true;
+  if (/\b\d+\s*(night|nights|din|raat)\b/.test(t)) return true;
   if (/\bhow much\b/.test(t)) return true;
   return false;
 }
@@ -496,8 +502,11 @@ function formatOfferSummary(caption = '', permalink = '') {
 
   if (info.title) out.push(`\n• **Package:** ${info.title}`);
   if (info.duration) out.push(`• **Duration:** ${info.duration}`);
-  if (info.pricePerPerson) out.push(`• **Price:** ${info.pricePerPerson}`);
-  else if (info.anyPrice) out.push(`• **Price:** ${info.anyPrice}`);
+  if (info.pricePerPerson) {
+    out.push(`• **Price:** ${info.pricePerPerson}`);
+  } else if (info.anyPrice) {
+    out.push(`• **Price:** ${info.anyPrice}`);
+  }
   if (info.groupSize) out.push(`• **Best for:** ${info.groupSize}`);
 
   if (info.inclusions.size) {
@@ -523,125 +532,95 @@ function formatOfferSummary(caption = '', permalink = '') {
 }
 
 /* =========================
-   SPECIAL OFFER: "3 din just chill" (Rs 9000 image)
+   NEW: STT — transcribe IG/FB audio/voice
    ========================= */
-const OFFER_KEY_STAYCATION = 'staycation_friends_v1';
-function matchesStaycationOffer(caption = '') {
-  const t = (caption || '').toLowerCase();
-  return /\b3\s*din\s*just\s*chill\b/.test(t) || /\b3\s*din\b/.test(t); // caption has this text
-  // (we purposely do NOT rely on reading 9000 from the image)
-}
-function staycationMessage() {
-  return sanitizeVoice(
-`Roameo Staycation for Friends 🌲
-
-This trip plan is designed especially for groups of friends who want to escape together. You’re free to plan from wherever you are and choose the dates that work best for your crew—we’ll take care of your stay and make sure it feels like home. The idea is simple: you bring your people, we provide the space and comfort.
-
-*Terms & Conditions*
-• Travel not included – Guests manage their own travel to and from Roameo.
-• Flexible dates – Book your stay in advance for any date that suits you. This isn’t a fixed trip or limited-time offer.
-• Meals – Your package includes daily complimentary breakfast + one free dinner. Any extra meals or snacks are billed separately.
-• Itinerary ideas – This is not a designed fixed trip. This was just a sample 3-day plan and we can suggest nearby spots you might enjoy—but how you spend your time at Roameo is completely up to you.
-• Add-ons – Any extra activities, services, or experiences beyond your stay will have separate charges.
-• Bring your crew – Roameo is best enjoyed with your own group of friends/family. You choose who comes along and when.
-
-Pack your bags, call your friends, and let’s make it a getaway to remember. Book your Roameo stay today and start creating your own stories!
-
-WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`
-  );
-}
-function setOfferContext(psid, offerObj) {
-  const prev = userContext.get(psid) || {};
-  userContext.set(psid, { ...prev, lastOffer: { ...offerObj, at: Date.now() } });
-}
-function getOfferContext(psid) {
-  const u = userContext.get(psid) || {};
-  return u.lastOffer || null;
+function looksLikeAudioContentType(ct = '') {
+  const s = (ct || '').toLowerCase();
+  return s.includes('audio') || s.includes('mpeg') || s.includes('mp4') || s.includes('x-m4a') || s.includes('aac') || s.includes('ogg') || s.includes('webm') || s.includes('3gpp');
 }
 
-/* ===== Night parsing + quick quote (used only for offer follow-ups if user states nights) */
-const NIGHT_RX = /\b(\d{1,2})\s*(?:night|nights|din|raat|day|days)\b/i;
-function parseNights(text='') {
-  const m = (text || '').match(NIGHT_RX);
-  if (!m) return null;
-  const n = parseInt(m[1], 10);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  return n;
-}
-const HUT_BASE = { Deluxe: 30000, Executive: 50000 };
-function priceAfterDiscount(base, nightIndex) {
-  // Night #1 → 10% off; #2 → 15% off; #3+ → 20% off
-  const idx = nightIndex + 1;
-  const rateOff = idx === 1 ? 0.10 : idx === 2 ? 0.15 : 0.20;
-  return Math.round(base * (1 - rateOff));
-}
-function buildQuoteForNights(nNights) {
-  const lines = [];
-  lines.push(`Here’s the quote for *${nNights} ${nNights === 1 ? 'night' : 'nights'}* (soft-launch discounts applied):`);
-  for (const [hut, base] of Object.entries(HUT_BASE)) {
-    let total = 0;
-    const nightly = [];
-    for (let i = 0; i < nNights; i++) {
-      const amt = priceAfterDiscount(base, i);
-      total += amt;
-      const off = i === 0 ? '10%' : i === 1 ? '15%' : '20%';
-      nightly.push(`• Night ${i+1}: PKR ${amt.toLocaleString()} (${off} off)`);
+async function transcribeAudioFromUrl(remote, langHint = 'en') {
+  if (!ENABLE_VOICE_STT || !OPENAI_API_KEY || !remote) return null;
+
+  try {
+    const headers = {
+      Referer: 'https://www.instagram.com/',
+      'User-Agent': 'Mozilla/5.0',
+      Accept: '*/*'
+    };
+
+    // HEAD (optional) to check size
+    try {
+      const head = await axios.head(remote, { headers, timeout: 8000, maxRedirects: 3, validateStatus: s => s >= 200 && s < 400 });
+      const len = Number(head.headers['content-length'] || 0);
+      if (len && len > MAX_AUDIO_MB * 1024 * 1024) {
+        return { error: `Audio too large (> ${MAX_AUDIO_MB}MB).` };
+      }
+    } catch { /* ignore */ }
+
+    const resp = await axios.get(remote, {
+      responseType: 'arraybuffer',
+      timeout: 20000,
+      headers,
+      maxRedirects: 3,
+      validateStatus: s => s >= 200 && s < 400
+    });
+
+    const ct = resp.headers['content-type'] || 'audio/mpeg';
+    if (!looksLikeAudioContentType(ct)) {
+      // Some voice clips come as video/mp4 with audio track — still OK
+      if (!/video\/mp4|application\/octet-stream/i.test(ct)) {
+        return { error: `Unsupported audio type: ${ct}` };
+      }
     }
-    lines.push(`\n${hut} Hut — Base PKR ${base.toLocaleString()}/night`);
-    lines.push(...nightly);
-    lines.push(`→ **Total: PKR ${total.toLocaleString()}**`);
-  }
-  lines.push(`Rates include all taxes and complimentary breakfast for 4 guests. 50% advance confirms booking.\n\nWhatsApp: ${WHATSAPP_LINK}\nAvailability / Book: ${SITE_URL}`);
-  return lines.join('\n');
-}
 
-/* ===== Offer follow-up router (runs only if that offer is active in context) */
-function shouldHandleWithOffer(intents, userText='') {
-  const t = (userText || '').toLowerCase();
-  const travelAsk = /\btravel|transport|bus|van|car|fare|cost of travel|pickup|drop\b/.test(t);
-  const joinAsk   = /\bjoin|how to (?:join|book|come)\b/.test(t);
-  return intents.wantsRates || travelAsk || joinAsk || /\bwhat(?:’|')?s included|includes|meals?|dinner|breakfast\b/.test(t);
-}
-async function handleOfferFollowup(psid, text, offer) {
-  const intents = intentFromText(text || '');
-  const lang = detectLanguage(text || '');
-
-  // Travel queries
-  if (/\btravel|transport|bus|van|car|fare|pickup|drop\b/i.test(text || '')) {
-    const msg = `For this plan, *travel is not included*. Guests manage their own travel to and from Roameo.\n\nIf you share your departure city, I can send route info and drive time.\n\nLocation: ${MAPS_LINK}\nWhatsApp: ${WHATSAPP_LINK}`;
-    return msg;
-  }
-
-  // Pricing / charges
-  if (intents.wantsRates) {
-    const nights = parseNights(text || '');
-    if (nights) {
-      return buildQuoteForNights(nights);
+    const buf = Buffer.from(resp.data);
+    const len = buf.length;
+    if (len > MAX_AUDIO_MB * 1024 * 1024) {
+      return { error: `Audio too large (> ${MAX_AUDIO_MB}MB).` };
     }
-    // No nights mentioned — explain how charges work for THIS offer (don’t dump generic card)
-    return sanitizeVoice(
-`For this *Roameo Staycation for Friends* plan there isn’t a fixed package fee. You choose your dates and we charge the *nightly hut rate* for your stay. The plan includes *daily complimentary breakfast + one free dinner*, and *travel isn’t included*.
 
-Tell me:
-• how many nights you’d like, and
-• which hut (Deluxe or Executive)
+    const tryModels = [STT_MODEL, 'whisper-1'];
+    let lastErr = null;
 
-…I’ll send a precise total with the soft-launch discounts applied. Or say “price for 3 nights” and I’ll calculate it right away. 🌿`
-    );
+    for (const model of tryModels) {
+      try {
+        const form = new FormData();
+        form.append('file', buf, { filename: 'voice.m4a', contentType: ct });
+        form.append('model', model);
+        form.append('response_format', 'text');
+        // Optional language hint: OpenAI will auto-detect if not provided
+        // form.append('language', langHint); 
+
+        const { data: txt } = await axios.post('https://api.openai.com/v1/audio/transcriptions', form, {
+          headers: { 
+            Authorization: `Bearer ${OPENAI_API_KEY}`,
+            ...form.getHeaders()
+          },
+          timeout: 30000
+        });
+
+        const transcript = (txt || '').toString().trim();
+        if (transcript) return { transcript };
+      } catch (e) {
+        lastErr = e?.response?.data || e.message;
+        if (IG_DEBUG_LOG) console.log('STT error for model', model, lastErr);
+      }
+    }
+
+    return { error: lastErr || 'Transcription failed.' };
+  } catch (e) {
+    if (IG_DEBUG_LOG) console.log('STT fetch/transcribe error', e?.response?.data || e.message);
+    return { error: 'Could not process audio.' };
   }
+}
 
-  // “How to join / book”
-  if (/\bjoin|book|reserve|reservation\b/i.test(text || '')) {
-    return `Joining us is simple! Share your preferred *dates* and we’ll check availability. You can also book here:\n\n• WhatsApp: ${WHATSAPP_LINK}\n• Website: ${SITE_URL}`;
-  }
-
-  // What’s included etc.
-  if (/\bincludes?|breakfast|dinner|meals?\b/i.test(text || '')) {
-    return `This staycation includes *daily complimentary breakfast* plus *one free dinner*. Extra meals/snacks and any add-ons are billed separately. Travel isn’t included.\n\nAnything else you’d like to know?`;
-  }
-
-  // Default: resurface the offer blurb briefly
-  return staycationMessage();
+function extractPostUrls(text='') {
+  if (!text) return [];
+  const rx = /(https?:\/\/(?:www\.)?instagram\.com\/(?:p|reel)\/[A-Za-z0-9_\-]+)/ig;
+  const out = [];
+  let m; while ((m = rx.exec(text))) out.push(m[1]);
+  return [...new Set(out)];
 }
 
 /* =========================
@@ -654,21 +633,12 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
   const combinedUrls = [...new Set([...(ctx.shareUrls || []), ...textUrls])];
 
   const intents = intentFromText(text || '');
-
-  // Quick branches that should always work
   if (intents.wantsContact) return sendBatched(psid, `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
   if (intents.wantsLocation) return sendBatched(psid, `*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
 
   if (intents.wantsRoute || intents.wantsDistance) {
     const msg = await dmRouteMessage(text);
     return sendBatched(psid, msg);
-  }
-
-  // NEW: if user is already in a special-offer conversation, answer follow-ups about THAT offer
-  const activeOffer = getOfferContext(psid);
-  if (activeOffer && shouldHandleWithOffer(intents, text || '')) {
-    const reply = await handleOfferFollowup(psid, text || '', activeOffer);
-    return sendBatched(psid, reply);
   }
 
   // 1) Brand-owned via asset_id
@@ -682,20 +652,11 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
       if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
-      // SPECIAL OFFER override if caption matches (when we have caption from the recent map)
-      if ((meta.caption || ctx.captions) && matchesStaycationOffer(meta.caption || ctx.captions)) {
-        const msg = staycationMessage();
-        setOfferContext(psid, { key: OFFER_KEY_STAYCATION, title: 'Roameo Staycation for Friends' });
-        return sendBatched(psid, msg);
-      }
-
-      // If user didn't ask "rates", send structured caption summary (NOT nightly card)
       if (!isPricingIntent(text || '')) {
         const reply = formatOfferSummary(meta.caption || ctx.captions || '', meta.permalink || '');
         return sendBatched(psid, reply);
       }
 
-      // Pricing asked → brain
       const postNote = [
         'postMeta:',
         `source: ig`,
@@ -726,13 +687,6 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
         const imgForVision = SEND_IMAGE_FOR_IG_SHARES ? thumb : null;
 
         if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
-
-        // SPECIAL OFFER override when caption shows "3 din just chill"
-        if (matchesStaycationOffer(caption)) {
-          const msg = staycationMessage();
-          setOfferContext(psid, { key: OFFER_KEY_STAYCATION, title: 'Roameo Staycation for Friends', permalink: url });
-          return sendBatched(psid, msg);
-        }
 
         if (!isPricingIntent(text || '')) {
           const reply = formatOfferSummary(caption, url);
@@ -781,6 +735,20 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 /* =========================
    FB DM + IG DM / COMMENTS
    ========================= */
+
+// Helper: extract any audio attachment URL (IG/FB DMs)
+function extractAudioFromAttachments(event) {
+  const atts = event?.message?.attachments || [];
+  for (const a of atts) {
+    // Types: 'audio', 'voice', sometimes 'file' with audio mimetype; IG uses lookaside URLs
+    if (a?.type === 'audio' || a?.type === 'voice' || a?.type === 'file' || a?.type === 'video') {
+      const url = a?.payload?.url || a?.url || null;
+      if (url && /^https?:\/\//i.test(url)) return url;
+    }
+  }
+  return null;
+}
+
 async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null }) {
   if (event.delivery || event.read || event.message?.is_echo) return;
 
@@ -792,8 +760,21 @@ async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null
       console.log('[FB DM attachments]', JSON.stringify(event.message.attachments, null, 2));
     }
 
-    const text = event.message.text || '';
+    let text = event.message.text || '';
     const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
+
+    // NEW: voice/audio
+    let audioTranscript = null;
+    const audioUrl = extractAudioFromAttachments(event);
+    if (ENABLE_VOICE_STT && OPENAI_API_KEY && audioUrl) {
+      const stt = await transcribeAudioFromUrl(audioUrl, detectLanguage(text || ''));
+      if (stt?.transcript) {
+        audioTranscript = stt.transcript;
+        text = `${text ? text + '\n\n' : ''}${audioTranscript}`;
+      } else if (stt?.error && IG_DEBUG_LOG) {
+        console.log('[FB STT error]', stt.error);
+      }
+    }
 
     const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
     if (!text && !imageUrl && !(isShare || shareUrls.length || assetId)) return;
@@ -840,8 +821,21 @@ async function routeInstagramMessage(event, ctx = { req: null }) {
       console.log('[IG DM attachments]', JSON.stringify(event.message.attachments, null, 2));
     }
 
-    const text = event.message.text || '';
+    let text = event.message.text || '';
     const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
+
+    // NEW: voice/audio for IG DMs
+    let audioTranscript = null;
+    const audioUrl = extractAudioFromAttachments(event);
+    if (ENABLE_VOICE_STT && OPENAI_API_KEY && audioUrl) {
+      const stt = await transcribeAudioFromUrl(audioUrl, detectLanguage(text || ''));
+      if (stt?.transcript) {
+        audioTranscript = stt.transcript;
+        text = `${text ? text + '\n\n' : ''}${audioTranscript}`;
+      } else if (stt?.error && IG_DEBUG_LOG) {
+        console.log('[IG STT error]', stt.error);
+      }
+    }
 
     const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
 
