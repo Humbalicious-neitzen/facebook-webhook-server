@@ -1,23 +1,17 @@
-// server.js — Roameo Resorts omni-channel bot
-// v12 — Voice STT + campaign memory for 9000 PKR post + Urdu location intents
-// NOTE: This is a drop-in replacement that preserves your existing logic and adds:
-// 1) IG audio voice-notes -> STT -> handled like text
-// 2) Prevents audio lookaside URLs from being treated as IG post asset_ids
-// 3) Sticky "campaign" context for the Rs 9,000 "3 din just chill" post
-// 4) Urdu/Roman-Urdu location intent always returns Maps link
+// server.js — Roameo Resorts omni-channel bot (v12 + campaign-from-text + sticky follow-ups + STT)
 
 const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
 const axios = require('axios');
-const fs = require('fs');
+const FormData = require('form-data');
 const { LRUCache } = require('lru-cache');
 
 const { askBrain, constructUserMessage } = require('./lib/brain');
-let OpenAI = null; // lazy require when STT enabled
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+
 app.set('trust proxy', true);
 
 /* =========================
@@ -43,10 +37,6 @@ const AUTO_REPLY_ENABLED       = String(process.env.AUTO_REPLY_ENABLED       || 
 const ALLOW_REPLY_IN_STANDBY   = String(process.env.ALLOW_REPLY_IN_STANDBY   || 'true').toLowerCase() === 'true';
 const AUTO_TAKE_THREAD_CONTROL = String(process.env.AUTO_TAKE_THREAD_CONTROL || 'false').toLowerCase() === 'true';
 
-const ENABLE_VOICE_STT = String(process.env.ENABLE_VOICE_STT || 'false').toLowerCase() === 'true';
-const STT_MODEL = process.env.STT_MODEL || 'gpt-4o-mini-transcribe'; // falls back to whisper-1
-const MAX_AUDIO_MB = Number(process.env.MAX_AUDIO_MB || 20);
-
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
 const BRAND_USERNAME  = (process.env.BRAND_USERNAME  || 'roameoresorts').toLowerCase();
@@ -62,6 +52,12 @@ const CHECKOUT_TIME = process.env.CHECKOUT_TIME || '12:00 pm';
 
 const MAX_OUT_CHAR = 800;
 
+/* === Optional STT (voice-note) === */
+const ENABLE_VOICE_STT = String(process.env.ENABLE_VOICE_STT || 'true').toLowerCase() === 'true';
+const STT_MODEL = process.env.STT_MODEL || 'gpt-4o-mini-transcribe'; // falls back to whisper-1 inside code
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
+/* Guard logs */
 if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
   console.warn('⚠️ Missing required env vars: APP_SECRET, VERIFY_TOKEN, PAGE_ACCESS_TOKEN');
 }
@@ -86,17 +82,19 @@ const FACTS = {
    MIDDLEWARE & CACHES
    ========================= */
 app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
-const dedupe        = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });              // 1h
-const tinyCache     = new LRUCache({ max: 300,  ttl: 1000 * 60 * 15 });              // 15m
-const chatHistory   = new LRUCache({ max: 2000, ttl: 1000 * 60 * 60 * 24 * 30 });    // 30d
-const sessionState  = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 * 24 * 30 });    // per-user lightweight state
+const dedupe      = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });
+const tinyCache   = new LRUCache({ max: 300,  ttl: 1000 * 60 * 15 });
+const chatHistory = new LRUCache({ max: 2000, ttl: 1000 * 60 * 60 * 24 * 30 });
+
+/* Session (sticky small flags per user, e.g., active campaign) */
+const sessionState = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 * 24 * 7 });
 
 /* =========================
    BASIC ROUTES
    ========================= */
 app.get('/', (_req, res) => res.send('Roameo Omni Bot running'));
 
-/* Image/audio proxy (always HTTPS) */
+/* Image proxy (always HTTPS) */
 app.get('/img', async (req, res) => {
   const remote = req.query.u;
   if (!remote) return res.status(400).send('missing u');
@@ -104,7 +102,7 @@ app.get('/img', async (req, res) => {
     const headers = {
       Referer: 'https://www.instagram.com/',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      Accept: '*/*',
+      Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9'
     };
     const resp = await axios.get(remote, {
@@ -114,7 +112,7 @@ app.get('/img', async (req, res) => {
       maxRedirects: 3,
       validateStatus: s => s >= 200 && s < 400
     });
-    const ct = resp.headers['content-type'] || 'application/octet-stream';
+    const ct = resp.headers['content-type'] || 'image/jpeg';
     res.set('Content-Type', ct);
     res.set('Cache-Control', 'public, max-age=300');
     res.send(Buffer.from(resp.data, 'binary'));
@@ -171,7 +169,7 @@ function detectLanguage(text = '') {
   const t = (text || '').trim();
   const hasUrduScript = /[\u0600-\u06FF\u0750-\u077F]/.test(t);
   if (hasUrduScript) return 'ur';
-  const romanUrduTokens = ['aap','ap','apka','apki','apke','kiraya','qeemat','rate','price','btao','batao','kitna','kitni','kitne','raha','hai','hain','kahan','location'];
+  const romanUrduTokens = ['aap','ap','apka','apki','apke','kiraya','qeemat','rate','price','btao','batao','kitna','kitni','kitne','raha','hai','hain'];
   const hit = romanUrduTokens.some(w => new RegExp(`\\b${w}\\b`, 'i').test(t));
   return hit ? 'roman-ur' : 'en';
 }
@@ -187,9 +185,9 @@ function stripPricesFromPublic(text = '') {
 function isPricingIntent(text = '') {
   const t = normalize(text);
   if (t.length <= 2) return false;
-  const kw = ['price','prices','pricing','rate','rates','tariff','cost','charges','kiraya','qeemat','kimat','keemat','قیمت','ریٹ','نرخ','charge'];
+  const kw = ['price','prices','pricing','rate','rates','tariff','cost','rent','rental','per night','night price','kiraya','qeemat','kimat','keemat','قیمت','کرایہ','ریٹ','نرخ','9k','9000','9 000'];
   if (kw.some(x => t.includes(x))) return true;
-  if (/\b\d+\s*(night|nights|din|raat|days|day)\b/.test(t)) return true;
+  if (/\b\d+\s*(night|nights|din|raat|days?)\b/.test(t)) return true;
   if (/\bhow much\b/.test(t)) return true;
   return false;
 }
@@ -232,10 +230,6 @@ function extractPostUrls(text='') {
   let m; while ((m = rx.exec(text))) out.push(m[1]);
   return [...new Set(out)];
 }
-const getPermalinkId = (url='') => {
-  const m = url.match(/instagram\.com\/(?:p|reel)\/([^\/?#]+)/i);
-  return m ? m[1] : '';
-};
 
 /* =========================
    IG Graph / OEmbed helpers
@@ -410,11 +404,10 @@ async function getRouteInfo(originLat, originLon, destLat, destLon) {
 function intentFromText(text = '') {
   const t = normalize(text);
   return {
-    // add Urdu tokens for "location"
-    wantsLocation   : /\blocation\b|\bwhere\b|\baddress\b|\bmap\b|\bpin\b|\bdirections?\b|\breach\b|لوکیشن|کہاں|پتہ|ایڈریس|نقشہ/.test(t) || /لوکیشن|کہاں|پتہ|ایڈریس|نقشہ/.test(text),
+    wantsLocation   : /\blocation\b|\bwhere\b|\baddress\b|\bmap\b|\bpin\b|\bdirections?\b|\breach\b|لوکیشن|کہاں|پتہ|ایڈریس|نقشہ|راستہ/.test(t + ' ' + text),
     wantsRates      : isPricingIntent(text),
     wantsFacilities : /\bfaciliti(?:y|ies)\b|\bamenit(?:y|ies)\b|\bkitchen\b|\bfood\b|\bheater\b|\bbonfire\b|\bfamily\b|\bparking\b|\bjeep\b|\binverter\b/.test(t),
-    wantsBooking    : /\bbook\b|\bbooking\b|\breserve\b|\breservation\b|\bcheck ?in\b|\bcheck ?out\b|\badvance\b|\bpayment\b|\bjoin\b/.test(t),
+    wantsBooking    : /\bbook\b|\bbooking\b|\breserve\b|\breservation\b|\bcheck ?in\b|\bcheck ?out\b|\badvance\b|\bpayment\b/.test(t),
     wantsAvail      : /\bavailability\b|\bavailable\b|\bdates?\b|\bcalendar\b/.test(t),
     wantsDistance   : /\bdistance\b|\bhow far\b|\bhours\b|\bdrive\b|\btime from\b|\beta\b/.test(t),
     wantsWeather    : /\bweather\b|\btemperature\b|\bforecast\b/.test(t),
@@ -424,7 +417,7 @@ function intentFromText(text = '') {
 }
 
 /* =========================
-   Caption → structured summary (existing)
+   NEW: caption → structured summary (no raw paste)
    ========================= */
 const RX_PRICE_PER_PERSON = /(rs\.?|pkr|₨)\s*([0-9][0-9,]*)\s*(?:\/?\s*(?:per\s*person|pp|per\s*head))?/i;
 const RX_ANY_PRICE        = /(rs\.?|pkr|₨)\s*([0-9][0-9,]*)/i;
@@ -440,6 +433,7 @@ const INCLUSION_KEYS = [
 
 function cleanLinesFromCaption(caption = '') {
   const raw = (caption || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  // drop hashtags / links only lines
   return raw.filter(l => !/^#/.test(l) && !/^https?:\/\//i.test(l));
 }
 
@@ -460,7 +454,6 @@ function extractInfoFromCaption(caption = '') {
 
   const capLower = caption.toLowerCase();
 
-  // price
   const mpp = caption.match(RX_PRICE_PER_PERSON);
   if (mpp) info.pricePerPerson = `PKR ${Number(mpp[2].replace(/,/g,'')).toLocaleString()}/person`;
   else {
@@ -468,7 +461,6 @@ function extractInfoFromCaption(caption = '') {
     if (mp) info.anyPrice = `PKR ${Number(mp[2].replace(/,/g,'')).toLocaleString()}`;
   }
 
-  // duration
   const md = caption.match(RX_DURATION);
   if (md) {
     const n = md[1];
@@ -478,20 +470,16 @@ function extractInfoFromCaption(caption = '') {
     info.duration = `${n} ${unit}`;
   }
 
-  // group size
   const mg = caption.match(RX_GROUP_SIZE);
   if (mg) info.groupSize = `${mg[1]}–${mg[2]} people`;
 
-  // inclusions
   for (const key of INCLUSION_KEYS) {
     if (capLower.includes(key)) info.inclusions.add(key.replace(/complimentary /i,''));
   }
 
-  // phone
   const ph = caption.match(RX_PHONE_PK);
   if (ph) info.phone = ph[0];
 
-  // key points (max 3)
   const pts = [];
   for (const l of lines.slice(1)) {
     if (pts.length >= 3) break;
@@ -545,558 +533,96 @@ function formatOfferSummary(caption = '', permalink = '') {
 }
 
 /* =========================
-   CAMPAIGN RULES — Rs 9,000 "3 din just chill"
+   CAMPAIGN: 3 din chill / 9000 per person
    ========================= */
 const CAMPAIGNS = {
   staycation9000: {
-    idSet: new Set(['DOQL0O0imXB']), // known permalink code(s)
-    titleRe: /3\s*din\s*just\s*chill/i,
-    priceRe: /\b9\s*000\b/,
-    // canonical message you provided:
     longMsg:
 `Roameo Staycation for Friends 🌲
 
 This trip plan is designed especially for groups of friends who want to escape together. You’re free to plan from wherever you are and choose the dates that work best for your crew—we’ll take care of your stay and make sure it feels like home. The idea is simple: you bring your people, we provide the space and comfort.
 
-Terms & Conditions
-
-Travel not included – Guests manage their own travel to and from Roameo.
-
-Flexible dates – Book your stay in advance for any date that suits you. This isn’t a fixed trip or limited-time offer.
-
-Meals – Your package includes daily complimentary breakfast + one free dinner. Any extra meals or snacks are billed separately.
-
-Itinerary ideas – This is not a designed fixed trip. This was just a sample 3-day plan and we can suggest nearby spots you might enjoy—but how you spend your time at Roameo is completely up to you.
-
-Add-ons – Any extra activities, services, or experiences beyond your stay will have separate charges.
-
-Bring your crew – Roameo is best enjoyed with your own group of friends/family. You choose who comes along and when.
+**Terms & Conditions**
+• Travel not included – Guests manage their own travel to and from Roameo.  
+• Flexible dates – Book your stay in advance for any date that suits you. This isn’t a fixed trip or limited-time offer.  
+• Meals – Your package includes daily complimentary breakfast + one free dinner. Any extra meals or snacks are billed separately.  
+• Itinerary ideas – This is not a designed fixed trip. The 3-day plan was only a sample; we can suggest nearby spots you might enjoy—but how you spend your time at Roameo is completely up to you.  
+• Add-ons – Any extra activities, services, or experiences beyond your stay will have separate charges.  
+• Bring your crew – Roameo is best enjoyed with your own group of friends/family. You choose who comes along and when.
 
 Pack your bags, call your friends, and let’s make it a getaway to remember. Book your Roameo stay today and start creating your own stories!
 
 WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`,
     priceReply:
-`Here are the charges for this offer:
+`For the *3-day chill* staycation, the headline price is **PKR 9,000 per person**.  
+What’s covered:
+• Daily complimentary **breakfast** + **one free dinner**  
+• Flexible dates (your choice)  
+• Stay at Roameo (travel not included)
 
-• Package price: **PKR 9,000 per person**
-• Includes: Complimentary breakfast + one free dinner, Free Wi-Fi
-• Flexible dates (choose the dates that suit you)
-• Travel not included
-
-To book or check dates:
-• WhatsApp: ${WHATSAPP_LINK}
-• Website: ${SITE_URL}`
+Tell me your **group size** and **dates**, and I’ll help you proceed.  
+WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`
   }
 };
 
-function detectCampaign(caption = '', permalink = '') {
-  const id = getPermalinkId(permalink || '');
-  const txt = caption || '';
-  const c = CAMPAIGNS.staycation9000;
-  if (c.idSet.has(id)) return 'staycation9000';
-  if (c.titleRe.test(txt) && c.priceRe.test(txt)) return 'staycation9000';
+function detectStaycation9000FromCaption(caption='') {
+  const s = (caption || '').toLowerCase();
+  return /3\s*(din|day|days).*ch(i|)ll/.test(s) || /\b9000\b/.test(s) || /\b9k\b/.test(s);
+}
+
+/* Allow text-only triggers */
+function maybeCampaignFromText(text = '') {
+  const s = (text || '').toLowerCase();
+
+  const mentions9000 =
+    /\b9\s*000\b/.test(s) || /\b9k\b/.test(s) || /\b9\s*k\b/.test(s) ||
+    /نو\s*ہزار/.test(s) || /٩٠٠٠/.test(s);
+
+  const mentionsThreeDayChill =
+    /3\s*(din|day|days)\s*(?:just)?\s*ch(?:i)?ll/.test(s) ||
+    /3\s*din\s*wali\s*post/.test(s) ||
+    /3[-\s]*day\s*package/.test(s) ||
+    /staycation\s*for\s*friends/.test(s);
+
+  if (mentions9000 || mentionsThreeDayChill) return 'staycation9000';
+  return null;
+}
+
+function campaignFollowupAnswer(campKey, userText = '') {
+  const t = (userText || '').toLowerCase();
+
+  if (/\b(price|prices|pricing|rate|rates|charges|cost|kiraya|qeemat|قیمت|ریٹ|نرخ|9k|9000)\b/.test(t))
+    return CAMPAIGNS[campKey].priceReply;
+
+  if (/\b(one|1)\s*person\b/.test(t) || /per\s*person/.test(t) || /ek\s*band(a|e)/.test(t))
+    return `Yes — the **PKR 9,000** is **per person** for this staycation.\n\nKey points:\n• Complimentary breakfast + one free dinner\n• Flexible dates (you choose)\n• Travel not included\n\nBook/check dates:\n• WhatsApp: ${WHATSAPP_LINK}\n• Website: ${SITE_URL}`;
+
+  if (/\bhut\b/.test(t) || /single\s*hut/.test(t) || /deluxe/.test(t) || /executive/.test(t)) {
+    return `We offer **Deluxe** and **Executive** huts. The 9,000 PKR package is priced **per person** — you can pick the hut type you prefer (subject to availability).\n\nTell me your dates + group size and I’ll help you proceed.\n\n• WhatsApp: ${WHATSAPP_LINK}\n• Website: ${SITE_URL}`;
+  }
+
+  if (/\bavailability|available|dates?|calendar\b/.test(t)) {
+    return `This staycation has **flexible dates** — pick any dates that suit your group (subject to availability).\n\nTo check/hold dates:\n• WhatsApp: ${WHATSAPP_LINK}\n• Website: ${SITE_URL}`;
+  }
+
+  if (/\bjoin|how\s*to\s*join|book|reserve|reservation\b/.test(t))
+    return `Joining is simple! Share your **dates** and **group size**, and we’ll lock it in.\n\n• WhatsApp: ${WHATSAPP_LINK}\n• Website: ${SITE_URL}`;
+
+  if (/\b(detail|details|info|information)\b/.test(t))
+    return CAMPAIGNS[campKey].longMsg;
+
   return null;
 }
 
 function respondForCampaign(campaignKey, userText = '') {
-  const t = normalize(userText || '');
   if (!campaignKey) return null;
-
-  if (isPricingIntent(userText) || /\bcharges?\b/i.test(userText)) {
-    return CAMPAIGNS[campaignKey].priceReply;
-  }
-  if (/\bjoin\b|\bhow\s+to\s+join\b|\bbook\b|\breserv/i.test(t)) {
-    return `Joining us is simple! Share your preferred dates and group size and we’ll lock it in.\n\n• WhatsApp: ${WHATSAPP_LINK}\n• Website: ${SITE_URL}`;
-  }
-  if (/\b(detail|info|information|what’s included|include|samjha|tafseel)/i.test(userText)) {
-    return CAMPAIGNS[campaignKey].longMsg;
-  }
-  return null; // fall through to general handlers
+  const specific = campaignFollowupAnswer(campaignKey, userText);
+  if (specific) return specific;
+  return CAMPAIGNS[campaignKey].longMsg;
 }
 
 /* =========================
-   VOICE STT
-   ========================= */
-async function sttTranscribeUrl(remoteUrl) {
-  if (!ENABLE_VOICE_STT) return null;
-  if (!process.env.OPENAI_API_KEY) return null;
-  if (!OpenAI) OpenAI = require('openai');
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-  try {
-    const headers = {
-      Referer: 'https://www.instagram.com/',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      Accept: '*/*',
-      'Accept-Language': 'en-US,en;q=0.9'
-    };
-    const resp = await axios.get(remoteUrl, { responseType: 'arraybuffer', timeout: 25000, headers });
-    const buf = Buffer.from(resp.data);
-    if (!buf?.length) return null;
-    if (buf.length > MAX_AUDIO_MB * 1024 * 1024) return 'Audio too large to transcribe. Please send a shorter note.';
-
-    const temp = `/tmp/ig_audio_${Date.now()}_${Math.random().toString(36).slice(2)}.ogg`;
-    fs.writeFileSync(temp, buf);
-
-    // Prefer 4o-mini-transcribe; fallback to whisper-1
-    let text = '';
-    try {
-      const r = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(temp),
-        model: STT_MODEL || 'gpt-4o-mini-transcribe'
-      });
-      text = r?.text || '';
-    } catch {
-      const r2 = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(temp),
-        model: 'whisper-1'
-      });
-      text = r2?.text || '';
-    }
-    try { fs.unlinkSync(temp); } catch {}
-    return (text || '').trim();
-  } catch (e) {
-    console.error('STT error', e?.response?.data || e.message);
-    return null;
-  }
-}
-
-/* =========================
-   DM HANDLER
-   ========================= */
-async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareUrls: [], shareThumb: null, isShare: false, brandHint: false, captions: '', assetId: null }) {
-  if (!AUTO_REPLY_ENABLED) return;
-
-  // 0) If we have an active campaign context, try to answer campaign-specific asks first (esp. pricing)
-  const state = sessionState.get(psid) || {};
-  const activeCampaign = state.campaign?.key || null;
-  if (activeCampaign) {
-    const tailored = respondForCampaign(activeCampaign, text || '');
-    if (tailored) return sendBatched(psid, tailored);
-  }
-
-  // If text contains an instagram permalink, collect it too
-  const textUrls = extractPostUrls(text || '');
-  const combinedUrls = [...new Set([...(ctx.shareUrls || []), ...textUrls])];
-
-  // Quick branches kept local (no history roundtrip)
-  const intents = intentFromText(text || '');
-  if (intents.wantsContact) return sendBatched(psid, `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
-  if (intents.wantsLocation) return sendBatched(psid, `*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
-
-  // Route/distance helper
-  if (intents.wantsRoute || intents.wantsDistance) {
-    const msg = await dmRouteMessage(text);
-    return sendBatched(psid, msg);
-  }
-
-  // 1) Brand-owned via asset_id
-  if (ctx.assetId) {
-    const lookup = await igLookupPostByAssetId(ctx.assetId);
-    if (lookup && lookup.isBrand && lookup.post) {
-      const meta = lookup.post;
-      const thumbRemote = meta.thumbnail_url || ctx.shareThumb || null;
-      const thumb = thumbRemote ? toVisionableUrl(thumbRemote, ctx.req) : imageUrl;
-      const imgForVision = SEND_IMAGE_FOR_IG_SHARES ? thumb : null;
-
-      if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
-
-      // Campaign override?
-      const campaignKey = detectCampaign(meta.caption || ctx.captions || '', meta.permalink || '');
-      if (campaignKey) {
-        sessionState.set(psid, { campaign: { key: campaignKey, permalink: meta.permalink || '', caption: meta.caption || ctx.captions || '' } });
-        return sendBatched(psid, CAMPAIGNS[campaignKey].longMsg);
-      }
-
-      if (!isPricingIntent(text || '')) {
-        const reply = formatOfferSummary(meta.caption || ctx.captions || '', meta.permalink || '');
-        sessionState.set(psid, { campaign: null }); // clear campaign if not the 9000 post
-        return sendBatched(psid, reply);
-      }
-
-      // Pricing asked → brain
-      const postNote = [
-        'postMeta:',
-        `source: ig`,
-        `author_name: Roameo Resorts`,
-        `author_url: https://www.instagram.com/${BRAND_USERNAME}/`,
-        `permalink: ${meta.permalink || ''}`,
-        `caption: ${meta.caption || ''}`
-      ].join('\n');
-
-      const history = chatHistory.get(psid) || [];
-      const surface = 'dm';
-      const response = await askBrain({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface, history });
-      const { message } = response;
-      const newHistory = [...history, constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface }), { role: 'assistant', content: message }].slice(-20);
-      chatHistory.set(psid, newHistory);
-      return sendBatched(psid, message);
-    }
-  }
-
-  // 2) Brand via oEmbed URL
-  if (combinedUrls.length) {
-    for (const url of combinedUrls) {
-      const meta = await fetchOEmbed(url);
-      if (meta && isFromBrand(meta)) {
-        const caption = (meta.title || '').trim();
-        const thumbRemote = meta.thumbnail_url || ctx.shareThumb || null;
-        const thumb = thumbRemote ? toVisionableUrl(thumbRemote, ctx.req) : imageUrl;
-        const imgForVision = SEND_IMAGE_FOR_IG_SHARES ? thumb : null;
-
-        if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
-
-        const campaignKey = detectCampaign(caption, url);
-        if (campaignKey) {
-          sessionState.set(psid, { campaign: { key: campaignKey, permalink: url, caption } });
-          return sendBatched(psid, CAMPAIGNS[campaignKey].longMsg);
-        }
-
-        if (!isPricingIntent(text || '')) {
-          const reply = formatOfferSummary(caption, url);
-          sessionState.set(psid, { campaign: null });
-          return sendBatched(psid, reply);
-        }
-
-        const postNote = [
-          'postMeta:',
-          `source: ig`,
-          `author_name: ${meta.author_name || 'Roameo Resorts'}`,
-          `author_url: ${meta.author_url || `https://www.instagram.com/${BRAND_USERNAME}/`}`,
-          `permalink: ${url}`,
-          `caption: ${caption}`
-        ].join('\n');
-
-        const history = chatHistory.get(psid) || [];
-        const surface = 'dm';
-        const response = await askBrain({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface, history });
-        const { message } = response;
-        const newHistory = [...history, constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface }), { role: 'assistant', content: message }].slice(-20);
-        chatHistory.set(psid, newHistory);
-        return sendBatched(psid, message);
-      }
-    }
-
-    // Not our post
-    const lang = detectLanguage(text || '');
-    const reply = lang === 'ur'
-      ? 'آپ نے جو پوسٹ شیئر کی ہے وہ ہماری نہیں لگتی۔ براہِ کرم اس کا اسکرین شاٹ بھیج دیں تاکہ رہنمائی کر سکیں۔'
-      : lang === 'roman-ur'
-        ? 'Jo post share ki hai wo hamari nahi lagti. Behtar rehnumai ke liye uska screenshot send karein.'
-        : 'It looks like the shared post isn’t from our page. Please send a screenshot and I’ll help with details.';
-    return sendBatched(psid, `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`);
-  }
-
-  // 3) Everything else → brain (with history)
-  const history = chatHistory.get(psid) || [];
-  const surface = 'dm';
-  const response = await askBrain({ text, imageUrl, surface, history });
-  const { message } = response;
-  const newHistory = [...history, constructUserMessage({ text, imageUrl, surface }), { role: 'assistant', content: message }].slice(-20);
-  chatHistory.set(psid, newHistory);
-  return sendBatched(psid, message);
-}
-
-/* =========================
-   FB DM + IG DM / COMMENTS
-   ========================= */
-async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null }) {
-  if (event.delivery || event.read || event.message?.is_echo) return;
-
-  if (event.message && event.sender?.id) {
-    if (ctx.source === 'standby' && !ALLOW_REPLY_IN_STANDBY) return;
-    if (ctx.source === 'standby' && AUTO_TAKE_THREAD_CONTROL) await takeThreadControl(event.sender.id).catch(() => {});
-
-    if (IG_DEBUG_LOG && event.message?.attachments) {
-      console.log('[FB DM attachments]', JSON.stringify(event.message.attachments, null, 2));
-    }
-
-    let text = event.message.text || '';
-
-    // voice/audio on Facebook Messenger (rare for your flow, but supported)
-    const audioUrl = event.message.attachments?.find(a => a.type === 'audio')?.payload?.url || null;
-    if (!text && audioUrl) {
-      const transcript = await sttTranscribeUrl(audioUrl);
-      if (transcript) text = transcript;
-    }
-
-    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
-
-    const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
-    if (!text && !imageUrl && !(isShare || shareUrls.length || assetId)) return;
-
-    return handleTextMessage(event.sender.id, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions, assetId });
-  }
-
-  if (event.postback?.payload && event.sender?.id) {
-    return handleTextMessage(event.sender.id, 'help', null, { req: ctx.req });
-  }
-}
-
-async function replyToFacebookComment(commentId, message) {
-  const url = `https://graph.facebook.com/v19.0/${commentId}/comments`;
-  await axios.post(url, { message: message.slice(0, MAX_OUT_CHAR) }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
-}
-function isSelfComment(v = {}, platform = 'facebook') {
-  const from = v.from || {};
-  if (platform === 'instagram') return from.username && from.username.toLowerCase() === BRAND_USERNAME;
-  return (from.name || '').toLowerCase().includes('roameo');
-}
-async function routePageChange(change) {
-  if (change.field !== 'feed') return;
-  const v = change.value || {};
-  if (v.item === 'comment' && v.comment_id) {
-    const text = (v.message || '').trim();
-    if (v.verb && v.verb !== 'add') return;
-    if (isSelfComment(v, 'facebook')) return;
-
-    if (AUTO_REPLY_ENABLED) {
-      const dm = await askBrain({ text, surface: 'comment' });
-      await replyToFacebookComment(v.comment_id, stripPricesFromPublic(dm.message));
-    }
-  }
-}
-
-async function routeInstagramMessage(event, ctx = { req: null }) {
-  if (event.delivery || event.read || event.message?.is_echo) return;
-
-  if (event.message && event.sender?.id) {
-    const igUserId = event.sender.id;
-
-    if (IG_DEBUG_LOG && event.message?.attachments) {
-      console.log('[IG DM attachments]', JSON.stringify(event.message.attachments, null, 2));
-    }
-
-    // 1) Text or voice
-    let text = event.message.text || '';
-
-    // Voice-note STT (for IG)
-    const voiceUrl = event.message.attachments?.find(a => a.type === 'audio')?.payload?.url || null;
-    if (!text && voiceUrl) {
-      const transcript = await sttTranscribeUrl(voiceUrl);
-      if (transcript) text = transcript;
-    }
-
-    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
-
-    const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
-
-    // Do not drop — acknowledge shares too
-    if (!text && !imageUrl && !(isShare || shareUrls.length || assetId)) return;
-
-    return handleTextMessage(igUserId, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions, assetId });
-  }
-}
-
-async function replyToInstagramComment(commentId, message) {
-  const url = `https://graph.facebook.com/v19.0/${commentId}/replies`;
-  await axios.post(url, { message: message.slice(0, MAX_OUT_CHAR) }, { params: { access_token: IG_MANAGE_TOKEN }, timeout: 10000 });
-}
-async function routeInstagramChange(change, pageId, ctx = { req: null }) {
-  const v = change.value || {};
-  const isComment = (change.field || '').toLowerCase().includes('comment') || (v.item === 'comment');
-  if (isComment && (v.comment_id || v.id)) {
-    const commentId = v.comment_id || v.id;
-    const text = (v.text || v.message || '').trim();
-    if (v.verb && v.verb !== 'add') return;
-    if (isSelfComment(v, 'instagram')) return;
-
-    if (AUTO_REPLY_ENABLED) {
-      const dm = await askBrain({ text, surface: 'comment' });
-      await replyToInstagramComment(commentId, stripPricesFromPublic(dm.message));
-    }
-  }
-}
-
-/* =========================
-   Attachment extractor
-   ========================= */
-function extractSharedPostDataFromAttachments(event) {
-  const atts = event?.message?.attachments || [];
-  const urls = new Set();
-  let thumb = null;
-  let isShare = false;
-  let brandHint = false;
-  const captions = [];
-  let assetId = null;
-
-  function unwrapRedirect(u) {
-    try {
-      const url = new URL(u);
-      const host = url.hostname.toLowerCase();
-      if (host.endsWith('l.facebook.com') || host.endsWith('lm.facebook.com') || host.endsWith('l.instagram.com')) {
-        const real = url.searchParams.get('u') || url.searchParams.get('l');
-        if (real) return decodeURIComponent(real);
-      }
-      return u;
-    } catch { return u; }
-  }
-  const looksLikePostUrl = (u) => /(https?:\/\/(?:www\.)?instagram\.com\/(?:p|reel)\/[A-Za-z0-9_-]+)/i.test(u || '');
-
-  function collect(obj, parentType = '') {
-    if (!obj || typeof obj !== 'object') return;
-    for (const [k, v] of Object.entries(obj)) {
-      if (typeof v === 'string') {
-        const s = v.trim();
-        if (!s) continue;
-        if (/^https?:\/\//i.test(s)) {
-          const u = unwrapRedirect(s);
-          try {
-            const uo = new URL(u);
-            const host = uo.hostname.toLowerCase();
-            // IMPORTANT: only derive asset_id for images/shares, NOT for audio/video
-            if ((parentType === 'image' || parentType === 'share' || parentType === 'fallback') &&
-                host.includes('lookaside.fbsbx.com') && uo.pathname.includes('/ig_messaging_cdn/')) {
-              if (!thumb) thumb = u;
-              const aid = uo.searchParams.get('asset_id');
-              if (aid) assetId = aid;
-            }
-          } catch {}
-          if (looksLikePostUrl(u)) urls.add(u);
-        }
-        if (['title','name','label','caption','description','subtitle','author','byline','text'].includes(k) && s) {
-          captions.push(s);
-          const low = s.toLowerCase();
-          if (low.includes(BRAND_USERNAME) || low.includes(BRAND_PAGE_NAME)) brandHint = true;
-        }
-        if (!thumb && ['image_url','thumbnail_url','preview_url','picture','media_url','image'].includes(k) && /^https?:\/\//i.test(s)) {
-          if (parentType === 'image' || parentType === 'share' || parentType === 'fallback') {
-            thumb = s;
-          }
-        }
-      } else if (typeof v === 'object') {
-        collect(v, parentType);
-      }
-    }
-  }
-
-  for (const a of atts) {
-    const parentType = a?.type || '';
-    if (parentType && parentType !== 'image') isShare = true;
-
-    if (a?.url && /^https?:\/\//i.test(a.url)) {
-      const u = unwrapRedirect(a.url);
-      try {
-        const uo = new URL(u);
-        const host = uo.hostname.toLowerCase();
-        if ((parentType === 'image' || parentType === 'share' || parentType === 'fallback') &&
-            host.includes('lookaside.fbsbx.com') && uo.pathname.includes('/ig_messaging_cdn/')) {
-          if (!thumb) thumb = u;
-          const aid = uo.searchParams.get('asset_id');
-          if (aid) assetId = aid;
-        }
-      } catch {}
-      if (looksLikePostUrl(u)) urls.add(u);
-    }
-    if (a?.payload) collect(a.payload, parentType);
-  }
-
-  return { urls: [...urls], thumb, isShare, brandHint, captions: captions.filter(Boolean).join(' • '), assetId };
-}
-
-/* =========================
-   ROUTING WEBHOOK
-   ========================= */
-app.post('/webhook', async (req, res) => {
-  if (!verifySignature(req)) return res.sendStatus(403);
-  res.sendStatus(200);
-
-  const body = req.body || {};
-  try {
-    if (body.object === 'page') {
-      for (const entry of (body.entry || [])) {
-        const key = `page:${entry.id}:${entry.time || Date.now()}`;
-        if (dedupe.has(key)) continue; dedupe.set(key, true);
-
-        if (Array.isArray(entry.messaging)) {
-          for (const ev of entry.messaging) await routeMessengerEvent(ev, { source: 'messaging', req }).catch(logErr);
-        }
-        if (Array.isArray(entry.changes)) {
-          for (const change of entry.changes) await routePageChange(change, { req }).catch(logErr);
-        }
-        if (Array.isArray(entry.standby)) {
-          for (const ev of entry.standby) {
-            if (!ALLOW_REPLY_IN_STANDBY) continue;
-            if (AUTO_TAKE_THREAD_CONTROL && ev.sender?.id) await takeThreadControl(ev.sender.id).catch(()=>{});
-            await routeMessengerEvent(ev, { source: 'standby', req }).catch(logErr);
-          }
-        }
-      }
-      return;
-    }
-
-    if (body.object === 'instagram') {
-      for (const entry of (body.entry || [])) {
-        const pageId = entry.id;
-        const key = `ig:${entry.id}:${entry.time || Date.now()}`;
-        if (dedupe.has(key)) continue; dedupe.set(key, true);
-
-        if (Array.isArray(entry.messaging)) {
-          for (const ev of entry.messaging) await routeInstagramMessage(ev, { req }).catch(logErr);
-        }
-        if (Array.isArray(entry.changes)) {
-          for (const change of entry.changes) await routeInstagramChange(change, pageId, { req }).catch(logErr);
-        }
-      }
-      return;
-    }
-  } catch (e) { logErr(e); }
-});
-
-function logErr(err) {
-  const payload = err?.response?.data || err.message || err;
-  if (payload?.error) console.error('FB/IG API error', payload);
-  else console.error('💥 Handler error:', payload);
-}
-
-/* =========================
-   HANDOVER & ADMIN
-   ========================= */
-async function takeThreadControl(psid) {
-  const url = `https://graph.facebook.com/v19.0/me/take_thread_control`;
-  const params = { access_token: PAGE_ACCESS_TOKEN };
-  try { await axios.post(url, { recipient: { id: psid } }, { params, timeout: 10000 }); }
-  catch (e) { console.error('take_thread_control error:', e?.response?.data || e.message); }
-}
-
-function requireAdmin(req, res, next) {
-  const hdr = req.headers.authorization || '';
-  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
-  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) return res.status(401).json({ error: 'unauthorized' });
-  next();
-}
-
-app.post('/admin/subscribe', requireAdmin, async (_req, res) => {
-  const subscribed_fields = ['messages','messaging_postbacks','messaging_optins','message_deliveries','message_reads','feed'];
-  try {
-    const url = `https://graph.facebook.com/v19.0/me/subscribed_apps`;
-    const params = { access_token: PAGE_ACCESS_TOKEN };
-    const { data } = await axios.post(url, { subscribed_fields }, { params, timeout: 10000 });
-    res.json({ ok: true, data, subscribed_fields });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e?.response?.data || e.message });
-  }
-});
-app.get('/admin/status', requireAdmin, async (_req, res) => {
-  try {
-    const url = `https://graph.facebook.com/v19.0/me/subscribed_apps`;
-    const params = { access_token: PAGE_ACCESS_TOKEN, fields: 'subscribed_fields' };
-    const { data } = await axios.get(url, { params, timeout: 10000 });
-    res.json({
-      ok: true,
-      subscribed_apps: data,
-      env: { IG_USER_ID, RESORT_COORDS, LINKS: { maps: MAPS_LINK, site: SITE_URL, whatsapp: WHATSAPP_LINK }, voice_stt: ENABLE_VOICE_STT }
-    });
-  } catch (e) { res.status(500).json({ ok: false, error: e?.response?.data || e.message }); }
-});
-
-/* =========================
-   START
-   ========================= */
-app.listen(PORT, () => console.log(`🚀 Listening on :${PORT}`));
-
-/* =========================
-   ROUTE MESSAGE HELPERS
+   DM/Comment HELPERS (routes, etc.)
    ========================= */
 function extractOrigin(text='') {
   const t = text.trim();
@@ -1199,3 +725,492 @@ async function dmRouteMessage(userText = '') {
 
   return sanitizeVoice(`${response}${additionalInfo}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
 }
+
+/* =========================
+   STT (voice-note transcription)
+   ========================= */
+async function transcribeAudioFromCdnUrl(url) {
+  if (!ENABLE_VOICE_STT || !OPENAI_API_KEY || !url) return null;
+  try {
+    const headers = {
+      Referer: 'https://www.instagram.com/',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      Accept: '*/*'
+    };
+    const audioResp = await axios.get(url, { responseType: 'arraybuffer', timeout: 20000, headers });
+    const buf = Buffer.from(audioResp.data);
+
+    const fd = new FormData();
+    fd.append('model', STT_MODEL || 'gpt-4o-mini-transcribe');
+    fd.append('file', buf, { filename: 'voice.m4a', contentType: 'audio/m4a' });
+
+    // prefer /v1/audio/transcriptions (new) — supports 4o-mini-transcribe, falls back to whisper-1
+    let sttResp;
+    try {
+      sttResp = await axios.post('https://api.openai.com/v1/audio/transcriptions', fd, {
+        headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd.getHeaders() },
+        timeout: 30000
+      });
+    } catch (e) {
+      // fallback whisper-1 if needed
+      const fd2 = new FormData();
+      fd2.append('model', 'whisper-1');
+      fd2.append('file', buf, { filename: 'voice.m4a', contentType: 'audio/m4a' });
+      sttResp = await axios.post('https://api.openai.com/v1/audio/transcriptions', fd2, {
+        headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd2.getHeaders() },
+        timeout: 30000
+      });
+    }
+    const text = (sttResp?.data?.text || '').trim();
+    return text || null;
+  } catch (e) {
+    console.error('STT error', e?.response?.data || e.message);
+    return null;
+  }
+}
+
+function extractAudioUrlsFromAttachments(event) {
+  const atts = event?.message?.attachments || [];
+  const urls = [];
+  for (const a of atts) {
+    if (a?.type === 'audio' && a?.payload?.url) urls.push(a.payload.url);
+  }
+  return urls;
+}
+
+/* =========================
+   DM HANDLER
+   ========================= */
+async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareUrls: [], shareThumb: null, isShare: false, brandHint: false, captions: '', assetId: null }) {
+  if (!AUTO_REPLY_ENABLED) return;
+
+  // --- Campaign stickiness & text activation ---
+  let state = sessionState.get(psid) || {};
+  let activeCampaign = state.campaign?.key || null;
+
+  if (!activeCampaign) {
+    const inferred = maybeCampaignFromText(text || '');
+    if (inferred) {
+      state = { campaign: { key: inferred } };
+      sessionState.set(psid, state);
+      activeCampaign = inferred;
+    }
+  }
+
+  if (activeCampaign) {
+    const tailored = respondForCampaign(activeCampaign, text || '');
+    if (tailored) return sendBatched(psid, tailored);
+  }
+  // --------------------------------------------
+
+  const textUrls = extractPostUrls(text || '');
+  const combinedUrls = [...new Set([...(ctx.shareUrls || []), ...textUrls])];
+
+  const intents = intentFromText(text || '');
+  if (intents.wantsContact) return sendBatched(psid, `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+  if (intents.wantsLocation) return sendBatched(psid, `*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+
+  if (intents.wantsRoute || intents.wantsDistance) {
+    const msg = await dmRouteMessage(text);
+    return sendBatched(psid, msg);
+  }
+
+  // 1) Brand-owned via asset_id
+  if (ctx.assetId) {
+    const lookup = await igLookupPostByAssetId(ctx.assetId);
+    if (lookup && lookup.isBrand && lookup.post) {
+      const meta = lookup.post;
+      const thumbRemote = meta.thumbnail_url || ctx.shareThumb || null;
+      const thumb = thumbRemote ? toVisionableUrl(thumbRemote, ctx.req) : imageUrl;
+      const imgForVision = SEND_IMAGE_FOR_IG_SHARES ? thumb : null;
+
+      if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
+
+      // SPECIAL: If it's the 9000 campaign, reply with custom message and set session
+      if (detectStaycation9000FromCaption(meta.caption || ctx.captions || '')) {
+        sessionState.set(psid, { campaign: { key: 'staycation9000' } });
+        if (!isPricingIntent(text || '')) {
+          return sendBatched(psid, CAMPAIGNS.staycation9000.longMsg);
+        }
+        return sendBatched(psid, CAMPAIGNS.staycation9000.priceReply);
+      }
+
+      // If user didn't ask "rates", send structured caption summary (NOT the nightly rate card)
+      if (!isPricingIntent(text || '')) {
+        const reply = formatOfferSummary(meta.caption || ctx.captions || '', meta.permalink || '');
+        return sendBatched(psid, reply);
+      }
+
+      // Pricing asked → brain
+      const postNote = [
+        'postMeta:',
+        `source: ig`,
+        `author_name: Roameo Resorts`,
+        `author_url: https://www.instagram.com/${BRAND_USERNAME}/`,
+        `permalink: ${meta.permalink || ''}`,
+        `caption: ${meta.caption || ''}`
+      ].join('\n');
+
+      const history = chatHistory.get(psid) || [];
+      const surface = 'dm';
+      const response = await askBrain({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface, history });
+      const { message } = response;
+      const newHistory = [...history, constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface }), { role: 'assistant', content: message }].slice(-20);
+      chatHistory.set(psid, newHistory);
+      return sendBatched(psid, message);
+    }
+  }
+
+  // 2) Brand via oEmbed URL
+  if (combinedUrls.length) {
+    for (const url of combinedUrls) {
+      const meta = await fetchOEmbed(url);
+      if (meta && isFromBrand(meta)) {
+        const caption = (meta.title || '').trim();
+        const thumbRemote = meta.thumbnail_url || ctx.shareThumb || null;
+        const thumb = thumbRemote ? toVisionableUrl(thumbRemote, ctx.req) : imageUrl;
+        const imgForVision = SEND_IMAGE_FOR_IG_SHARES ? thumb : null;
+
+        if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
+
+        // SPECIAL: 9000 campaign message
+        if (detectStaycation9000FromCaption(caption)) {
+          sessionState.set(psid, { campaign: { key: 'staycation9000' } });
+          if (!isPricingIntent(text || '')) {
+            return sendBatched(psid, CAMPAIGNS.staycation9000.longMsg);
+          }
+          return sendBatched(psid, CAMPAIGNS.staycation9000.priceReply);
+        }
+
+        if (!isPricingIntent(text || '')) {
+          const reply = formatOfferSummary(caption, url);
+          return sendBatched(psid, reply);
+        }
+
+        const postNote = [
+          'postMeta:',
+          `source: ig`,
+          `author_name: ${meta.author_name || 'Roameo Resorts'}`,
+          `author_url: ${meta.author_url || `https://www.instagram.com/${BRAND_USERNAME}/`}`,
+          `permalink: ${url}`,
+          `caption: ${caption}`
+        ].join('\n');
+
+        const history = chatHistory.get(psid) || [];
+        const surface = 'dm';
+        const response = await askBrain({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface, history });
+        const { message } = response;
+        const newHistory = [...history, constructUserMessage({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface }), { role: 'assistant', content: message }].slice(-20);
+        chatHistory.set(psid, newHistory);
+        return sendBatched(psid, message);
+      }
+    }
+
+    // Not our post
+    const lang = detectLanguage(text || '');
+    const reply = lang === 'ur'
+      ? 'آپ نے جو پوسٹ شیئر کی ہے وہ ہماری نہیں لگتی۔ براہِ کرم اس کا اسکرین شاٹ بھیج دیں تاکہ رہنمائی کر سکیں۔'
+      : lang === 'roman-ur'
+        ? 'Jo post share ki hai wo hamari nahi lagti. Behtar rehnumai ke liye uska screenshot send karein.'
+        : 'It looks like the shared post isn’t from our page. Please send a screenshot and I’ll help with details.';
+    return sendBatched(psid, `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`);
+  }
+
+  // 3) Everything else → brain (with history)
+  const history = chatHistory.get(psid) || [];
+  const surface = 'dm';
+  const response = await askBrain({ text, imageUrl, surface, history });
+  const { message } = response;
+  const newHistory = [...history, constructUserMessage({ text, imageUrl, surface }), { role: 'assistant', content: message }].slice(-20);
+  chatHistory.set(psid, newHistory);
+  return sendBatched(psid, message);
+}
+
+/* =========================
+   FB DM + IG DM / COMMENTS
+   ========================= */
+async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null }) {
+  if (event.delivery || event.read || event.message?.is_echo) return;
+
+  if (event.message && event.sender?.id) {
+    if (ctx.source === 'standby' && !ALLOW_REPLY_IN_STANDBY) return;
+    if (ctx.source === 'standby' && AUTO_TAKE_THREAD_CONTROL) await takeThreadControl(event.sender.id).catch(() => {});
+
+    if (IG_DEBUG_LOG && event.message?.attachments) {
+      console.log('[FB DM attachments]', JSON.stringify(event.message.attachments, null, 2));
+    }
+
+    let text = event.message.text || '';
+    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
+
+    // voice notes (FB Messenger)
+    const audioUrls = extractAudioUrlsFromAttachments(event);
+    if (!text && audioUrls.length) {
+      const stt = await transcribeAudioFromCdnUrl(audioUrls[0]).catch(()=>null);
+      if (stt) text = stt;
+    }
+
+    const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
+    if (!text && !imageUrl && !(isShare || shareUrls.length || assetId)) return;
+
+    return handleTextMessage(event.sender.id, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions, assetId });
+  }
+
+  if (event.postback?.payload && event.sender?.id) {
+    return handleTextMessage(event.sender.id, 'help', null, { req: ctx.req });
+  }
+}
+
+async function replyToFacebookComment(commentId, message) {
+  const url = `https://graph.facebook.com/v19.0/${commentId}/comments`;
+  await axios.post(url, { message: message.slice(0, MAX_OUT_CHAR) }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
+}
+function isSelfComment(v = {}, platform = 'facebook') {
+  const from = v.from || {};
+  if (platform === 'instagram') return from.username && from.username.toLowerCase() === BRAND_USERNAME;
+  return (from.name || '').toLowerCase().includes('roameo');
+}
+async function routePageChange(change) {
+  if (change.field !== 'feed') return;
+  const v = change.value || {};
+  if (v.item === 'comment' && v.comment_id) {
+    const text = (v.message || '').trim();
+    if (v.verb && v.verb !== 'add') return;
+    if (isSelfComment(v, 'facebook')) return;
+
+    if (AUTO_REPLY_ENABLED) {
+      const dm = await askBrain({ text, surface: 'comment' });
+      await replyToFacebookComment(v.comment_id, stripPricesFromPublic(dm.message));
+    }
+  }
+}
+
+async function routeInstagramMessage(event, ctx = { req: null }) {
+  if (event.delivery || event.read || event.message?.is_echo) return;
+
+  if (event.message && event.sender?.id) {
+    const igUserId = event.sender.id;
+
+    if (IG_DEBUG_LOG && event.message?.attachments) {
+      console.log('[IG DM attachments]', JSON.stringify(event.message.attachments, null, 2));
+    }
+
+    let text = event.message.text || '';
+    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
+
+    // voice notes (Instagram)
+    const audioUrls = extractAudioUrlsFromAttachments(event);
+    if (!text && audioUrls.length) {
+      const stt = await transcribeAudioFromCdnUrl(audioUrls[0]).catch(()=>null);
+      if (stt) text = stt;
+    }
+
+    const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
+
+    if (!text && !imageUrl && !(isShare || shareUrls.length || assetId)) return;
+
+    return handleTextMessage(igUserId, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions, assetId });
+  }
+}
+
+async function replyToInstagramComment(commentId, message) {
+  const url = `https://graph.facebook.com/v19.0/${commentId}/replies`;
+  await axios.post(url, { message: message.slice(0, MAX_OUT_CHAR) }, { params: { access_token: IG_MANAGE_TOKEN }, timeout: 10000 });
+}
+async function routeInstagramChange(change, pageId, ctx = { req: null }) {
+  const v = change.value || {};
+  const isComment = (change.field || '').toLowerCase().includes('comment') || (v.item === 'comment');
+  if (isComment && (v.comment_id || v.id)) {
+    const commentId = v.comment_id || v.id;
+    const text = (v.text || v.message || '').trim();
+    if (v.verb && v.verb !== 'add') return;
+    if (isSelfComment(v, 'instagram')) return;
+
+    if (AUTO_REPLY_ENABLED) {
+      const dm = await askBrain({ text, surface: 'comment' });
+      await replyToInstagramComment(commentId, stripPricesFromPublic(dm.message));
+    }
+  }
+}
+
+/* =========================
+   Attachment extractor
+   ========================= */
+function extractSharedPostDataFromAttachments(event) {
+  const atts = event?.message?.attachments || [];
+  const urls = new Set();
+  let thumb = null;
+  let isShare = false;
+  let brandHint = false;
+  const captions = [];
+  let assetId = null;
+
+  function unwrapRedirect(u) {
+    try {
+      const url = new URL(u);
+      const host = url.hostname.toLowerCase();
+      if (host.endsWith('l.facebook.com') || host.endsWith('lm.facebook.com') || host.endsWith('l.instagram.com')) {
+        const real = url.searchParams.get('u') || url.searchParams.get('l');
+        if (real) return decodeURIComponent(real);
+      }
+      return u;
+    } catch { return u; }
+  }
+  const looksLikePostUrl = (u) => /(https?:\/\/(?:www\.)?instagram\.com\/(?:p|reel)\/[A-Za-z0-9_-]+)/i.test(u || '');
+
+  function collect(obj) {
+    if (!obj || typeof obj !== 'object') return;
+    for (const [k, v] of Object.entries(obj)) {
+      if (typeof v === 'string') {
+        const s = v.trim();
+        if (!s) continue;
+        if (/^https?:\/\//i.test(s)) {
+          const u = unwrapRedirect(s);
+          try {
+            const uo = new URL(u);
+            const host = uo.hostname.toLowerCase();
+            if (host.includes('lookaside.fbsbx.com') && uo.pathname.includes('/ig_messaging_cdn/')) {
+              if (!thumb) thumb = u;
+              const aid = uo.searchParams.get('asset_id');
+              if (aid) assetId = aid;
+            }
+          } catch {}
+          if (looksLikePostUrl(u)) urls.add(u);
+        }
+        if (['title','name','label','caption','description','subtitle','author','byline','text'].includes(k) && s) {
+          captions.push(s);
+          const low = s.toLowerCase();
+          if (low.includes(BRAND_USERNAME) || low.includes(BRAND_PAGE_NAME)) brandHint = true;
+        }
+        if (!thumb && ['image_url','thumbnail_url','preview_url','picture','media_url','image'].includes(k) && /^https?:\/\//i.test(s)) {
+          thumb = s;
+        }
+      } else if (typeof v === 'object') {
+        collect(v);
+      }
+    }
+  }
+
+  for (const a of atts) {
+    if (a?.type && a.type !== 'image') isShare = true;
+
+    if (a?.url && /^https?:\/\//i.test(a.url)) {
+      const u = unwrapRedirect(a.url);
+      try {
+        const uo = new URL(u);
+        const host = uo.hostname.toLowerCase();
+        if (host.includes('lookaside.fbsbx.com') && uo.pathname.includes('/ig_messaging_cdn/')) {
+          if (!thumb) thumb = u;
+          const aid = uo.searchParams.get('asset_id');
+          if (aid) assetId = aid;
+        }
+      } catch {}
+      if (looksLikePostUrl(u)) urls.add(u);
+    }
+    if (a?.payload) collect(a.payload);
+  }
+
+  return { urls: [...urls], thumb, isShare, brandHint, captions: captions.filter(Boolean).join(' • '), assetId };
+}
+
+/* =========================
+   ROUTING WEBHOOK
+   ========================= */
+app.post('/webhook', async (req, res) => {
+  if (!verifySignature(req)) return res.sendStatus(403);
+  res.sendStatus(200);
+
+  const body = req.body || {};
+  try {
+    if (body.object === 'page') {
+      for (const entry of (body.entry || [])) {
+        const key = `page:${entry.id}:${entry.time || Date.now()}`;
+        if (dedupe.has(key)) continue; dedupe.set(key, true);
+
+        if (Array.isArray(entry.messaging)) {
+          for (const ev of entry.messaging) await routeMessengerEvent(ev, { source: 'messaging', req }).catch(logErr);
+        }
+        if (Array.isArray(entry.changes)) {
+          for (const change of entry.changes) await routePageChange(change, { req }).catch(logErr);
+        }
+        if (Array.isArray(entry.standby)) {
+          for (const ev of entry.standby) {
+            if (!ALLOW_REPLY_IN_STANDBY) continue;
+            if (AUTO_TAKE_THREAD_CONTROL && ev.sender?.id) await takeThreadControl(ev.sender.id).catch(()=>{});
+            await routeMessengerEvent(ev, { source: 'standby', req }).catch(logErr);
+          }
+        }
+      }
+      return;
+    }
+
+    if (body.object === 'instagram') {
+      for (const entry of (body.entry || [])) {
+        const pageId = entry.id;
+        const key = `ig:${entry.id}:${entry.time || Date.now()}`;
+        if (dedupe.has(key)) continue; dedupe.set(key, true);
+
+        if (Array.isArray(entry.messaging)) {
+          for (const ev of entry.messaging) await routeInstagramMessage(ev, { req }).catch(logErr);
+        }
+        if (Array.isArray(entry.changes)) {
+          for (const change of entry.changes) await routeInstagramChange(change, pageId, { req }).catch(logErr);
+        }
+      }
+      return;
+    }
+  } catch (e) { logErr(e); }
+});
+
+function logErr(err) {
+  const payload = err?.response?.data || err.message || err;
+  if (payload?.error) console.error('FB/IG API error', payload);
+  else console.error('💥 Handler error:', payload);
+}
+
+/* =========================
+   HANDOVER & ADMIN
+   ========================= */
+async function takeThreadControl(psid) {
+  const url = `https://graph.facebook.com/v19.0/me/take_thread_control`;
+  const params = { access_token: PAGE_ACCESS_TOKEN };
+  try { await axios.post(url, { recipient: { id: psid } }, { params, timeout: 10000 }); }
+  catch (e) { console.error('take_thread_control error:', e?.response?.data || e.message); }
+}
+
+function requireAdmin(req, res, next) {
+  const hdr = req.headers.authorization || '';
+  theToken = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
+  const token = theToken;
+  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) return res.status(401).json({ error: 'unauthorized' });
+  next();
+}
+
+app.post('/admin/subscribe', requireAdmin, async (_req, res) => {
+  const subscribed_fields = ['messages','messaging_postbacks','messaging_optins','message_deliveries','message_reads','feed'];
+  try {
+    const url = `https://graph.facebook.com/v19.0/me/subscribed_apps`;
+    const params = { access_token: PAGE_ACCESS_TOKEN };
+    const { data } = await axios.post(url, { subscribed_fields }, { params, timeout: 10000 });
+    res.json({ ok: true, data, subscribed_fields });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.response?.data || e.message });
+  }
+});
+app.get('/admin/status', requireAdmin, async (_req, res) => {
+  try {
+    const url = `https://graph.facebook.com/v19.0/me/subscribed_apps`;
+    const params = { access_token: PAGE_ACCESS_TOKEN, fields: 'subscribed_fields' };
+    const { data } = await axios.get(url, { params, timeout: 10000 });
+    res.json({
+      ok: true,
+      subscribed_apps: data,
+      env: { IG_USER_ID, RESORT_COORDS, LINKS: { maps: MAPS_LINK, site: SITE_URL, whatsapp: WHATSAPP_LINK } }
+    });
+  } catch (e) { res.status(500).json({ ok: false, error: e?.response?.data || e.message }); }
+});
+
+/* =========================
+   START
+   ========================= */
+app.listen(PORT, () => console.log(`🚀 Listening on :${PORT}`));
