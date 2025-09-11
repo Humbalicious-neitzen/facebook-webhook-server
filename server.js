@@ -1,4 +1,4 @@
-// server.js — Roameo Resorts omni-channel bot (v12 + campaign-from-text + sticky follow-ups + STT)
+// server.js — Roameo Resorts omni-channel bot (v12  |  9000-campaign + multi-intent + STT + nights quote)
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -52,17 +52,20 @@ const CHECKOUT_TIME = process.env.CHECKOUT_TIME || '12:00 pm';
 
 const MAX_OUT_CHAR = 800;
 
-/* === Optional STT (voice-note) === */
-const ENABLE_VOICE_STT = String(process.env.ENABLE_VOICE_STT || 'true').toLowerCase() === 'true';
-const STT_MODEL = process.env.STT_MODEL || 'gpt-4o-mini-transcribe'; // falls back to whisper-1 inside code
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+/* Voice / STT */
+const OPENAI_API_KEY      = process.env.OPENAI_API_KEY || '';
+const ENABLE_VOICE_STT    = String(process.env.ENABLE_VOICE_STT || 'true').toLowerCase() === 'true';
+const STT_MODEL           = process.env.STT_MODEL || 'gpt-4o-mini-transcribe'; // whisper-1 works too
+const MAX_AUDIO_MB        = Number(process.env.MAX_AUDIO_MB || 20);
 
-/* Guard logs */
 if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
   console.warn('⚠️ Missing required env vars: APP_SECRET, VERIFY_TOKEN, PAGE_ACCESS_TOKEN');
 }
 if (!IG_USER_ID) {
   console.warn('⚠️ IG_USER_ID not set — IG share recognition via asset_id will be disabled.');
+}
+if (ENABLE_VOICE_STT && !OPENAI_API_KEY) {
+  console.warn('⚠️ ENABLE_VOICE_STT is true but OPENAI_API_KEY is missing — voice notes will be ignored.');
 }
 
 /* =========================
@@ -82,12 +85,11 @@ const FACTS = {
    MIDDLEWARE & CACHES
    ========================= */
 app.use(bodyParser.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
-const dedupe      = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });
-const tinyCache   = new LRUCache({ max: 300,  ttl: 1000 * 60 * 15 });
-const chatHistory = new LRUCache({ max: 2000, ttl: 1000 * 60 * 60 * 24 * 30 });
-
-/* Session (sticky small flags per user, e.g., active campaign) */
-const sessionState = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 * 24 * 7 });
+const dedupe        = new LRUCache({ max: 5000, ttl: 1000 * 60 * 60 });
+const tinyCache     = new LRUCache({ max: 600,  ttl: 1000 * 60 * 15 });
+const chatHistory   = new LRUCache({ max: 2000, ttl: 1000 * 60 * 60 * 24 * 30 });
+const campaignState = new LRUCache({ max: 3000, ttl: 1000 * 60 * 60 * 24 * 7 });      // per-user sticky campaign
+const lastShareMeta = new LRUCache({ max: 3000, ttl: 1000 * 60 * 60 * 24 * 3 });      // remember last brand post seen
 
 /* =========================
    BASIC ROUTES
@@ -169,7 +171,7 @@ function detectLanguage(text = '') {
   const t = (text || '').trim();
   const hasUrduScript = /[\u0600-\u06FF\u0750-\u077F]/.test(t);
   if (hasUrduScript) return 'ur';
-  const romanUrduTokens = ['aap','ap','apka','apki','apke','kiraya','qeemat','rate','price','btao','batao','kitna','kitni','kitne','raha','hai','hain'];
+  const romanUrduTokens = ['aap','ap','apka','apki','apke','kiraya','qeemat','rate','price','btao','batao','kitna','kitni','kitne','raha','hai','hain','kahan','kidhar','map','location'];
   const hit = romanUrduTokens.some(w => new RegExp(`\\b${w}\\b`, 'i').test(t));
   return hit ? 'roman-ur' : 'en';
 }
@@ -181,15 +183,6 @@ function stripPricesFromPublic(text = '') {
     return !(hasCurrency || hasMoneyish);
   });
   return lines.join(' ');
-}
-function isPricingIntent(text = '') {
-  const t = normalize(text);
-  if (t.length <= 2) return false;
-  const kw = ['price','prices','pricing','rate','rates','tariff','cost','rent','rental','per night','night price','kiraya','qeemat','kimat','keemat','قیمت','کرایہ','ریٹ','نرخ','9k','9000','9 000'];
-  if (kw.some(x => t.includes(x))) return true;
-  if (/\b\d+\s*(night|nights|din|raat|days?)\b/.test(t)) return true;
-  if (/\bhow much\b/.test(t)) return true;
-  return false;
 }
 function splitToChunks(s, limit = MAX_OUT_CHAR) {
   const out = [];
@@ -399,21 +392,72 @@ async function getRouteInfo(originLat, originLon, destLat, destLon) {
 }
 
 /* =========================
-   INTENTS
+   INTENTS / DETECTORS
    ========================= */
 function intentFromText(text = '') {
   const t = normalize(text);
+
+  const wantsLocation =
+    /\b(location|where|address|map|pin|directions?|reach)\b/.test(t) ||
+    /کہاں|لوکیشن|پتہ|ایڈریس|نقشہ/.test(text); // Urdu
+
+  const wantsRates =
+    isPricingIntent(text);
+
+  const wantsFacilities =
+    /\bfaciliti(?:y|ies)\b|\bamenit(?:y|ies)\b|\bkitchen\b|\bfood\b|\bheater\b|\bbonfire\b|\bfamily\b|\bparking\b|\bjeep\b|\binverter\b/.test(t);
+
+  const wantsBooking =
+    /\bbook\b|\bbooking\b|\breserve\b|\breservation\b|\bcheck ?in\b|\bcheck ?out\b|\badvance\b|\bpayment\b/.test(t);
+
+  const wantsAvail =
+    /\bavailability\b|\bavailable\b|\bdates?\b|\bcalendar\b/.test(t);
+
+  const wantsDistance =
+    /\bdistance\b|\bhow far\b|\bhours\b|\bdrive\b|\btime from\b|\beta\b/.test(t);
+
+  const wantsWeather =
+    /\bweather\b|\btemperature\b|\bforecast\b/.test(t);
+
+  const wantsRoute =
+    /\broute\b|\brasta\b|\bhow\s+to\s+(?:reach|get|come)\b|\bfrom\s+\w+\s+(?:to|till|for)\b|\b(?:travel|journey)\s+time\b|\b(?:travel|journey)\s+from\b/.test(t);
+
+  const wantsContact =
+    /\bcontact\b|\bmanager\b|\bowner\b|\bnumber\b|\bwhats\s*app\b|\bwhatsapp\b|\bcall\b|\bspeak to\b|\braabta\b/.test(t);
+
+  // Nights / days ask
+  const nightsAsk =
+    /\b(\d{1,2})\s*(?:night|nights|raat|din|day|days)\b/i.exec(text);
+
   return {
-    wantsLocation   : /\blocation\b|\bwhere\b|\baddress\b|\bmap\b|\bpin\b|\bdirections?\b|\breach\b|لوکیشن|کہاں|پتہ|ایڈریس|نقشہ|راستہ/.test(t + ' ' + text),
-    wantsRates      : isPricingIntent(text),
-    wantsFacilities : /\bfaciliti(?:y|ies)\b|\bamenit(?:y|ies)\b|\bkitchen\b|\bfood\b|\bheater\b|\bbonfire\b|\bfamily\b|\bparking\b|\bjeep\b|\binverter\b/.test(t),
-    wantsBooking    : /\bbook\b|\bbooking\b|\breserve\b|\breservation\b|\bcheck ?in\b|\bcheck ?out\b|\badvance\b|\bpayment\b/.test(t),
-    wantsAvail      : /\bavailability\b|\bavailable\b|\bdates?\b|\bcalendar\b/.test(t),
-    wantsDistance   : /\bdistance\b|\bhow far\b|\bhours\b|\bdrive\b|\btime from\b|\beta\b/.test(t),
-    wantsWeather    : /\bweather\b|\btemperature\b|\bforecast\b/.test(t),
-    wantsRoute      : /\broute\b|\brasta\b|\bhow\s+to\s+(?:reach|get|come)\b|\bfrom\s+\w+\s+(?:to|till|for)\b|\b(?:travel|journey)\s+time\b|\b(?:travel|journey)\s+from\b/.test(t),
-    wantsContact    : /\bcontact\b|\bmanager\b|\bowner\b|\bnumber\b|\bwhats\s*app\b|\bwhatsapp\b|\bcall\b|\bspeak to\b|\braabta\b/.test(t)
+    wantsLocation, wantsRates, wantsFacilities, wantsBooking, wantsAvail,
+    wantsDistance, wantsWeather, wantsRoute, wantsContact,
+    nightsAsk
   };
+}
+
+/* === campaign detector (9000 staycation) === */
+function maybeCampaignFromText(text = '') {
+  const s = (text || '').toLowerCase();
+
+  const mentions9000 =
+    /\b9\s*0\s*0\s*0\b/.test(s) ||
+    /\b9\s*k\b/.test(s) ||
+    /(?:^|[^a-z0-9])(rs|pkr|₨)\s*9\s*0\s*0\s*0(?:[^a-z0-9]|$)/.test(s) ||
+    /\b9\s*0\s*0\s*0\s*(rs|pkr|₨)\b/.test(s) ||
+    /\b9\s*0\s*0\s*0\s*\/-\b/.test(s);
+
+  const mentionsThreeDayChill =
+    /3\s*(din|day|days)\s*(?:just)?\s*ch(?:i)?ll/.test(s) ||
+    /3\s*din\s*wali\s*post/.test(s) ||
+    /3[-\s]*day\s*(?:chill|package)/.test(s) ||
+    /staycation\s*for\s*friends/.test(s);
+
+  if (mentions9000 || mentionsThreeDayChill) return 'staycation9000';
+  return null;
+}
+function maybeCampaignFromCaption(caption='') {
+  return maybeCampaignFromText(caption || '');
 }
 
 /* =========================
@@ -433,7 +477,6 @@ const INCLUSION_KEYS = [
 
 function cleanLinesFromCaption(caption = '') {
   const raw = (caption || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-  // drop hashtags / links only lines
   return raw.filter(l => !/^#/.test(l) && !/^https?:\/\//i.test(l));
 }
 
@@ -533,7 +576,7 @@ function formatOfferSummary(caption = '', permalink = '') {
 }
 
 /* =========================
-   CAMPAIGN: 3 din chill / 9000 per person
+   9000-PKR Staycation campaign content
    ========================= */
 const CAMPAIGNS = {
   staycation9000: {
@@ -541,6 +584,8 @@ const CAMPAIGNS = {
 `Roameo Staycation for Friends 🌲
 
 This trip plan is designed especially for groups of friends who want to escape together. You’re free to plan from wherever you are and choose the dates that work best for your crew—we’ll take care of your stay and make sure it feels like home. The idea is simple: you bring your people, we provide the space and comfort.
+
+**Best for:** 2–5 people
 
 **Terms & Conditions**
 • Travel not included – Guests manage their own travel to and from Roameo.  
@@ -553,215 +598,109 @@ This trip plan is designed especially for groups of friends who want to escape t
 Pack your bags, call your friends, and let’s make it a getaway to remember. Book your Roameo stay today and start creating your own stories!
 
 WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`,
-    priceReply:
-`For the *3-day chill* staycation, the headline price is **PKR 9,000 per person**.  
-What’s covered:
-• Daily complimentary **breakfast** + **one free dinner**  
-• Flexible dates (your choice)  
-• Stay at Roameo (travel not included)
 
-Tell me your **group size** and **dates**, and I’ll help you proceed.  
+    priceReply:
+`For the *3-day chill* staycation, the headline price is **PKR 9,000 per person**.
+
+**What’s included**
+• Daily complimentary **breakfast** + **one free dinner**  
+• **Flexible dates** (your choice)  
+• Stay at Roameo (**travel not included**)  
+• **Best for:** 2–5 people
+
+Tell me your **group size** and **dates**, and I’ll help you proceed.
 WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`
   }
 };
 
-function detectStaycation9000FromCaption(caption='') {
-  const s = (caption || '').toLowerCase();
-  return /3\s*(din|day|days).*ch(i|)ll/.test(s) || /\b9000\b/.test(s) || /\b9k\b/.test(s);
+/* =========================
+   Pricing helpers (soft launch card + nights quote)
+   ========================= */
+function currentRateCard() {
+  return `Right now, we’re offering exclusive soft launch discounts for our guests at Roameo Resort.
+
+Soft Launch  Rate List:
+
+Deluxe Hut – PKR 30,000/night
+• 1st Night: 10% Off → PKR 27,000
+• 2nd Night: 15% Off → PKR 25,500
+• 3rd Night: 20% Off → PKR 24,000
+
+Executive Hut – PKR 50,000/night
+• 1st Night: 10% Off → PKR 45,000
+• 2nd Night: 15% Off → PKR 42,500
+• 3rd Night: 20% Off → PKR 40,000
+
+Terms & Conditions:
+• Rates are inclusive of all taxes.
+• Complimentary breakfast for 4 guests per booking.
+• 50% advance payment is required to confirm the reservation.
+
+Let us know if you’d like to book your stay or need any assistance! 🌿✨
+
+WhatsApp: ${WHATSAPP_LINK}
+Availability / Book: ${SITE_URL}`;
 }
 
-/* Allow text-only triggers */
-function maybeCampaignFromText(text = '') {
-  const s = (text || '').toLowerCase();
-
-  const mentions9000 =
-    /\b9\s*000\b/.test(s) || /\b9k\b/.test(s) || /\b9\s*k\b/.test(s) ||
-    /نو\s*ہزار/.test(s) || /٩٠٠٠/.test(s);
-
-  const mentionsThreeDayChill =
-    /3\s*(din|day|days)\s*(?:just)?\s*ch(?:i)?ll/.test(s) ||
-    /3\s*din\s*wali\s*post/.test(s) ||
-    /3[-\s]*day\s*package/.test(s) ||
-    /staycation\s*for\s*friends/.test(s);
-
-  if (mentions9000 || mentionsThreeDayChill) return 'staycation9000';
-  return null;
+// discount table (night no. → % off). Nights 4+ keep 20% off.
+function discountPctForNight(n) {
+  if (n === 1) return 10;
+  if (n === 2) return 15;
+  return 20;
 }
+function quoteForNights(n) {
+  const baseDeluxe = 30000;
+  const baseExec   = 50000;
 
-function campaignFollowupAnswer(campKey, userText = '') {
-  const t = (userText || '').toLowerCase();
+  let deluxeTotal = 0, execTotal = 0;
+  let linesDeluxe = [], linesExec = [];
 
-  if (/\b(price|prices|pricing|rate|rates|charges|cost|kiraya|qeemat|قیمت|ریٹ|نرخ|9k|9000)\b/.test(t))
-    return CAMPAIGNS[campKey].priceReply;
-
-  if (/\b(one|1)\s*person\b/.test(t) || /per\s*person/.test(t) || /ek\s*band(a|e)/.test(t))
-    return `Yes — the **PKR 9,000** is **per person** for this staycation.\n\nKey points:\n• Complimentary breakfast + one free dinner\n• Flexible dates (you choose)\n• Travel not included\n\nBook/check dates:\n• WhatsApp: ${WHATSAPP_LINK}\n• Website: ${SITE_URL}`;
-
-  if (/\bhut\b/.test(t) || /single\s*hut/.test(t) || /deluxe/.test(t) || /executive/.test(t)) {
-    return `We offer **Deluxe** and **Executive** huts. The 9,000 PKR package is priced **per person** — you can pick the hut type you prefer (subject to availability).\n\nTell me your dates + group size and I’ll help you proceed.\n\n• WhatsApp: ${WHATSAPP_LINK}\n• Website: ${SITE_URL}`;
+  for (let i=1; i<=n; i++) {
+    const pct = discountPctForNight(i);
+    const dNight = Math.round(baseDeluxe * (100 - pct) / 100);
+    const eNight = Math.round(baseExec   * (100 - pct) / 100);
+    deluxeTotal += dNight; execTotal += eNight;
+    linesDeluxe.push(`• Night ${i}: PKR ${dNight.toLocaleString()} (${pct}% off)`);
+    linesExec  .push(`• Night ${i}: PKR ${eNight.toLocaleString()} (${pct}% off)`);
   }
 
-  if (/\bavailability|available|dates?|calendar\b/.test(t)) {
-    return `This staycation has **flexible dates** — pick any dates that suit your group (subject to availability).\n\nTo check/hold dates:\n• WhatsApp: ${WHATSAPP_LINK}\n• Website: ${SITE_URL}`;
-  }
+  return `Here’s the quote for *${n} ${n===1?'night':'nights'}* (soft-launch discounts applied):
 
-  if (/\bjoin|how\s*to\s*join|book|reserve|reservation\b/.test(t))
-    return `Joining is simple! Share your **dates** and **group size**, and we’ll lock it in.\n\n• WhatsApp: ${WHATSAPP_LINK}\n• Website: ${SITE_URL}`;
+Deluxe Hut — Base PKR 30,000/night
+${linesDeluxe.join('\n')} 
+→ **Total: PKR ${deluxeTotal.toLocaleString()}**
 
-  if (/\b(detail|details|info|information)\b/.test(t))
-    return CAMPAIGNS[campKey].longMsg;
+Executive Hut — Base PKR 50,000/night
+${linesExec.join('\n')}
+→ **Total: PKR ${execTotal.toLocaleString()}**
 
-  return null;
-}
+Rates include all taxes and complimentary breakfast for 4 guests.
+50% advance confirms booking.
 
-function respondForCampaign(campaignKey, userText = '') {
-  if (!campaignKey) return null;
-  const specific = campaignFollowupAnswer(campaignKey, userText);
-  if (specific) return specific;
-  return CAMPAIGNS[campaignKey].longMsg;
+WhatsApp: ${WHATSAPP_LINK}
+Availability / Book: ${SITE_URL}`;
 }
 
 /* =========================
-   DM/Comment HELPERS (routes, etc.)
+   VOICE: transcribe IG audio/voice
    ========================= */
-function extractOrigin(text='') {
-  const t = text.trim();
-  const rx = [
-    /route\s+from\s+(.+)$/i,
-    /rasta\s+from\s+(.+)$/i,
-    /directions?\s+from\s+(.+)$/i,
-    /how\s+to\s+reach\s+from\s+(.+)$/i,
-    /how\s+to\s+get\s+there\s+from\s+(.+)$/i,
-    /(?:i\s+am\s+)?coming\s+from\s+(.+)$/i,
-    /(?:i\s+am\s+)?travelling\s+from\s+(.+)$/i,
-    /(?:i\s+am\s+)?traveling\s+from\s+(.+)$/i,
-    /from\s+(.+)\s+(?:to|till|for)?\s*(?:roameo|resort|neelum|tehjian|here)?$/i,
-    /(.+)\s+(?:se|say)\s+(?:rasta|route|directions?)/i,
-    /(.+)\s+to\s+(?:roameo|resort|neelum|tehjian)/i,
-    /how\s+far\s+is\s+(.+)\s+(?:from|to)/i,
-    /distance\s+from\s+(.+)$/i,
-    /how\s+long\s+to\s+reach\s+from\s+(.+)$/i,
-    /travel\s+time\s+from\s+(.+)$/i,
-    /(.+)\s+سے\s+(?:راستہ|فاصلہ|دور|کتنے|کتنا)/i,
-    /(.+)\s+سے\s+(?:کتنے|کتنا)\s+(?:کلومیٹر|گھنٹے)/i,
-    /(.+)\s+سے\s+(?:روامو|ریسورٹ)/i,
-    /(.+)\s+se\s+(?:rasta|distance|far|kitna|kitne)/i,
-    /(.+)\s+se\s+(?:kitna|kitne)\s+(?:km|kilometer|ghante)/i,
-    /(.+)\s+se\s+(?:roameo|resort)/i
-  ];
-  for (const r of rx) {
-    const m = t.match(r);
-    if (m && m[1]) {
-      let origin = m[1].replace(/[.?!]+$/,'').trim();
-      origin = origin.replace(/\b(?:the|a|an|from|to|is|are|was|were|will|would|can|could|should|may|might)\b/gi, '').trim();
-      if (origin.length > 2) return origin;
-    }
-  }
-  return null;
-}
-async function dmRouteMessage(userText = '') {
-  const lang = detectLanguage(userText);
-  let origin = extractOrigin(userText);
-  if (!origin) {
-    const ask = lang === 'ur'
-      ? 'براہِ کرم روانگی کا شہر بتائیں۔ مثال: "route from Lahore"'
-      : lang === 'roman-ur'
-        ? 'Apni rawangi ka shehar batayein. Example: "route from Lahore"'
-        : 'Please tell us your departure city. Example: "route from Lahore".';
-    return ask;
-  }
-
-  const destParts = (RESORT_COORDS || '').split(',').map(s => s.trim());
-  if (destParts.length !== 2) return 'Location temporarily unavailable. Please try later.';
-  const [dLat, dLon] = destParts.map(parseFloat);
-
-  const originGeo = await geocodePlace(origin);
-  if (!originGeo) {
-    return lang === 'ur'
-      ? `"${origin}" کا مقام نہیں مل سکا۔ براہِ کرم شہر کا صحیح نام استعمال کریں۔\n\nلوکیشن: ${MAPS_LINK}`
-      : lang === 'roman-ur'
-        ? `"${origin}" ka location nahi mila. Sahi shehar ka naam use karein.\n\nLocation: ${MAPS_LINK}`
-        : `Could not find location for "${origin}". Please use the correct city name.\n\nLocation: ${MAPS_LINK}`;
-  }
-
-  const routeInfo = await getRouteInfo(originGeo.lat, originGeo.lon, dLat, dLon);
-  if (!routeInfo) {
-    return lang === 'ur'
-      ? `راستہ معلومات دستیاب نہیں۔ براہِ کرم بعد میں کوشش کریں۔\n\nلوکیشن: ${MAPS_LINK}`
-      : lang === 'roman-ur'
-        ? `Route info nahi mila. Baad mein try karein.\n\nLocation: ${MAPS_LINK}`
-        : `Route information not available. Please try again later.\n\nLocation: ${MAPS_LINK}`;
-  }
-
-  let response = '';
-  if (lang === 'ur') {
-    response = `*${origin}* سے Roameo Resorts تک:\n\n`;
-    routeInfo.routes.forEach(route => {
-      const modeName = route.mode === 'drive' ? 'گاڑی' : route.mode === 'walk' ? 'پیدل' : 'پبلک ٹرانسپورٹ';
-      response += `• ${modeName}: ${route.distance_km} کلومیٹر (${route.duration_formatted})\n`;
-    });
-    response += `\nلوکیشن: ${MAPS_LINK}`;
-  } else if (lang === 'roman-ur') {
-    response = `*${origin}* se Roameo Resorts:\n\n`;
-    routeInfo.routes.forEach(route => {
-      const modeName = route.mode === 'drive' ? 'Car' : route.mode === 'walk' ? 'Walking' : 'Public Transport';
-      response += `• ${modeName}: ${route.distance_km} km (${route.duration_formatted})\n`;
-    });
-    response += `\nLocation: ${MAPS_LINK}`;
-  } else {
-    response = `From *${origin}* to Roameo Resorts:\n\n`;
-    routeInfo.routes.forEach(route => {
-      const modeName = route.mode === 'drive' ? 'By Car' : route.mode === 'walk' ? 'Walking' : 'Public Transport';
-      response += `• ${modeName}: ${route.distance_km} km (${route.duration_formatted})\n`;
-    });
-    response += `\nLocation: ${MAPS_LINK}`;
-  }
-
-  const additionalInfo = lang === 'ur'
-    ? `\n\n💡 ٹپ: گاڑی سے آنا بہترین ہے۔ راستہ خوبصورت ہے!`
-    : lang === 'roman-ur'
-      ? `\n\n💡 Tip: Car se ana best hai. Rasta khoobsurat hai!`
-      : `\n\n💡 Tip: Driving is the best option. The route is beautiful!`;
-
-  return sanitizeVoice(`${response}${additionalInfo}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
-}
-
-/* =========================
-   STT (voice-note transcription)
-   ========================= */
-async function transcribeAudioFromCdnUrl(url) {
+async function transcribeFromUrl(url) {
   if (!ENABLE_VOICE_STT || !OPENAI_API_KEY || !url) return null;
   try {
-    const headers = {
-      Referer: 'https://www.instagram.com/',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      Accept: '*/*'
-    };
-    const audioResp = await axios.get(url, { responseType: 'arraybuffer', timeout: 20000, headers });
-    const buf = Buffer.from(audioResp.data);
+    const resp = await axios.get(url, { responseType: 'arraybuffer', timeout: 20000 });
+    const buf = Buffer.from(resp.data);
+    const mb = buf.length / (1024*1024);
+    if (mb > MAX_AUDIO_MB) { console.warn('STT skipped (size)', mb); return null; }
 
-    const fd = new FormData();
-    fd.append('model', STT_MODEL || 'gpt-4o-mini-transcribe');
-    fd.append('file', buf, { filename: 'voice.m4a', contentType: 'audio/m4a' });
+    const form = new FormData();
+    form.append('file', buf, { filename: 'note.m4a', contentType: resp.headers['content-type'] || 'audio/mpeg' });
+    form.append('model', STT_MODEL);
 
-    // prefer /v1/audio/transcriptions (new) — supports 4o-mini-transcribe, falls back to whisper-1
-    let sttResp;
-    try {
-      sttResp = await axios.post('https://api.openai.com/v1/audio/transcriptions', fd, {
-        headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd.getHeaders() },
-        timeout: 30000
-      });
-    } catch (e) {
-      // fallback whisper-1 if needed
-      const fd2 = new FormData();
-      fd2.append('model', 'whisper-1');
-      fd2.append('file', buf, { filename: 'voice.m4a', contentType: 'audio/m4a' });
-      sttResp = await axios.post('https://api.openai.com/v1/audio/transcriptions', fd2, {
-        headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...fd2.getHeaders() },
-        timeout: 30000
-      });
-    }
-    const text = (sttResp?.data?.text || '').trim();
+    const stt = await axios.post('https://api.openai.com/v1/audio/transcriptions', form, {
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, ...form.getHeaders() },
+      timeout: 30000
+    });
+    const text = (stt?.data?.text || '').trim();
     return text || null;
   } catch (e) {
     console.error('STT error', e?.response?.data || e.message);
@@ -769,13 +708,26 @@ async function transcribeAudioFromCdnUrl(url) {
   }
 }
 
-function extractAudioUrlsFromAttachments(event) {
-  const atts = event?.message?.attachments || [];
-  const urls = [];
-  for (const a of atts) {
-    if (a?.type === 'audio' && a?.payload?.url) urls.push(a.payload.url);
-  }
-  return urls;
+/* =========================
+   INTENT HELPERS
+   ========================= */
+function isPricingIntent(text = '') {
+  const t = normalize(text);
+  if (t.length <= 2) return false;
+
+  const kw = [
+    'price','prices','pricing','rate','rates','tariff','cost','rent','rental','per night',
+    'night price','kiraya','qeemat','kimat','keemat','قیمت','کرایہ','ریٹ','نرخ','offer','pkg','package','charges','charo'
+  ];
+  if (kw.some(x => t.includes(x))) return true;
+
+  if (/\b9\s*k\b/.test(t) || /\b9\s*0\s*0\s*0\b/.test(t)) return true;
+  if (/(rs|pkr|₨)\s*9\s*0\s*0\s*0/i.test(text) || /\b9\s*0\s*0\s*0\s*(rs|pkr|₨)\b/i.test(text)) return true;
+
+  if (/\bhow much\b/i.test(text)) return true;
+  if (/\b\d+\s*(night|nights|din|raat|days?)\b/i.test(text)) return true;
+
+  return false;
 }
 
 /* =========================
@@ -784,71 +736,98 @@ function extractAudioUrlsFromAttachments(event) {
 async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareUrls: [], shareThumb: null, isShare: false, brandHint: false, captions: '', assetId: null }) {
   if (!AUTO_REPLY_ENABLED) return;
 
-  // --- Campaign stickiness & text activation ---
-  let state = sessionState.get(psid) || {};
-  let activeCampaign = state.campaign?.key || null;
-
-  if (!activeCampaign) {
-    const inferred = maybeCampaignFromText(text || '');
-    if (inferred) {
-      state = { campaign: { key: inferred } };
-      sessionState.set(psid, state);
-      activeCampaign = inferred;
-    }
-  }
-
-  if (activeCampaign) {
-    const tailored = respondForCampaign(activeCampaign, text || '');
-    if (tailored) return sendBatched(psid, tailored);
-  }
-  // --------------------------------------------
-
   const textUrls = extractPostUrls(text || '');
   const combinedUrls = [...new Set([...(ctx.shareUrls || []), ...textUrls])];
 
   const intents = intentFromText(text || '');
-  if (intents.wantsContact) return sendBatched(psid, `WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
-  if (intents.wantsLocation) return sendBatched(psid, `*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+  const lang = detectLanguage(text || '');
 
+  // ==== Sticky campaign (if any) ====
+  let stickyCampaign = campaignState.get(psid) || null;
+
+  // === Multi-intent bundle reply container ===
+  const sections = [];
+
+  // Contact shortcut
+  if (intents.wantsContact) {
+    sections.push(`WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+  }
+
+  // Location shortcut (any language)
+  if (intents.wantsLocation) {
+    sections.push(`*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+  }
+
+  // Nights quote (if asked explicitly like "price for 4 nights")
+  if (intents.nightsAsk && intents.wantsRates) {
+    const n = Math.max(1, Math.min(21, parseInt(intents.nightsAsk[1], 10)));
+    sections.push(quoteForNights(n));
+  }
+
+  // If user asked for rates / charges without explicit nights:
+  if (intents.wantsRates && !intents.nightsAsk) {
+    const campaignFromText = maybeCampaignFromText(text || '');
+    const activeCampaign = campaignFromText || stickyCampaign;
+    if (activeCampaign === 'staycation9000') {
+      sections.push(CAMPAIGNS.staycation9000.priceReply);
+      stickyCampaign = 'staycation9000';
+      campaignState.set(psid, stickyCampaign);
+    } else {
+      // fallback to current rate card
+      sections.push(currentRateCard());
+    }
+  }
+
+  // Route / distance (handled after rates so both can be returned)
   if (intents.wantsRoute || intents.wantsDistance) {
     const msg = await dmRouteMessage(text);
-    return sendBatched(psid, msg);
+    sections.push(msg);
   }
+
+  // If we already have sections (multi-intent), send and return
+  if (sections.length) {
+    return sendBatched(psid, sections);
+  }
+
+  // ====== IG SHARE HANDLING ======
 
   // 1) Brand-owned via asset_id
   if (ctx.assetId) {
     const lookup = await igLookupPostByAssetId(ctx.assetId);
     if (lookup && lookup.isBrand && lookup.post) {
       const meta = lookup.post;
+      const caption = meta.caption || ctx.captions || '';
+      const camp = maybeCampaignFromCaption(caption);
+
       const thumbRemote = meta.thumbnail_url || ctx.shareThumb || null;
       const thumb = thumbRemote ? toVisionableUrl(thumbRemote, ctx.req) : imageUrl;
       const imgForVision = SEND_IMAGE_FOR_IG_SHARES ? thumb : null;
 
       if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
-      // SPECIAL: If it's the 9000 campaign, reply with custom message and set session
-      if (detectStaycation9000FromCaption(meta.caption || ctx.captions || '')) {
-        sessionState.set(psid, { campaign: { key: 'staycation9000' } });
-        if (!isPricingIntent(text || '')) {
-          return sendBatched(psid, CAMPAIGNS.staycation9000.longMsg);
-        }
-        return sendBatched(psid, CAMPAIGNS.staycation9000.priceReply);
+      // Special case: our 9000 campaign
+      if (camp === 'staycation9000') {
+        campaignState.set(psid, 'staycation9000');
+        lastShareMeta.set(psid, { caption, permalink: meta.permalink || '' });
+        return sendBatched(psid, CAMPAIGNS.staycation9000.longMsg);
       }
 
-      // If user didn't ask "rates", send structured caption summary (NOT the nightly rate card)
+      // Generic branded share → caption summary except explicit pricing ask
+      lastShareMeta.set(psid, { caption, permalink: meta.permalink || '' });
+
       if (!isPricingIntent(text || '')) {
-        const reply = formatOfferSummary(meta.caption || ctx.captions || '', meta.permalink || '');
+        const reply = formatOfferSummary(caption, meta.permalink || '');
         return sendBatched(psid, reply);
       }
 
-      // Pricing asked → brain
+      // Pricing asked → brain (with post note)
       const postNote = [
         'postMeta:',
         `source: ig`,
         `author_name: Roameo Resorts`,
         `author_url: https://www.instagram.com/${BRAND_USERNAME}/`,
         `permalink: ${meta.permalink || ''}`,
-        `caption: ${meta.caption || ''}`
+        `caption: ${caption}`
       ].join('\n');
 
       const history = chatHistory.get(psid) || [];
@@ -867,20 +846,23 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
       const meta = await fetchOEmbed(url);
       if (meta && isFromBrand(meta)) {
         const caption = (meta.title || '').trim();
+        const camp = maybeCampaignFromCaption(caption);
+
         const thumbRemote = meta.thumbnail_url || ctx.shareThumb || null;
         const thumb = thumbRemote ? toVisionableUrl(thumbRemote, ctx.req) : imageUrl;
         const imgForVision = SEND_IMAGE_FOR_IG_SHARES ? thumb : null;
 
         if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
-        // SPECIAL: 9000 campaign message
-        if (detectStaycation9000FromCaption(caption)) {
-          sessionState.set(psid, { campaign: { key: 'staycation9000' } });
-          if (!isPricingIntent(text || '')) {
-            return sendBatched(psid, CAMPAIGNS.staycation9000.longMsg);
-          }
-          return sendBatched(psid, CAMPAIGNS.staycation9000.priceReply);
+        // 9000 campaign
+        if (camp === 'staycation9000') {
+          campaignState.set(psid, 'staycation9000');
+          lastShareMeta.set(psid, { caption, permalink: url });
+          return sendBatched(psid, CAMPAIGNS.staycation9000.longMsg);
         }
+
+        // Generic branded post
+        lastShareMeta.set(psid, { caption, permalink: url });
 
         if (!isPricingIntent(text || '')) {
           const reply = formatOfferSummary(caption, url);
@@ -907,7 +889,6 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     }
 
     // Not our post
-    const lang = detectLanguage(text || '');
     const reply = lang === 'ur'
       ? 'آپ نے جو پوسٹ شیئر کی ہے وہ ہماری نہیں لگتی۔ براہِ کرم اس کا اسکرین شاٹ بھیج دیں تاکہ رہنمائی کر سکیں۔'
       : lang === 'roman-ur'
@@ -916,7 +897,16 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     return sendBatched(psid, `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`);
   }
 
-  // 3) Everything else → brain (with history)
+  // 3) Fallbacks:
+  //    If user refers to "that post / that offer" and we have lastShareMeta or sticky campaign
+  const campFromText = maybeCampaignFromText(text || '');
+  if (campFromText === 'staycation9000' || stickyCampaign === 'staycation9000') {
+    campaignState.set(psid, 'staycation9000');
+    if (isPricingIntent(text)) return sendBatched(psid, CAMPAIGNS.staycation9000.priceReply);
+    return sendBatched(psid, CAMPAIGNS.staycation9000.longMsg);
+  }
+
+  // 4) Everything else → brain (with history)
   const history = chatHistory.get(psid) || [];
   const surface = 'dm';
   const response = await askBrain({ text, imageUrl, surface, history });
@@ -943,11 +933,11 @@ async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null
     let text = event.message.text || '';
     const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
 
-    // voice notes (FB Messenger)
-    const audioUrls = extractAudioUrlsFromAttachments(event);
-    if (!text && audioUrls.length) {
-      const stt = await transcribeAudioFromCdnUrl(audioUrls[0]).catch(()=>null);
-      if (stt) text = stt;
+    // Messenger voice notes (if any)
+    const audioUrl = event.message.attachments?.find(a => a.type === 'audio')?.payload?.url || null;
+    if (!text && audioUrl) {
+      const transcript = await transcribeFromUrl(audioUrl);
+      if (transcript) text = transcript;
     }
 
     const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
@@ -998,11 +988,11 @@ async function routeInstagramMessage(event, ctx = { req: null }) {
     let text = event.message.text || '';
     const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
 
-    // voice notes (Instagram)
-    const audioUrls = extractAudioUrlsFromAttachments(event);
-    if (!text && audioUrls.length) {
-      const stt = await transcribeAudioFromCdnUrl(audioUrls[0]).catch(()=>null);
-      if (stt) text = stt;
+    // IG voice / audio
+    const audioUrl = event.message.attachments?.find(a => a.type === 'audio')?.payload?.url || null;
+    if (!text && audioUrl) {
+      const transcript = await transcribeFromUrl(audioUrl);
+      if (transcript) text = transcript;
     }
 
     const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
@@ -1092,7 +1082,8 @@ function extractSharedPostDataFromAttachments(event) {
   }
 
   for (const a of atts) {
-    if (a?.type && a.type !== 'image') isShare = true;
+    // NOTE: don't mark audio as "share"
+    if (a?.type && a.type !== 'image' && a.type !== 'audio') isShare = true;
 
     if (a?.url && /^https?:\/\//i.test(a.url)) {
       const u = unwrapRedirect(a.url);
@@ -1180,8 +1171,7 @@ async function takeThreadControl(psid) {
 
 function requireAdmin(req, res, next) {
   const hdr = req.headers.authorization || '';
-  theToken = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
-  const token = theToken;
+  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
   if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) return res.status(401).json({ error: 'unauthorized' });
   next();
 }
@@ -1214,3 +1204,108 @@ app.get('/admin/status', requireAdmin, async (_req, res) => {
    START
    ========================= */
 app.listen(PORT, () => console.log(`🚀 Listening on :${PORT}`));
+
+/* =========================
+   ROUTE MESSAGE HELPERS
+   ========================= */
+function extractOrigin(text='') {
+  const t = text.trim();
+  const rx = [
+    /route\s+from\s+(.+)$/i,
+    /rasta\s+from\s+(.+)$/i,
+    /directions?\s+from\s+(.+)$/i,
+    /how\s+to\s+reach\s+from\s+(.+)$/i,
+    /how\s+to\s+get\s+there\s+from\s+(.+)$/i,
+    /(?:i\s+am\s+)?coming\s+from\s+(.+)$/i,
+    /(?:i\s+am\s+)?travelling\s+from\s+(.+)$/i,
+    /(?:i\s+am\s+)?traveling\s+from\s+(.+)$/i,
+    /from\s+(.+)\s+(?:to|till|for)?\s*(?:roameo|resort|neelum|tehjian|here)?$/i,
+    /(.+)\s+(?:se|say)\s+(?:rasta|route|directions?)/i,
+    /(.+)\s+to\s+(?:roameo|resort|neelum|tehjian)/i,
+    /how\s+far\s+is\s+(.+)\s+(?:from|to)/i,
+    /distance\s+from\s+(.+)$/i,
+    /how\s+long\s+to\s+reach\s+from\s+(.+)$/i,
+    /travel\s+time\s+from\s+(.+)$/i,
+    /(.+)\s+سے\s+(?:راستہ|فاصلہ|دور|کتنے|کتنا)/i,
+    /(.+)\s+سے\s+(?:کتنے|کتنا)\s+(?:کلومیٹر|گھنٹے)/i,
+    /(.+)\s+سے\s+(?:روامو|ریسورٹ)/i,
+    /(.+)\s+se\s+(?:rasta|distance|far|kitna|kitne)/i,
+    /(.+)\s+se\s+(?:kitna|kitne)\s+(?:km|kilometer|ghante)/i,
+    /(.+)\s+se\s+(?:roameo|resort)/i
+  ];
+  for (const r of rx) {
+    const m = t.match(r);
+    if (m && m[1]) {
+      let origin = m[1].replace(/[.?!]+$/,'').trim();
+      origin = origin.replace(/\b(?:the|a|an|from|to|is|are|was|were|will|would|can|could|should|may|might)\b/gi, '').trim();
+      if (origin.length > 2) return origin;
+    }
+  }
+  return null;
+}
+async function dmRouteMessage(userText = '') {
+  const lang = detectLanguage(userText);
+  let origin = extractOrigin(userText);
+  if (!origin) {
+    const ask = lang === 'ur'
+      ? 'براہِ کرم روانگی کا شہر بتائیں۔ مثال: "route from Lahore"'
+      : lang === 'roman-ur'
+        ? 'Apni rawangi ka shehar batayein. Example: "route from Lahore"'
+        : 'Please tell us your departure city. Example: "route from Lahore".';
+    return ask + `\n\n*Roameo Resorts — location link:*\n👉 ${MAPS_LINK}`;
+  }
+
+  const destParts = (RESORT_COORDS || '').split(',').map(s => s.trim());
+  if (destParts.length !== 2) return 'Location temporarily unavailable. Please try later.';
+  const [dLat, dLon] = destParts.map(parseFloat);
+
+  const originGeo = await geocodePlace(origin);
+  if (!originGeo) {
+    return lang === 'ur'
+      ? `"${origin}" کا مقام نہیں مل سکا۔ براہِ کرم شہر کا صحیح نام استعمال کریں۔\n\nلوکیشن: ${MAPS_LINK}`
+      : lang === 'roman-ur'
+        ? `"${origin}" ka location nahi mila. Sahi shehar ka naam use karein.\n\nLocation: ${MAPS_LINK}`
+        : `Could not find location for "${origin}". Please use the correct city name.\n\nLocation: ${MAPS_LINK}`;
+  }
+
+  const routeInfo = await getRouteInfo(originGeo.lat, originGeo.lon, dLat, dLon);
+  if (!routeInfo) {
+    return lang === 'ur'
+      ? `راستہ معلومات دستیاب نہیں۔ براہِ کرم بعد میں کوشش کریں۔\n\nلوکیشن: ${MAPS_LINK}`
+      : lang === 'roman-ur'
+        ? `Route info nahi mila. Baad mein try karein.\n\nLocation: ${MAPS_LINK}`
+        : `Route information not available. Please try again later.\n\nLocation: ${MAPS_LINK}`;
+  }
+
+  let response = '';
+  if (lang === 'ur') {
+    response = `*${origin}* سے Roameo Resorts تک:\n\n`;
+    routeInfo.routes.forEach(route => {
+      const modeName = route.mode === 'drive' ? 'گاڑی' : route.mode === 'walk' ? 'پیدل' : 'پبلک ٹرانسپورٹ';
+      response += `• ${modeName}: ${route.distance_km} کلومیٹر (${route.duration_formatted})\n`;
+    });
+    response += `\nلوکیشن: ${MAPS_LINK}`;
+  } else if (lang === 'roman-ur') {
+    response = `*${origin}* se Roameo Resorts:\n\n`;
+    routeInfo.routes.forEach(route => {
+      const modeName = route.mode === 'drive' ? 'Car' : route.mode === 'walk' ? 'Walking' : 'Public Transport';
+      response += `• ${modeName}: ${route.distance_km} km (${route.duration_formatted})\n`;
+    });
+    response += `\nLocation: ${MAPS_LINK}`;
+  } else {
+    response = `From *${origin}* to Roameo Resorts:\n\n`;
+    routeInfo.routes.forEach(route => {
+      const modeName = route.mode === 'drive' ? 'By Car' : route.mode === 'walk' ? 'Walking' : 'Public Transport';
+      response += `• ${modeName}: ${route.distance_km} km (${route.duration_formatted})\n`;
+    });
+    response += `\nLocation: ${MAPS_LINK}`;
+  }
+
+  const additionalInfo = lang === 'ur'
+    ? `\n\n💡 ٹپ: گاڑی سے آنا بہترین ہے۔ راستہ خوبصورت ہے!`
+    : lang === 'roman-ur'
+      ? `\n\n💡 Tip: Car se ana best hai. Rasta khoobsurat hai!`
+      : `\n\n💡 Tip: Driving is the best option. The route is beautiful!`;
+
+  return sanitizeVoice(`${response}${additionalInfo}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+}
