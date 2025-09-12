@@ -440,6 +440,7 @@ function intentFromText(text = '') {
 function maybeCampaignFromText(text = '') {
   const s = (text || '').toLowerCase();
 
+  // ===== 9000 campaign =====
   const mentions9000 =
     /\b9\s*0\s*0\s*0\b/.test(s) ||
     /\b9\s*k\b/.test(s) ||
@@ -454,6 +455,19 @@ function maybeCampaignFromText(text = '') {
     /staycation\s*for\s*friends/.test(s);
 
   if (mentions9000 || mentionsThreeDayChill) return 'staycation9000';
+
+  // ===== Honeymoon campaign =====
+  const mentionsHoneymoon =
+    /\bhone[\s-]?moon\b/.test(s) ||            // honeymoon, honey moon, honey-moon
+    /\bhoneymoon[a-z]*/.test(s) ||             // honeymoonprice, honeymoonpackage, etc.
+    /\bhoneemoon\b/.test(s) ||                 // typo
+    /\bhoneymon\b/.test(s) ||                  // typo
+    /\b70\s*[kK]\b/.test(s) ||                 // 70k
+    /\b70\s*[,\.]?\s*0{3,}\b/.test(s) ||       // 70000 / 70,000
+    /(?:^|[^a-z0-9])(rs|pkr|₨)\s*70\s*[,\.]?\s*0{3,}/.test(s); // Rs70000 etc.
+
+  if (mentionsHoneymoon) return 'honeymoon70k';
+
   return null;
 }
 function maybeCampaignFromCaption(caption='') {
@@ -583,20 +597,7 @@ const CAMPAIGNS = {
     longMsg:
 `Roameo Staycation for Friends 🌲
 
-This trip plan is designed especially for groups of friends who want to escape together. You’re free to plan from wherever you are and choose the dates that work best for your crew—we’ll take care of your stay and make sure it feels like home. The idea is simple: you bring your people, we provide the space and comfort.
-
-**Best for:** 2–5 people
-
-**Terms & Conditions**
-• Travel not included – Guests manage their own travel to and from Roameo.  
-• Flexible dates – Book your stay in advance for any date that suits you. This isn’t a fixed trip or limited-time offer.  
-• Meals – Your package includes daily complimentary breakfast + one free dinner. Any extra meals or snacks are billed separately.  
-• Itinerary ideas – This is not a designed fixed trip. The 3-day plan was only a sample; we can suggest nearby spots you might enjoy—but how you spend your time at Roameo is completely up to you.  
-• Add-ons – Any extra activities, services, or experiences beyond your stay will have separate charges.  
-• Bring your crew – Roameo is best enjoyed with your own group of friends/family. You choose who comes along and when.
-
-Pack your bags, call your friends, and let’s make it a getaway to remember. Book your Roameo stay today and start creating your own stories!
-
+This trip plan is designed especially for groups of friends who want to escape together...
 WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`,
 
     priceReply:
@@ -610,8 +611,37 @@ WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`,
 
 Tell me your **group size** and **dates**, and I’ll help you proceed.
 WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`
+  },
+
+  honeymoon70k: {
+    longMsg:
+`💍 Roameo Honeymoon Package 💕
+
+Celebrate your love in the heart of Kashmir 🌲✨.  
+Starting from **Rs. 70,000 per couple** for 3 nights or more.
+
+**Includes:**
+• Breakfast in bed each morning 🥐☕  
+• Dreamy candlelight dinner under the stars 🌙  
+• Experiences: lantern night, canvas painting, mini hike to Bantal, bonfire, stargazing, photo walk & a private picnic 🍃📸  
+
+Mark the dates that work for you, arrive hand-in-hand, and we’ll create the warmth and magic for unforgettable moments.  
+
+WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`,
+
+    priceReply:
+`Our *Honeymoon Package* starts from **Rs. 70,000 per couple** (for 3 nights or more). 💕
+
+**Includes:**
+• Breakfast in bed every morning  
+• A candlelight dinner under the stars  
+• Romantic & fun experiences: lantern night, canvas painting, mini hike to Bantal, bonfire, stargazing, photo walk, private picnic  
+
+This package is designed for couples to create unforgettable memories.  
+WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`
   }
 };
+
 
 /* =========================
    Pricing helpers (soft launch card + nights quote)
