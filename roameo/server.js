@@ -632,7 +632,7 @@ WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`
 `💍 Roameo Honeymoon Package 💕
 
 Celebrate your love in the heart of Kashmir 🌲✨.  
-Starting from **Rs. 70,000 per couple** for 3 nights or more.
+Starting from **PKR 70,000 per couple** for 3 nights or more.
 
 **Includes:**
 • Breakfast in bed each morning 🥐☕  
@@ -644,7 +644,7 @@ Mark the dates that work for you, arrive hand-in-hand, and we’ll create the wa
 WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`,
 
     priceReply:
-`Our *Honeymoon Package* starts from **Rs. 70,000 per couple** (for 3 nights or more). 💕
+`Our *Honeymoon Package* starts from **PKR 70,000 per couple** (for 3 nights or more). 💕
 
 **Includes:**
 • Breakfast in bed every morning  
@@ -786,8 +786,26 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
   const intents = intentFromText(text || '');
   const lang = detectLanguage(text || '');
 
-  // ==== Sticky campaign (if any) ====
+  // === Load history and sticky campaign ===
+  const history = chatHistory.get(psid) || [];
   let stickyCampaign = campaignState.get(psid) || null;
+
+  // Try to recover from history if no sticky campaign
+  if (!stickyCampaign) {
+    const lastMarker = [...history].reverse().find(m => m.role === 'system' && m.content.startsWith('activeCampaign:'));
+    if (lastMarker) {
+      stickyCampaign = lastMarker.content.replace('activeCampaign:', '').trim();
+    }
+  }
+
+  // === Detect campaign from current text ===
+  const campaignFromText = maybeCampaignFromText(text || '');
+  if (campaignFromText) {
+    stickyCampaign = campaignFromText;
+    campaignState.set(psid, stickyCampaign);
+    history.push({ role: 'system', content: `activeCampaign: ${stickyCampaign}` });
+    chatHistory.set(psid, history.slice(-20));
+  }
 
   // === Multi-intent bundle reply container ===
   const sections = [];
@@ -808,30 +826,47 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
     sections.push(quoteForNights(n));
   }
 
-  // If user asked for rates / charges without explicit nights:
-  if (intents.wantsRates && !intents.nightsAsk) {
-    const campaignFromText = maybeCampaignFromText(text || '');
-    const activeCampaign = campaignFromText || stickyCampaign;
-    if (activeCampaign === 'staycation9000') {
-      sections.push(CAMPAIGNS.staycation9000.priceReply);
-      stickyCampaign = 'staycation9000';
-      campaignState.set(psid, stickyCampaign);
-    } else {
-      // fallback to current rate card
-      sections.push(currentRateCard());
-    }
-  }
+// If user asked for rates / charges without explicit nights:
+if (intents.wantsRates && !intents.nightsAsk) {
+  const activeCampaign = campaignFromText || stickyCampaign;
 
-  // Route / distance (handled after rates so both can be returned)
-  if (intents.wantsRoute || intents.wantsDistance) {
-    const msg = await dmRouteMessage(text);
-    sections.push(msg);
+  if (activeCampaign === 'staycation9000') {
+    const reply = CAMPAIGNS.staycation9000.priceReply;
+    sections.push(reply);
+    stickyCampaign = 'staycation9000';
+    campaignState.set(psid, stickyCampaign);
+    history.push({ role: 'user', content: text }, { role: 'assistant', content: reply });
+    chatHistory.set(psid, history.slice(-20));
+  } else if (activeCampaign === 'honeymoon70k') {
+    const reply = CAMPAIGNS.honeymoon70k.priceReply;
+    sections.push(reply);
+    stickyCampaign = 'honeymoon70k';
+    campaignState.set(psid, stickyCampaign);
+    history.push({ role: 'user', content: text }, { role: 'assistant', content: reply });
+    chatHistory.set(psid, history.slice(-20));
+  } else {
+    sections.push(currentRateCard());
   }
+}
+
+/* =========================
+   Route intent (moved here)
+   ========================= */
+if (intents.wantsRoute || intents.wantsDistance) {
+  const msg = await dmRouteMessage(text);
+  history.push({ role: 'user', content: text }, { role: 'assistant', content: msg });
+  chatHistory.set(psid, history.slice(-20));
+  return sendBatched(psid, msg);
+}
 
   // If we already have sections (multi-intent), send and return
-  if (sections.length) {
-    return sendBatched(psid, sections);
-  }
+ if (sections.length) {
+  const newHistory = [...history];
+  newHistory.push({ role: 'user', content: text });
+  newHistory.push({ role: 'assistant', content: sections.join('\n\n') });
+  chatHistory.set(psid, newHistory.slice(-20));
+  return sendBatched(psid, sections);
+}
 
   // ====== IG SHARE HANDLING ======
 
@@ -849,20 +884,45 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
       if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
-      // Special case: our 9000 campaign
-      if (camp === 'staycation9000') {
-        campaignState.set(psid, 'staycation9000');
-        lastShareMeta.set(psid, { caption, permalink: meta.permalink || '' });
-        return sendBatched(psid, CAMPAIGNS.staycation9000.longMsg);
-      }
+      // Special case: our 9000 campaign & honeymoon campaign
+    if (camp === 'staycation9000') {
+  campaignState.set(psid, 'staycation9000');
+  lastShareMeta.set(psid, { caption, permalink: meta.permalink || '' });
+
+  const reply = CAMPAIGNS.staycation9000.longMsg;
+  const newHistory = [...history];
+  newHistory.push({ role: 'user', content: text || '[shared staycation9000 post]' });
+  newHistory.push({ role: 'assistant', content: reply });
+  chatHistory.set(psid, newHistory.slice(-20));
+
+  return sendBatched(psid, reply);
+}
+
+if (camp === 'honeymoon70k') {
+  campaignState.set(psid, 'honeymoon70k');
+  lastShareMeta.set(psid, { caption, permalink: meta.permalink || '' });
+
+  const reply = CAMPAIGNS.honeymoon70k.longMsg;
+  const newHistory = [...history];
+  newHistory.push({ role: 'user', content: text || '[shared honeymoon post]' });
+  newHistory.push({ role: 'assistant', content: reply });
+  chatHistory.set(psid, newHistory.slice(-20));
+
+  return sendBatched(psid, reply);
+}
 
       // Generic branded share → caption summary except explicit pricing ask
       lastShareMeta.set(psid, { caption, permalink: meta.permalink || '' });
 
       if (!isPricingIntent(text || '')) {
-        const reply = formatOfferSummary(caption, meta.permalink || '');
-        return sendBatched(psid, reply);
-      }
+  const reply = formatOfferSummary(caption, meta.permalink || '');
+  const newHistory = [...history];
+  newHistory.push({ role: 'user', content: text || '[shared IG post]' });
+  newHistory.push({ role: 'assistant', content: reply });
+  chatHistory.set(psid, newHistory.slice(-20));
+  return sendBatched(psid, reply);
+}
+
 
       // Pricing asked → brain (with post note)
       const postNote = [
@@ -874,7 +934,6 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
         `caption: ${caption}`
       ].join('\n');
 
-      const history = chatHistory.get(psid) || [];
       const surface = 'dm';
       const response = await askBrain({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface, history });
       const { message } = response;
@@ -904,6 +963,20 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
           lastShareMeta.set(psid, { caption, permalink: url });
           return sendBatched(psid, CAMPAIGNS.staycation9000.longMsg);
         }
+// Honeymoon campaign
+if (camp === 'honeymoon70k') {
+  campaignState.set(psid, 'honeymoon70k');
+  lastShareMeta.set(psid, { caption, permalink: url });
+
+  const reply = CAMPAIGNS.honeymoon70k.longMsg;
+  const newHistory = [...history];
+  newHistory.push({ role: 'user', content: text || '[shared honeymoon oEmbed post]' });
+  newHistory.push({ role: 'assistant', content: reply });
+  chatHistory.set(psid, newHistory.slice(-20));
+
+  return sendBatched(psid, reply);
+}
+
 
         // Generic branded post
         lastShareMeta.set(psid, { caption, permalink: url });
@@ -922,7 +995,6 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
           `caption: ${caption}`
         ].join('\n');
 
-        const history = chatHistory.get(psid) || [];
         const surface = 'dm';
         const response = await askBrain({ text: `${text || ''}\n\n${postNote}`, imageUrl: imgForVision, surface, history });
         const { message } = response;
@@ -932,47 +1004,85 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
       }
     }
 
-    // Not our post
-    const reply = lang === 'ur'
-      ? 'آپ نے جو پوسٹ شیئر کی ہے وہ ہماری نہیں لگتی۔ براہِ کرم اس کا اسکرین شاٹ بھیج دیں تاکہ رہنمائی کر سکیں۔'
-      : lang === 'roman-ur'
-        ? 'Jo post share ki hai wo hamari nahi lagti. Behtar rehnumai ke liye uska screenshot send karein.'
-        : 'It looks like the shared post isn’t from our page. Please send a screenshot and I’ll help with details.';
-    return sendBatched(psid, `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`);
-  }
+// 2b) If it’s NOT our post
+if (!meta || !isFromBrand(meta)) {
+  const reply = lang === 'ur'
+    ? 'آپ نے جو پوسٹ شیئر کی ہے وہ ہماری نہیں لگتی۔ براہِ کرم اس کا اسکرین شاٹ بھیج دیں تاکہ رہنمائی کر سکیں۔'
+    : lang === 'roman-ur'
+      ? 'Jo post share ki hai wo hamari nahi lagti. Behtar rehnumai ke liye uska screenshot send karein.'
+      : 'It looks like the shared post isn’t from our page. Please send a screenshot and I’ll help with details.';
 
-  // 3) Fallbacks:
-  //    If user refers to "that post / that offer" and we have lastShareMeta or sticky campaign
+  const out = `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`;
+  const newHistory = [...history];
+  newHistory.push({ role: 'user', content: text || '[shared non-brand post]' });
+  newHistory.push({ role: 'assistant', content: out });
+  chatHistory.set(psid, newHistory.slice(-20));
+  return sendBatched(psid, out);
+}
+}
+// 3) Fallbacks: if user refers to "that post / that offer"
 const campFromText = maybeCampaignFromText(text || '');
+
+// Staycation 9000 fallback
 if (campFromText === 'staycation9000' || stickyCampaign === 'staycation9000') {
   campaignState.set(psid, 'staycation9000');
 
-  // Dates / availability
   if (intents.wantsAvail) {
     return sendBatched(psid,
       `The 9000 package has **flexible dates** — you can book anytime in advance. Just tell us your group size and preferred dates.\n\nWhatsApp: ${WHATSAPP_LINK}`
     );
   }
 
-  // Facilities
   if (intents.wantsFacilities) {
     return sendBatched(psid,
       `This package includes **daily complimentary breakfast + one free dinner**. Other meals/add-ons are billed separately. Best for 2–5 people.\n\nWhatsApp: ${WHATSAPP_LINK}`
     );
   }
 
-  // Price
-  if (isPricingIntent(text)) {
-    return sendBatched(psid, CAMPAIGNS.staycation9000.priceReply);
-  }
-
-  // First trigger → show long card (only once, when detected from text)
   if (campFromText === 'staycation9000' && !stickyCampaign) {
     return sendBatched(psid, CAMPAIGNS.staycation9000.longMsg);
   }
 
+  // Otherwise → brain
+  const surface = 'dm';
+  const response = await askBrain({ text, imageUrl, surface, history });
+  const { message } = response;
+  const newHistory = [...history, constructUserMessage({ text, imageUrl, surface }), { role: 'assistant', content: message }].slice(-20);
+  chatHistory.set(psid, newHistory);
+  return sendBatched(psid, message);
+}
+
+// Honeymoon 70k fallback
+if (campFromText === 'honeymoon70k' || stickyCampaign === 'honeymoon70k') {
+  campaignState.set(psid, 'honeymoon70k');
+
+  if (intents.wantsAvail) {
+    return sendBatched(psid,
+      `The honeymoon package is flexible — you can book 3 nights or more at dates of your choice.\n\nWhatsApp: ${WHATSAPP_LINK}`
+    );
+  }
+
+  if (intents.wantsFacilities) {
+    return sendBatched(psid,
+      `The honeymoon package includes breakfast in bed, candlelight dinner, and romantic activities like lantern night and stargazing.\n\nWhatsApp: ${WHATSAPP_LINK}`
+    );
+  }
+
+
+  if (campFromText === 'honeymoon70k' && !stickyCampaign) {
+    return sendBatched(psid, CAMPAIGNS.honeymoon70k.longMsg);
+  }
+
+  // Otherwise → brain
+  const surface = 'dm';
+  const response = await askBrain({ text, imageUrl, surface, history });
+  const { message } = response;
+  const newHistory = [...history, constructUserMessage({ text, imageUrl, surface }), { role: 'assistant', content: message }].slice(-20);
+  chatHistory.set(psid, newHistory);
+  return sendBatched(psid, message);
+}
+
   // Otherwise → let brain handle it (no card repeat!)
-  const history = chatHistory.get(psid) || [];
   const surface = 'dm';
   const response = await askBrain({ text, imageUrl, surface, history });
   const { message } = response;
@@ -981,7 +1091,6 @@ if (campFromText === 'staycation9000' || stickyCampaign === 'staycation9000') {
   return sendBatched(psid, message);
 }
 }
-
 
 /* =========================
    FB DM + IG DM / COMMENTS
