@@ -899,7 +899,7 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
   // 3) Fallbacks:
   //    If user refers to "that post / that offer" and we have lastShareMeta or sticky campaign
- const campFromText = maybeCampaignFromText(text || '');
+const campFromText = maybeCampaignFromText(text || '');
 if (campFromText === 'staycation9000' || stickyCampaign === 'staycation9000') {
   campaignState.set(psid, 'staycation9000');
 
@@ -922,12 +922,12 @@ if (campFromText === 'staycation9000' || stickyCampaign === 'staycation9000') {
     return sendBatched(psid, CAMPAIGNS.staycation9000.priceReply);
   }
 
-  // Only show long card on FIRST trigger
+  // First trigger → show long card (only once, when detected from text)
   if (campFromText === 'staycation9000' && !stickyCampaign) {
     return sendBatched(psid, CAMPAIGNS.staycation9000.longMsg);
   }
 
-  // Otherwise: do NOT repeat card → let brain handle
+  // Otherwise → let brain handle it (no card repeat!)
   const history = chatHistory.get(psid) || [];
   const surface = 'dm';
   const response = await askBrain({ text, imageUrl, surface, history });
