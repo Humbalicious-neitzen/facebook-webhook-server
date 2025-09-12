@@ -314,34 +314,49 @@ async function igFetchRecentMediaMap(force = false) {
 async function igFetchMediaById(assetId) {
   const token = IG_MANAGE_TOKEN || PAGE_ACCESS_TOKEN;
   if (!assetId || !token) return null;
+
   try {
     const url = `https://graph.facebook.com/v19.0/${assetId}`;
-    const params = { access_token: token, fields: 'id,media_type,media_url,thumbnail_url' };
+    const params = {
+      access_token: token,
+      fields: 'id,caption,permalink,media_type,media_url,thumbnail_url'
+    };
+
     const { data } = await axios.get(url, { params, timeout: 10000 });
+
     return {
       id: data.id,
-      permalink: '',
-      caption: '',
+      caption: data.caption || '',
+      permalink: data.permalink || '',
       media_type: data.media_type,
       media_url: data.media_url || data.thumbnail_url || '',
       thumbnail_url: data.thumbnail_url || data.media_url || ''
     };
   } catch (e) {
-    if (IG_DEBUG_LOG) console.log('igFetchMediaById error', e?.response?.data || e.message);
+    if (IG_DEBUG_LOG) {
+      console.log('igFetchMediaById error', e?.response?.data || e.message);
+    }
     return null;
   }
 }
 
+
 async function igLookupPostByAssetId(assetId) {
   if (!assetId) return { isBrand: false, post: null };
+
   let map = await igFetchRecentMediaMap();
   if (map && map[assetId]) return { isBrand: true, post: map[assetId] };
+
   map = await igFetchRecentMediaMap(true);
   if (map && map[assetId]) return { isBrand: true, post: map[assetId] };
+
+  // Fallback: fetch the media directly by ID
   const direct = await igFetchMediaById(assetId);
   if (direct) return { isBrand: true, post: direct };
+
   return { isBrand: false, post: null };
 }
+
 
 /* =========================
    ENRICHMENT — route/drive-time
