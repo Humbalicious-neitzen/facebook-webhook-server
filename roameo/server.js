@@ -333,12 +333,11 @@ async function igFetchMediaById(assetId) {
       thumbnail_url: data.thumbnail_url || data.media_url || ''
     };
   } catch (e) {
-    if (IG_DEBUG_LOG) {
-      console.log('igFetchMediaById error', e?.response?.data || e.message);
-    }
+    if (IG_DEBUG_LOG) console.log('igFetchMediaById error', e?.response?.data || e.message);
     return null;
   }
 }
+
 
 
 async function igLookupPostByAssetId(assetId) {
