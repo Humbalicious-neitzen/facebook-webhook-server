@@ -899,32 +899,35 @@ async function handleTextMessage(psid, text, imageUrl, ctx = { req: null, shareU
 
   // 3) Fallbacks:
   //    If user refers to "that post / that offer" and we have lastShareMeta or sticky campaign
-  const campFromText = maybeCampaignFromText(text || '');
+ const campFromText = maybeCampaignFromText(text || '');
 if (campFromText === 'staycation9000' || stickyCampaign === 'staycation9000') {
   campaignState.set(psid, 'staycation9000');
 
+  // Dates / availability
   if (intents.wantsAvail) {
     return sendBatched(psid,
-      `The 9000 package has **flexible dates** — book anytime in advance. Just tell us your group size and preferred dates.\n\nWhatsApp: ${WHATSAPP_LINK}`
+      `The 9000 package has **flexible dates** — you can book anytime in advance. Just tell us your group size and preferred dates.\n\nWhatsApp: ${WHATSAPP_LINK}`
     );
   }
 
+  // Facilities
   if (intents.wantsFacilities) {
     return sendBatched(psid,
       `This package includes **daily complimentary breakfast + one free dinner**. Other meals/add-ons are billed separately. Best for 2–5 people.\n\nWhatsApp: ${WHATSAPP_LINK}`
     );
   }
 
+  // Price
   if (isPricingIntent(text)) {
     return sendBatched(psid, CAMPAIGNS.staycation9000.priceReply);
   }
 
-  // First trigger → show long card
+  // Only show long card on FIRST trigger
   if (campFromText === 'staycation9000' && !stickyCampaign) {
     return sendBatched(psid, CAMPAIGNS.staycation9000.longMsg);
   }
 
-  // Otherwise → fallback to brain
+  // Otherwise: do NOT repeat card → let brain handle
   const history = chatHistory.get(psid) || [];
   const surface = 'dm';
   const response = await askBrain({ text, imageUrl, surface, history });
@@ -933,6 +936,7 @@ if (campFromText === 'staycation9000' || stickyCampaign === 'staycation9000') {
   chatHistory.set(psid, newHistory);
   return sendBatched(psid, message);
 }
+
 
 
 /* =========================
