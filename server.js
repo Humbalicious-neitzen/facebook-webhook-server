@@ -936,7 +936,7 @@ if (campFromText === 'staycation9000' || stickyCampaign === 'staycation9000') {
   chatHistory.set(psid, newHistory);
   return sendBatched(psid, message);
 }
-
+}
 
 
 /* =========================
