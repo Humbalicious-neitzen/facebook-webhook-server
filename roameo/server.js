@@ -172,7 +172,7 @@ function detectLanguage(text = '') {
   const t = (text || '').trim();
   const hasUrduScript = /[\u0600-\u06FF\u0750-\u077F]/.test(t);
   if (hasUrduScript) return 'ur';
-  const romanUrduTokens = ['aap','ap','apka','apki','apke','kiraya','qeemat','rate','price','btao','batao','kitna','kitni','kitne','raha','hai','hain','kahan','kidhar','map','location'];
+  const romanUrduTokens = ['aap','ap','apka','apki','apke','kiraya','qeemat','rate','price','btao','batao','kitna','kitni','kitne','raha','hai','hain','kahan','kidhar','map','location','place'];
   const hit = romanUrduTokens.some(w => new RegExp(`\\b${w}\\b`, 'i').test(t));
   return hit ? 'roman-ur' : 'en';
 }
@@ -317,7 +317,7 @@ async function igFetchMediaById(assetId) {
   if (!assetId || !token) return null;
 
   try {
-    const url = `https://graph.facebook.com/v19.0/${assetId}`;
+       const url = `https://graph.facebook.com/v19.0/${assetId}`;
     const params = {
       access_token: token,
       fields: 'id,caption,permalink,media_type,media_url,thumbnail_url'
@@ -408,7 +408,7 @@ async function getRouteInfo(originLat, originLon, destLat, destLon) {
    INTENTS / DETECTORS
    ========================= */
 
-// STRICTER pricing intent: ignore validity-only asks and avoid "offer" as a trigger
+// STRICTER pricing intent: ignore validity-only asks and avoid "offer/package" as a trigger
 function isPricingIntent(text = '') {
   const t = normalize(text);
   if (t.length <= 2) return false;
@@ -442,8 +442,8 @@ function intentFromText(text = '') {
   const t = normalize(text);
 
   const wantsLocation =
-    /\b(location|where|address|map|maps?|pin|directions?|reach|loc)\b/.test(t) ||
-    /\b(kahan|kidhar)\b/.test(t) ||
+    /\b(location|where|address|map|maps?|pin|directions?|reach|loc|place)\b/.test(t) ||
+    /\b(kahan|kidhar|place)\b/.test(t) ||
     /کہاں|لوکیشن|پتہ|ایڈریس|نقشہ/.test(text); // Urdu
 
   const wantsRates = isPricingIntent(text);
@@ -474,14 +474,20 @@ function intentFromText(text = '') {
     /کب\s*تک|تک\b/.test(text) ||
     /\b(kab\s*tak|tk|tak)\b/i.test(text);
 
-  // Nights / days ask (still captured, but pricing branch will check wantsRates)
+  // NEW: packages / discounts intent
+  const wantsPackages =
+    /\b(packages?|pkg|pckg|deal|deals|promo|promotion|offers?|discounts?)\b/.test(t) ||
+    /(پیکج|پیکیج|آفر|آفرز|ڈسکا?ونٹ)/i.test(text) ||
+    /\bpkg\b/i.test(text);
+
+  // Nights / days ask (still captured; pricing branch checks wantsRates)
   const nightsAsk =
     /\b(\d{1,2})\s*(?:night|nights|raat|din|day|days)\b/i.exec(text);
 
   return {
     wantsLocation, wantsRates, wantsFacilities, wantsBooking, wantsAvail,
     wantsDistance, wantsWeather, wantsRoute, wantsContact, wantsValidity,
-    nightsAsk
+    wantsPackages, nightsAsk
   };
 }
 
@@ -507,13 +513,13 @@ function maybeCampaignFromText(text = '') {
 
   // ===== Honeymoon campaign =====
   const mentionsHoneymoon =
-    /\bhone[\s-]?moon\b/.test(s) ||            // honeymoon, honey moon, honey-moon
-    /\bhoneymoon[a-z]*/.test(s) ||             // honeymoonprice, honeymoonpackage, etc.
-    /\bhoneemoon\b/.test(s) ||                 // typo
-    /\bhoneymon\b/.test(s) ||                  // typo
-    /\b70\s*[kK]\b/.test(s) ||                 // 70k
-    /\b70\s*[,\.]?\s*0{3,}\b/.test(s) ||       // 70000 / 70,000
-    /(?:^|[^a-z0-9])(rs|pkr|₨)\s*70\s*[,\.]?\s*0{3,}/.test(s); // Rs70000 etc.
+    /\bhone[\s-]?moon\b/.test(s) ||
+    /\bhoneymoon[a-z]*/.test(s) ||
+    /\bhoneemoon\b/.test(s) ||
+    /\bhoneymon\b/.test(s) ||
+    /\b70\s*[kK]\b/.test(s) ||
+    /\b70\s*[,\.]?\s*0{3,}\b/.test(s) ||
+    /(?:^|[^a-z0-9])(rs|pkr|₨)\s*70\s*[,\.]?\s*0{3,}/.test(s);
 
   if (mentionsHoneymoon) return 'honeymoon70k';
 
@@ -760,6 +766,17 @@ WhatsApp: ${WHATSAPP_LINK}
 Availability / Book: ${SITE_URL}`;
 }
 
+/* ============== NEW ==============
+   ALL PACKAGES OVERVIEW (for "discounts / packages" asks)
+   ================================= */
+function allPackagesOverview() {
+  const header = `Here are our current options (overview):`;
+  const nightly = currentRateCard();
+  const chill   = CAMPAIGNS.staycation9000.priceReply;
+  const honey   = CAMPAIGNS.honeymoon70k.priceReply;
+  return [header, nightly, chill, honey].join('\n\n');
+}
+
 /* =========================
    VOICE: transcribe IG audio/voice
    ========================= */
@@ -788,11 +805,6 @@ async function transcribeFromUrl(url) {
 }
 
 /* =========================
-   INTENT HELPERS
-   ========================= */
-// (isPricingIntent moved above)
-
-/* =========================
    DM HANDLER
    ========================= */
 async function handleTextMessage(
@@ -813,12 +825,9 @@ async function handleTextMessage(
   const history = chatHistory.get(psid) || [];
   let stickyCampaign = campaignState.get(psid) || null;
 
-  // Try to recover from history if no sticky campaign
   if (!stickyCampaign) {
     const lastMarker = [...history].reverse().find(m => m.role === 'system' && m.content.startsWith('activeCampaign:'));
-    if (lastMarker) {
-      stickyCampaign = lastMarker.content.replace('activeCampaign:', '').trim();
-    }
+    if (lastMarker) stickyCampaign = lastMarker.content.replace('activeCampaign:', '').trim();
   }
 
   // === Detect campaign from current text ===
@@ -838,19 +847,24 @@ async function handleTextMessage(
     sections.push(`WhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
   }
 
-  // Location shortcut (any language)
+  // Location shortcut (supports "place")
   if (intents.wantsLocation) {
     sections.push(`*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
   }
 
-  // Nights quote only if it is truly a pricing ask (not validity)
+  // NEW: If user asks for packages/discounts → send ALL options
+  if (intents.wantsPackages) {
+    sections.push(allPackagesOverview());
+  }
+
+  // Nights quote only if truly pricing (not validity)
   if (intents.nightsAsk && intents.wantsRates && !intents.wantsValidity) {
     const n = Math.max(1, Math.min(21, parseInt(intents.nightsAsk[1], 10)));
     sections.push(quoteForNights(n));
   }
 
-  // If user asked for rates / charges without explicit nights, and not a validity query
-  if (intents.wantsRates && !intents.nightsAsk && !intents.wantsValidity) {
+  // Generic price ask (no nights) and not a validity or "packages" request
+  if (intents.wantsRates && !intents.nightsAsk && !intents.wantsValidity && !intents.wantsPackages) {
     const activeCampaign = campaignFromText || stickyCampaign;
 
     if (activeCampaign === 'staycation9000') {
@@ -873,7 +887,7 @@ async function handleTextMessage(
   }
 
   /* =========================
-     Route / distance intent — now bundled (no early return)
+     Route / distance intent — bundled
      ========================= */
   if (intents.wantsRoute || intents.wantsDistance) {
     const msg = await dmRouteMessage(text);
@@ -928,7 +942,6 @@ async function handleTextMessage(
 
       if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
-      // Special case: our campaigns
       if (camp === 'staycation9000') {
         campaignState.set(psid, 'staycation9000');
         lastShareMeta.set(psid, { caption, permalink: meta.permalink || '' });
@@ -955,7 +968,6 @@ async function handleTextMessage(
         return sendBatched(psid, reply);
       }
 
-      // Generic branded share → caption summary except explicit pricing ask
       lastShareMeta.set(psid, { caption, permalink: meta.permalink || '' });
 
       if (!isPricingIntent(text || '')) {
@@ -965,7 +977,6 @@ async function handleTextMessage(
         return sendBatched(psid, reply);
       }
 
-      // Pricing asked → brain (with post note)
       const postNote = [
         'postMeta:',
         `source: ig`,
@@ -1005,7 +1016,6 @@ async function handleTextMessage(
 
         if (IG_DEBUG_LOG) console.log('[IG share] sending image to Vision:', imgForVision);
 
-        // Staycation campaign (ADD history push here)
         if (camp === 'staycation9000') {
           campaignState.set(psid, 'staycation9000');
           lastShareMeta.set(psid, { caption, permalink: url });
@@ -1019,7 +1029,6 @@ async function handleTextMessage(
           return sendBatched(psid, reply);
         }
 
-        // Honeymoon campaign (history push already present)
         if (camp === 'honeymoon70k') {
           campaignState.set(psid, 'honeymoon70k');
           lastShareMeta.set(psid, { caption, permalink: url });
@@ -1033,7 +1042,6 @@ async function handleTextMessage(
           return sendBatched(psid, reply);
         }
 
-        // Generic branded post
         lastShareMeta.set(psid, { caption, permalink: url });
 
         if (!isPricingIntent(text || '')) {
@@ -1064,7 +1072,7 @@ async function handleTextMessage(
       }
     }
 
-    // 2b) If none of the URLs were our brand → single non-brand fallback
+    // 2b) Non-brand fallback
     if (!matchedBrand) {
       const reply = lang === 'ur'
         ? 'آپ نے جو پوسٹ شیئر کی ہے وہ ہماری نہیں لگتی۔ براہِ کرم اس کا اسکرین شاٹ بھیج دیں تاکہ رہنمائی کر سکیں۔'
@@ -1079,10 +1087,9 @@ async function handleTextMessage(
     }
   }
 
-  // 3) Campaign-aware lightweight fallbacks (no duplicate longMsg blasts)
+  // 3) Campaign-aware lightweight fallbacks
   const campFromText = maybeCampaignFromText(text || '');
 
-  // Staycation 9000 — quick answers only; otherwise brain
   if (campFromText === 'staycation9000' || stickyCampaign === 'staycation9000') {
     campaignState.set(psid, 'staycation9000');
 
@@ -1100,7 +1107,6 @@ async function handleTextMessage(
       return sendBatched(psid, reply);
     }
 
-    // Otherwise → brain
     const surface = 'dm';
     const response = await askBrain({ text, imageUrl, surface, history });
     const { message } = response;
@@ -1109,7 +1115,6 @@ async function handleTextMessage(
     return sendBatched(psid, message);
   }
 
-  // Honeymoon 70k — quick answers only; otherwise brain
   if (campFromText === 'honeymoon70k' || stickyCampaign === 'honeymoon70k') {
     campaignState.set(psid, 'honeymoon70k');
 
@@ -1127,7 +1132,6 @@ async function handleTextMessage(
       return sendBatched(psid, reply);
     }
 
-    // Otherwise → brain
     const surface = 'dm';
     const response = await askBrain({ text, imageUrl, surface, history });
     const { message } = response;
@@ -1233,7 +1237,6 @@ async function routeInstagramMessage(event, ctx = { req: null }) {
 }
 
 async function replyToInstagramComment(commentId, message) {
-  // Use PAGE_ACCESS_TOKEN consistently
   const url = `https://graph.facebook.com/v19.0/${commentId}/replies`;
   await axios.post(url, { message: message.slice(0, MAX_OUT_CHAR) }, { params: { access_token: PAGE_ACCESS_TOKEN }, timeout: 10000 });
 }
