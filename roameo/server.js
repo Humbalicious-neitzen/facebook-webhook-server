@@ -407,15 +407,46 @@ async function getRouteInfo(originLat, originLon, destLat, destLon) {
 /* =========================
    INTENTS / DETECTORS
    ========================= */
+
+// STRICTER pricing intent: ignore validity-only asks and avoid "offer" as a trigger
+function isPricingIntent(text = '') {
+  const t = normalize(text);
+  if (t.length <= 2) return false;
+
+  // If asking about validity/expiry, do not treat as pricing
+  if (/\b(valid|validity|until|till|through|expiry|expire|expiring|last\s*date|deadline)\b/.test(t) ||
+      /\b(kab\s*tak|tk|tak)\b/i.test(text) ||
+      /کب\s*تک|تک\b/.test(text)) {
+    return false;
+  }
+
+  const kw = [
+    'price','prices','pricing','rate','rates','tariff','cost','rent','rental','per night',
+    'night price','kiraya','qeemat','kimat','keemat','قیمت','کرایہ','ریٹ','نرخ','charges','charji','fees'
+  ];
+  if (kw.some(x => t.includes(x))) return true;
+
+  if (/\b9\s*k\b/.test(t) || /\b9\s*0\s*0\s*0\b/.test(t)) return true;
+  if (/(rs|pkr|₨)\s*9\s*0\s*0\s*0/i.test(text) || /\b9\s*0\s*0\s*0\s*(rs|pkr|₨)\b/i.test(text)) return true;
+
+  if (/\bhow much\b/i.test(text)) return true;
+
+  // Only treat "X nights/days" as pricing if currency/price words are also present
+  if (/\b\d+\s*(night|nights|din|raat|days?)\b/i.test(text) &&
+      /\b(price|rate|cost|pkr|rs|₨|per\s*(night|day))\b/i.test(text)) return true;
+
+  return false;
+}
+
 function intentFromText(text = '') {
   const t = normalize(text);
 
   const wantsLocation =
-    /\b(location|where|address|map|pin|directions?|reach)\b/.test(t) ||
+    /\b(location|where|address|map|maps?|pin|directions?|reach|loc)\b/.test(t) ||
+    /\b(kahan|kidhar)\b/.test(t) ||
     /کہاں|لوکیشن|پتہ|ایڈریس|نقشہ/.test(text); // Urdu
 
-  const wantsRates =
-    isPricingIntent(text);
+  const wantsRates = isPricingIntent(text);
 
   const wantsFacilities =
     /\bfaciliti(?:y|ies)\b|\bamenit(?:y|ies)\b|\bkitchen\b|\bfood\b|\bheater\b|\bbonfire\b|\bfamily\b|\bparking\b|\bjeep\b|\binverter\b/.test(t);
@@ -433,18 +464,23 @@ function intentFromText(text = '') {
     /\bweather\b|\btemperature\b|\bforecast\b/.test(t);
 
   const wantsRoute =
-    /\broute\b|\brasta\b|\bhow\s+to\s+(?:reach|get|come)\b|\bfrom\s+\w+\s+(?:to|till|for)\b|\b(?:travel|journey)\s+time\b|\b(?:travel|journey)\s+from\b/.test(t);
+    /\broute\b|\brasta\b|\bhow\s+(?:to|do\s+(?:i|we))\s+(?:reach|get|come)\b|\bfrom\s+\w+\s+(?:to|till|for)\b|\b(?:travel|journey)\s+time\b|\b(?:travel|journey)\s+from\b|\btransport(?:ation)?\b|\bbus\b|\bcoach\b|\bvan\b|\bjeep\b|\bpick\s*up\b|\bshuttle\b/.test(t);
 
   const wantsContact =
     /\bcontact\b|\bmanager\b|\bowner\b|\bnumber\b|\bwhats\s*app\b|\bwhatsapp\b|\bcall\b|\bspeak to\b|\braabta\b/.test(t);
 
-  // Nights / days ask
+  const wantsValidity =
+    /\b(valid|validity|until|till|through|expiry|expire|expiring|last\s*date|deadline)\b/.test(t) ||
+    /کب\s*تک|تک\b/.test(text) ||
+    /\b(kab\s*tak|tk|tak)\b/i.test(text);
+
+  // Nights / days ask (still captured, but pricing branch will check wantsRates)
   const nightsAsk =
     /\b(\d{1,2})\s*(?:night|nights|raat|din|day|days)\b/i.exec(text);
 
   return {
     wantsLocation, wantsRates, wantsFacilities, wantsBooking, wantsAvail,
-    wantsDistance, wantsWeather, wantsRoute, wantsContact,
+    wantsDistance, wantsWeather, wantsRoute, wantsContact, wantsValidity,
     nightsAsk
   };
 }
@@ -754,24 +790,7 @@ async function transcribeFromUrl(url) {
 /* =========================
    INTENT HELPERS
    ========================= */
-function isPricingIntent(text = '') {
-  const t = normalize(text);
-  if (t.length <= 2) return false;
-
-  const kw = [
-    'price','prices','pricing','rate','rates','tariff','cost','rent','rental','per night',
-    'night price','kiraya','qeemat','kimat','keemat','قیمت','کرایہ','ریٹ','نرخ','offer','pkg','package','charges','charo'
-  ];
-  if (kw.some(x => t.includes(x))) return true;
-
-  if (/\b9\s*k\b/.test(t) || /\b9\s*0\s*0\s*0\b/.test(t)) return true;
-  if (/(rs|pkr|₨)\s*9\s*0\s*0\s*0/i.test(text) || /\b9\s*0\s*0\s*0\s*(rs|pkr|₨)\b/i.test(text)) return true;
-
-  if (/\bhow much\b/i.test(text)) return true;
-  if (/\b\d+\s*(night|nights|din|raat|days?)\b/i.test(text)) return true;
-
-  return false;
-}
+// (isPricingIntent moved above)
 
 /* =========================
    DM HANDLER
@@ -824,14 +843,14 @@ async function handleTextMessage(
     sections.push(`*Roameo Resorts — location link:*\n\n👉 ${MAPS_LINK}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
   }
 
-  // Nights quote (if asked explicitly like "price for 4 nights")
-  if (intents.nightsAsk && intents.wantsRates) {
+  // Nights quote only if it is truly a pricing ask (not validity)
+  if (intents.nightsAsk && intents.wantsRates && !intents.wantsValidity) {
     const n = Math.max(1, Math.min(21, parseInt(intents.nightsAsk[1], 10)));
     sections.push(quoteForNights(n));
   }
 
-  // If user asked for rates / charges without explicit nights:
-  if (intents.wantsRates && !intents.nightsAsk) {
+  // If user asked for rates / charges without explicit nights, and not a validity query
+  if (intents.wantsRates && !intents.nightsAsk && !intents.wantsValidity) {
     const activeCampaign = campaignFromText || stickyCampaign;
 
     if (activeCampaign === 'staycation9000') {
@@ -854,13 +873,35 @@ async function handleTextMessage(
   }
 
   /* =========================
-     Route intent (moved here)
+     Route / distance intent — now bundled (no early return)
      ========================= */
   if (intents.wantsRoute || intents.wantsDistance) {
     const msg = await dmRouteMessage(text);
-    const newHistory = [...history, { role: 'user', content: text }, { role: 'assistant', content: msg }];
-    chatHistory.set(psid, newHistory.slice(-20));
-    return sendBatched(psid, msg);
+    sections.push(msg);
+  }
+
+  /* =========================
+     Offer validity intent
+     ========================= */
+  if (intents.wantsValidity) {
+    const activeCampaign = campaignFromText || stickyCampaign;
+    if (activeCampaign === 'staycation9000') {
+      sections.push(
+        `The *3-day chill* staycation is **active with flexible dates**. November bookings are fine subject to availability.\nShare your **group size** and **preferred dates** and we will lock it for you.\nWhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`
+      );
+      stickyCampaign = 'staycation9000';
+      campaignState.set(psid, stickyCampaign);
+    } else if (activeCampaign === 'honeymoon70k') {
+      sections.push(
+        `The *Honeymoon Package* runs on **flexible dates** (3 nights or more). November is fine subject to availability.\nTell me your **dates** and I’ll confirm.\nWhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`
+      );
+      stickyCampaign = 'honeymoon70k';
+      campaignState.set(psid, stickyCampaign);
+    } else {
+      sections.push(
+        `Our current offers run on **flexible dates**. For November, share your **dates** and **group size** and I’ll confirm availability.\nLocation: ${MAPS_LINK}\nWhatsApp: ${WHATSAPP_LINK}`
+      );
+    }
   }
 
   // If we already have sections (multi-intent), send and return
@@ -1404,6 +1445,7 @@ function extractOrigin(text='') {
     /rasta\s+from\s+(.+)$/i,
     /directions?\s+from\s+(.+)$/i,
     /how\s+to\s+reach\s+from\s+(.+)$/i,
+    /how\s+(?:to|do\s+(?:i|we))\s+get\s+(?:there|to)\s*(?:from\s+(.+))?/i,
     /how\s+to\s+get\s+there\s+from\s+(.+)$/i,
     /(?:i\s+am\s+)?coming\s+from\s+(.+)$/i,
     /(?:i\s+am\s+)?travelling\s+from\s+(.+)$/i,
@@ -1424,8 +1466,8 @@ function extractOrigin(text='') {
   ];
   for (const r of rx) {
     const m = t.match(r);
-    if (m && m[1]) {
-      let origin = m[1].replace(/[.?!]+$/,'').trim();
+    if (m && (m[1] || m[0])) {
+      let origin = (m[1] || '').replace(/[.?!]+$/,'').trim();
       origin = origin.replace(/\b(?:the|a|an|from|to|is|are|was|were|will|would|can|could|should|may|might)\b/gi, '').trim();
       if (origin.length > 2) return origin;
     }
