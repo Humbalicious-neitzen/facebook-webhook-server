@@ -536,7 +536,7 @@ function maybeCampaignFromCaption(caption='') {
    NEW: caption → structured summary (no raw paste)
    ========================= */
 const RX_PRICE_PER_PERSON = /(rs\.?|pkr|₨)\s*([0-9][0-9,]*)\s*(?:\/?\s*(?:per\s*person|pp|per\s*head))?/i;
-const RX_ANY_PRICE        = /(rs\.?|pkr|₨)\s*([0-9][0-9,]*)/i;
+const RX_ANY_PRICE        = /(rs\.?|pkr|₨)?\s*([0-9][0-9,]*)\b|\b\d{1,2}\s*k\b/i;
 const RX_DURATION         = /\b(\d{1,2})\s*(?:din|day|days|night|nights|raat)\b/i;
 const RX_GROUP_SIZE       = /\b(\d{1,2})\s*[–-]\s*(\d{1,2})\s*(?:people|persons|guests|pax)\b/i;
 const RX_PHONE_PK         = /\b(?:\+?92|0)?3\d{9}\b/;
@@ -614,7 +614,7 @@ function formatOfferSummary(caption = '', permalink = '') {
   const info = extractInfoFromCaption(c);
 
   const out = [];
-  out.push('Thanks for sharing the post! Here’s a quick summary of this offer:');
+  out.push('Thanks for sharing the post! Here's a quick summary of this offer:');
 
   if (info.title) out.push(`\n• **Package:** ${info.title}`);
   if (info.duration) out.push(`• **Duration:** ${info.duration}`);
@@ -659,15 +659,14 @@ This trip plan is designed especially for groups of friends who want to escape t
 WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`,
 
     priceReply:
-`For the *3-day chill* staycation, the headline price is **PKR 9,000 per person**.
+`For the *3-day chill* staycation, the total is **PKR 9,000 per person**.
 
-**What’s included**
+**What's included**
+• Stay at Roameo Resort huts 🌲  
 • Daily complimentary **breakfast** + **one free dinner**  
-• **Flexible dates** (your choice)  
-• Stay at Roameo (**travel not included**)  
-• **Best for:** 2–5 people
+• **Flexible dates** (choose your own)  
+• **Best for:** 2–5 people  
 
-Tell me your **group size** and **dates**, and I’ll help you proceed.
 WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`
   },
 
@@ -683,7 +682,7 @@ Starting from **PKR 70,000 per couple** for 3 nights or more.
 • Dreamy candlelight dinner under the stars 🌙  
 • Experiences: lantern night, canvas painting, mini hike to Bantal, bonfire, stargazing, photo walk & a private picnic 🍃📸  
 
-Mark the dates that work for you, arrive hand-in-hand, and we’ll create the warmth and magic for unforgettable moments.  
+Mark the dates that work for you, arrive hand-in-hand, and we'll create the warmth and magic for unforgettable moments.  
 
 WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`,
 
@@ -705,7 +704,7 @@ WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_URL}`
    Pricing helpers (soft launch card + nights quote)
    ========================= */
 function currentRateCard() {
-  return `Right now, we’re offering exclusive soft launch discounts for our guests at Roameo Resort.
+  return `Right now, we're offering exclusive soft launch discounts for our guests at Roameo Resort.
 
 Soft Launch  Rate List:
 
@@ -724,7 +723,7 @@ Terms & Conditions:
 • Complimentary breakfast for 4 guests per booking.
 • 50% advance payment is required to confirm the reservation.
 
-Let us know if you’d like to book your stay or need any assistance! 🌿✨
+Let us know if you'd like to book your stay or need any assistance! 🌿✨
 
 WhatsApp: ${WHATSAPP_LINK}
 Availability / Book: ${SITE_URL}`;
@@ -752,7 +751,7 @@ function quoteForNights(n) {
     linesExec  .push(`• Night ${i}: PKR ${eNight.toLocaleString()} (${pct}% off)`);
   }
 
-  return `Here’s the quote for *${n} ${n===1?'night':'nights'}* (soft-launch discounts applied):
+  return `Here's the quote for *${n} ${n===1?'night':'nights'}* (soft-launch discounts applied):
 
 Deluxe Hut — Base PKR 30,000/night
 ${linesDeluxe.join('\n')} 
@@ -837,7 +836,7 @@ Then a single friendly sentence for the user (no prices). Keep it under 180 char
   const friendly =
     lang === 'ur' ? 'خوبصورت شاٹ! اگر آپ بکنگ یا پیکیجز پوچھنا چاہیں تو بتا دیں۔'
     : lang === 'roman-ur' ? 'Khoobsurat shot! Agar booking ya packages poochna chahen to batadein.'
-    : 'Beautiful shot! If you’d like details or to book, tell me your dates & group size.';
+    : 'Beautiful shot! If you'd like details or to book, tell me your dates & group size.';
 
   const base = isRoameo
     ? (lang === 'ur'
@@ -849,7 +848,7 @@ Then a single friendly sentence for the user (no prices). Keep it under 180 char
         ? `بہت خوب! اگر یہ Roameo Resorts ہے تو بتائیں—میں آپ کو درست معلومات دے دوں گا۔\nWhatsApp: ${WHATSAPP_LINK}`
         : lang === 'roman-ur'
           ? `Zabardast! Agar ye Roameo Resorts hai to bata dein—main sahi info share kar dunga.\nWhatsApp: ${WHATSAPP_LINK}`
-          : `Looks great! If this is at Roameo Resorts, say the word and I’ll share the right info.\nWhatsApp: ${WHATSAPP_LINK}`);
+          : `Looks great! If this is at Roameo Resorts, say the word and I'll share the right info.\nWhatsApp: ${WHATSAPP_LINK}`);
 
   return base;
 }
@@ -889,13 +888,13 @@ async function handleTextMessage(
     chatHistory.set(psid, newHistory.slice(-20));
   }
 
-  // >>> NEW GUARD: if it’s image-only and we somehow reached here (vision didn’t run), avoid generic openers
+  // >>> NEW GUARD: if it's image-only and we somehow reached here (vision didn't run), avoid generic openers
   if (!text && imageUrl) {
     const msg2 = lang === 'ur'
       ? `خوبصورت تصویر! کیا یہ Roameo Resorts ہے؟ اگر جی ہاں تو تاریخیں/گروپ سائز بتائیں۔`
       : lang === 'roman-ur'
         ? `Khoobsurat tasveer! Kya ye Roameo Resorts hai? Dates/group size batadein.`
-        : `Lovely photo! Is this Roameo Resorts? Share your dates & group size and I’ll help.`;
+        : `Lovely photo! Is this Roameo Resorts? Share your dates & group size and I'll help.`;
     const newHistory2 = [...history, { role:'user', content:'[image-only]' }, { role:'assistant', content: msg2 }];
     chatHistory.set(psid, newHistory2.slice(-20));
     return sendBatched(psid, msg2 + `\nWhatsApp: ${WHATSAPP_LINK}`);
@@ -969,13 +968,13 @@ async function handleTextMessage(
       campaignState.set(psid, stickyCampaign);
     } else if (activeCampaign === 'honeymoon70k') {
       sections.push(
-        `The *Honeymoon Package* runs on **flexible dates** (3 nights or more). November is fine subject to availability.\nTell me your **dates** and I’ll confirm.\nWhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`
+        `The *Honeymoon Package* runs on **flexible dates** (3 nights or more). November is fine subject to availability.\nTell me your **dates** and I'll confirm.\nWhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`
       );
       stickyCampaign = 'honeymoon70k';
       campaignState.set(psid, stickyCampaign);
     } else {
       sections.push(
-        `Our current offers run on **flexible dates**. For November, share your **dates** and **group size** and I’ll confirm availability.\nLocation: ${MAPS_LINK}\nWhatsApp: ${WHATSAPP_LINK}`
+        `Our current offers run on **flexible dates**. For November, share your **dates** and **group size** and I'll confirm availability.\nLocation: ${MAPS_LINK}\nWhatsApp: ${WHATSAPP_LINK}`
       );
     }
   }
@@ -1066,15 +1065,24 @@ async function handleTextMessage(
 
     for (const url of combinedUrls) {
       const meta = await fetchOEmbed(url);
-      const isStoryUrl = /stories/i.test(url);
+      const isStoryUrl = /\/stories\//i.test(url);
       if (isStoryUrl) {
         if (SEND_IMAGE_FOR_IG_SHARES && (meta?.thumbnail_url || ctx.shareThumb || imageUrl)) {
           const thumbRemote = meta?.thumbnail_url || ctx.shareThumb || null;
           const visionable = thumbRemote ? toVisionableUrl(thumbRemote, ctx.req) : imageUrl;
           const isBrandStory = ((ctx.storyUsername || '')).toLowerCase() === BRAND_USERNAME;
-          const reply = await storyVisionReply(            psid,            imageUrl: visionable,            isBrandStory,            storyUrl: url          );          const newHistory = [...history,  role:'user', content: text || '[shared Story url]' ,  role:'assistant', content: reply ];          chatHistory.set(psid, newHistory.slice(-20));          return sendBatched(psid, reply);        } else {
-          const reply = `Thanks for sharing our Story! If youþ got any questions about Roameo Resorts, just ask.\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`;
-          const newHistory = [...history,  role:'user', content: text || '[shared Story url]' ,  role:'assistant', content: reply ];
+          const reply = await storyVisionReply({
+            psid,
+            imageUrl: visionable,
+            isBrandStory,
+            storyUrl: url
+          });
+          const newHistory = [...history, { role:'user', content: text || '[shared Story url]' }, { role:'assistant', content: reply }];
+          chatHistory.set(psid, newHistory.slice(-20));
+          return sendBatched(psid, reply);
+        } else {
+          const reply = `Thanks for sharing our Story! If you've got any questions about Roameo Resorts, just ask.\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`;
+          const newHistory = [...history, { role:'user', content: text || '[shared Story url]' }, { role:'assistant', content: reply }];
           chatHistory.set(psid, newHistory.slice(-20));
           return sendBatched(psid, reply);
         }
@@ -1153,7 +1161,7 @@ async function handleTextMessage(
         ? 'آپ نے جو پوسٹ شیئر کی ہے وہ ہماری نہیں لگتی۔ براہِ کرم اس کا اسکرین شاٹ بھیج دیں تاکہ رہنمائی کر سکیں۔'
         : lang === 'roman-ur'
           ? 'Jo post share ki hai wo hamari nahi lagti. Behtar rehnumai ke liye uska screenshot send karein.'
-          : 'It looks like the shared post isn’t from our page. Please send a screenshot and I’ll help with details.';
+          : 'It looks like the shared post isn't from our page. Please send a screenshot and I'll help with details.';
 
       const out = `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`;
       const newHistory = [...history, { role: 'user', content: text || '[shared non-brand post]' }, { role: 'assistant', content: out }];
@@ -1252,7 +1260,7 @@ async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null
     const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId, isStory, storyUsername, storyUrl } = extractSharedPostDataFromAttachments(event);
     if (!text && !imageUrl && !(isShare || shareUrls.length || assetId)) return;
 
-    // === IG Story share (Messenger) â†’ vision one-liner    if (isStory && (shareThumb || imageUrl))       const visionable = toVisionableUrl(shareThumb || imageUrl, ctx.req) || imageUrl;      const isBrandStory = !!storyUsername && (storyUsername === BRAND_USERNAME);      const reply = await storyVisionReply(        psid: event.sender.id,        imageUrl: visionable,        isBrandStory,        storyUrl      );      const history = chatHistory.get(event.sender.id) || [];      const newHistory = [...history,  role:'user', content: '[story share]' ,  role:'assistant', content: reply ];      chatHistory.set(event.sender.id, newHistory.slice(-20));      return sendBatched(event.sender.id, reply);        // NEW: Image-only short-circuit for vision (typical Story image or plain image DM)    if (!text && imageUrl)       const lang = detectLanguage('');      const history = chatHistory.get(event.sender.id) || [];      const auto = await handleImageOnlyStory(event.sender.id, imageUrl, lang, history);      if (auto)         const newHistory = [...history,  role: 'user', content: '[image-only message]' ,  role: 'assistant', content: auto ];        chatHistory.set(event.sender.id, newHistory.slice(-20));        return sendBatched(event.sender.id, auto);              return handleTextMessage(event.sender.id, text, imageUrl,  req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions, assetId, isStory, storyUsername, storyUrl );  }
+    // === IG Story share (Messenger) → vision one-liner    if (isStory && (shareThumb || imageUrl))       const visionable = toVisionableUrl(shareThumb || imageUrl, ctx.req) || imageUrl;      const isBrandStory = !!storyUsername && (storyUsername === BRAND_USERNAME);      const reply = await storyVisionReply(        psid: event.sender.id,        imageUrl: visionable,        isBrandStory,        storyUrl      );      const history = chatHistory.get(event.sender.id) || [];      const newHistory = [...history,  role:'user', content: '[story share]' ,  role:'assistant', content: reply ];      chatHistory.set(event.sender.id, newHistory.slice(-20));      return sendBatched(event.sender.id, reply);        // NEW: Image-only short-circuit for vision (typical Story image or plain image DM)    if (!text && imageUrl)       const lang = detectLanguage('');      const history = chatHistory.get(event.sender.id) || [];      const auto = await handleImageOnlyStory(event.sender.id, imageUrl, lang, history);      if (auto)         const newHistory = [...history,  role: 'user', content: '[image-only message]' ,  role: 'assistant', content: auto ];        chatHistory.set(event.sender.id, newHistory.slice(-20));        return sendBatched(event.sender.id, auto);              return handleTextMessage(event.sender.id, text, imageUrl,  req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions, assetId, isStory, storyUsername, storyUrl );  }
 
   if (event.postback?.payload && event.sender?.id) {
     return handleTextMessage(event.sender.id, 'help', null, { req: ctx.req });
@@ -1358,7 +1366,7 @@ function extractSharedPostDataFromAttachments(event) {
 
   // NEW
   let isStory = false;
-  let storyUsername = null; // extracted from /stories/username/...
+  let storyUsername = null; // extracted from /stories/{username}/...
   let storyUrl = null;
 
   function unwrapRedirect(u) {
@@ -1373,12 +1381,12 @@ function extractSharedPostDataFromAttachments(event) {
     } catch { return u; }
   }
 
-  const looksLikePostUrl   = (u) => /(https?:(?:www)?instagramcom(?:p|reel)[A-Za-z0-9_-]+)/i.test(u || '');
-  const looksLikeStoryUrl  = (u) => /(https?:(?:www)?instagramcomstories[^/]++)/i.test(u || '');
+  const looksLikePostUrl   = (u) => /(https?:\/\/(?:www\.)?instagram\.com\/(?:p|reel)\/[A-Za-z0-9_-]+)/i.test(u || '');
+  const looksLikeStoryUrl  = (u) => /(https?:\/\/(?:www\.)?instagram\.com\/stories\/[^/]+\/\d+)/i.test(u || '');
   const parseStoryUsername = (u) => {
     try {
       const url = new URL(u);
-      const m = url.pathname.match(/stories([^/]+)/i);
+      const m = url.pathname.match(/\/stories\/([^/]+)\//i);
       return m ? m[1].toLowerCase() : null;
     } catch { return null; }
   };
@@ -1453,7 +1461,7 @@ function extractSharedPostDataFromAttachments(event) {
     thumb,
     isShare,
     brandHint,
-    captions: captions.filter(Boolean).join(' â€¢ '),
+    captions: captions.filter(Boolean).join(' • '),
     assetId,
     // NEW:
     isStory,
