@@ -1082,7 +1082,7 @@ async function handleTextMessage(
 
     for (const url of combinedUrls) {
       const meta = await fetchOEmbed(url);
-      const isStoryUrl = /\/stories\//i.test(url);
+      const isStoryUrl = (/\/stories\//i.test(url)) || !!ctx.isStory;
       if (isStoryUrl) {
         if (SEND_IMAGE_FOR_IG_SHARES && (meta?.thumbnail_url || ctx.shareThumb || imageUrl)) {
           const thumbRemote = meta?.thumbnail_url || ctx.shareThumb || null;
@@ -1727,24 +1727,24 @@ async function dmRouteMessage(userText = '') {
 async function storyVisionReply({ psid, imageUrl, isBrandStory, storyUrl }) {
   const surface = 'vision';
   const note = [
-    'storyShare:', 
-    `type: ${isBrandStory ? 'brand' : 'user'}`, 
-    `url: ${storyUrl || ''}`, 
-    'requirements:', 
-    '- Look at the image and briefly describe the foreground + background (fire/kettle/tea setup, river stones, huts, mountains, lawn, lights).', 
-    '- If you see Roameo-style A-frame huts or our riverside lawn, acknowledge it as Roameo Resorts.', 
-    '- If there is on-image text or a poll (e.g., Chai vs Coffee), acknowledge or playfully reference it in 1 short phrase.', 
-    '- Be appreciative and friendly. No prices.', 
-    '- Close with WhatsApp + website in a single short line.', 
-    '- Keep the whole reply within 2 short lines if possible.'
+    'storyShare:',
+    `type: ${isBrandStory ? 'brand' : 'user'}`,
+    `url: ${storyUrl || ''}`,
+    'instructions:',
+    '- Look at the image and describe the foreground + background in plain words (e.g., tea pot on fire, mountain view, rain, huts).',
+    '- If you see Roameo-style huts, river lawn, or mountain valley → acknowledge as **Roameo Resorts**.',
+    '- If there is poll/question text (e.g., chai vs coffee), playfully reference it.',
+    '- Reply in a friendly tone. No prices, no "offer summaries."',
+    '- Keep it under 2 short lines.',
+    `- Always end with: "WhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}".`
   ].join('\n');
 
   try {
-    const response = await askBrain({ 
-      text: note, 
-      imageUrl, 
-      surface, 
-      history: chatHistory.get(psid) || [] 
+    const response = await askBrain({
+      text: note,
+      imageUrl,
+      surface,
+      history: []
     });
     const msg = (response?.message || '').trim();
     if (msg) return msg;
@@ -1752,7 +1752,7 @@ async function storyVisionReply({ psid, imageUrl, isBrandStory, storyUrl }) {
     console.error('storyVisionReply error', e?.response?.data || e.message);
   }
 
-  return `Beautiful view by the river — love the tea setup! If you've got any questions about stays or packages, I'm here to help.\nWhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`;
+  return `Beautiful moment captured at Roameo Resorts 🌲. Thanks for sharing!\nWhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`;
 }
 
 function parsePriceToken(token = '') {
