@@ -1,4 +1,4 @@
-// server.js — Roameo Resorts omni-channel bot (v13  |  spam/collab/honeymoon/tax fixes + comment price redaction kept)
+// server.js — Roameo Resorts omni-channel bot (v12  |  9000-campaign + multi-intent + STT + nights quote)
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -58,6 +58,9 @@ const OPENAI_API_KEY      = process.env.OPENAI_API_KEY || '';
 const ENABLE_VOICE_STT    = String(process.env.ENABLE_VOICE_STT || 'true').toLowerCase() === 'true';
 const STT_MODEL           = process.env.STT_MODEL || 'gpt-4o-mini-transcribe'; // whisper-1 works too
 const MAX_AUDIO_MB        = Number(process.env.MAX_AUDIO_MB || 20);
+
+/* NEW: Story/DM image-only vision toggle */
+const ENABLE_STORY_VISION = String(process.env.ENABLE_STORY_VISION || 'true').toLowerCase() === 'true';
 
 if (!APP_SECRET || !VERIFY_TOKEN || !PAGE_ACCESS_TOKEN) {
   console.warn('⚠️ Missing required env vars: APP_SECRET, VERIFY_TOKEN, PAGE_ACCESS_TOKEN');
@@ -172,12 +175,11 @@ function detectLanguage(text = '') {
   const t = (text || '').trim();
   const hasUrduScript = /[\u0600-\u06FF\u0750-\u077F]/.test(t);
   if (hasUrduScript) return 'ur';
-  const romanUrduTokens = ['aap','ap','apka','apki','apke','kiraya','qeemat','rate','price','btao','batao','kitna','kitni','kitne','raha','hai','hain','kahan','kidhar','map','location','place','shadi','shadiyon','honeymoon'];
+  const romanUrduTokens = ['aap','ap','apka','apki','apke','kiraya','qeemat','rate','price','btao','batao','kitna','kitni','kitne','raha','hai','hain','kahan','kidhar','map','location','place'];
   const hit = romanUrduTokens.some(w => new RegExp(`\\b${w}\\b`, 'i').test(t));
   return hit ? 'roman-ur' : 'en';
 }
 function stripPricesFromPublic(text = '') {
-  // Remove lines that look like they contain prices or numeric money
   const lines = (text || '').split(/\r?\n/).filter(Boolean).filter(l => {
     const s = l.toLowerCase();
     const hasCurrency = /(?:pkr|rs\.?|rupees|₨|price|prices|pricing|rate|rates|tariff|per\s*night|rent|rental|kiraya|قیمت|کرایہ|ریٹ|نرخ)/i.test(s);
@@ -406,7 +408,7 @@ async function getRouteInfo(originLat, originLon, destLat, destLon) {
 }
 
 /* =========================
-   INTENTS / DETECTORS  (patched)
+   INTENTS / DETECTORS
    ========================= */
 
 // STRICTER pricing intent: ignore validity-only asks and avoid "offer/package" as a trigger
@@ -427,6 +429,9 @@ function isPricingIntent(text = '') {
   ];
   if (kw.some(x => t.includes(x))) return true;
 
+  if (/\b9\s*k\b/.test(t) || /\b9\s*0\s*0\s*0\b/.test(t)) return true;
+  if (/(rs|pkr|₨)\s*9\s*0\s*0\s*0/i.test(text) || /\b9\s*0\s*0\s*0\s*(rs|pkr|₨)\b/i.test(text)) return true;
+
   if (/\bhow much\b/i.test(text)) return true;
 
   // Only treat "X nights/days" as pricing if currency/price words are also present
@@ -438,14 +443,6 @@ function isPricingIntent(text = '') {
 
 function intentFromText(text = '') {
   const t = normalize(text);
-
-  // NEW — spammy vendor pitches (followers/likes/SMM/page handler)
-  const spammy =
-    /\bfollowers?\b|\blikes?\b|\bsubscribers?\b|\bgrow(?:\s+your)?\b|\bsmm\b|\bcheap\b|\bpanel\b|\bseo\b|\bpage handler\b|\bgraphic designer\b|\bvideo editor\b/.test(t);
-
-  // NEW — influencer/collab
-  const wantsCollab =
-    /\bcollab(?:oration)?\b|\bbrand\s*deal\b|\bpartnership\b|\binfluencer\b|\bpr\s*(?:deal|package)?\b/.test(t);
 
   const wantsLocation =
     /\b(location|where|address|map|maps?|pin|directions?|reach|loc|place)\b/.test(t) ||
@@ -480,35 +477,20 @@ function intentFromText(text = '') {
     /کب\s*تک|تک\b/.test(text) ||
     /\b(kab\s*tak|tk|tak)\b/i.test(text);
 
-  // NEW: packages / discounts intent (generic only)
+  // NEW: packages / discounts intent
   const wantsPackages =
-    (/\b(packages?|pkg|pckg|deal|deals|promo|promotion|offers?|discounts?)\b/.test(t) ||
-     /(پیکج|پیکیج|آفر|آفرز|ڈسکا?ونٹ)/i.test(text) ||
-     /\bpkg\b/i.test(text))
-     && !/\bhone[\s-]?moon\b/i.test(t); // don't treat honeymoon-specific as "all packages"
-
-  // NEW: honeymoon intent
-  const wantsHoneymoon =
-    /\bhone[\s-]?moon\b/i.test(t) || /(honeymoon[a-z]*)/i.test(text) ||
-    /\b70\s*[kK]\b/.test(t) || /\b70\s*[,\.]?\s*0{3,}\b/.test(t) ||
-    /(?:^|[^a-z0-9])(rs|pkr|₨)\s*70\s*[,\.]?\s*0{3,}/i.test(text);
-
-  // NEW: explicit tax ask
-  const wantsTax =
-    /\b(inclusive|include[sd]?|with)\s+(?:tax|taxes)\b/.test(t) ||
-    /\btax(?:es)?\s*(?:included|inclusive)\b/.test(t) ||
-    /(?:شامل|ٹیکس)\s*(?:ہے|ہیں|ہو)/.test(text) ||
-    /\b(?:kya|kia|kya)\s*tax\s*shamil\b/i.test(text);
+    /\b(packages?|pkg|pckg|deal|deals|promo|promotion|offers?|discounts?)\b/.test(t) ||
+    /(پیکج|پیکیج|آفر|آفرز|ڈسکا?ونٹ)/i.test(text) ||
+    /\bpkg\b/i.test(text);
 
   // Nights / days ask (still captured; pricing branch checks wantsRates)
   const nightsAsk =
     /\b(\d{1,2})\s*(?:night|nights|raat|din|day|days)\b/i.exec(text);
 
   return {
-    spammy, wantsCollab,
     wantsLocation, wantsRates, wantsFacilities, wantsBooking, wantsAvail,
     wantsDistance, wantsWeather, wantsRoute, wantsContact, wantsValidity,
-    wantsPackages, wantsHoneymoon, wantsTax, nightsAsk
+    wantsPackages, nightsAsk
   };
 }
 
@@ -636,8 +618,11 @@ function formatOfferSummary(caption = '', permalink = '') {
 
   if (info.title) out.push(`\n• **Package:** ${info.title}`);
   if (info.duration) out.push(`• **Duration:** ${info.duration}`);
-  // deliberately avoid numeric price in public contexts later; DMs fine.
-
+  if (info.pricePerPerson) {
+    out.push(`• **Price:** ${info.pricePerPerson}`);
+  } else if (info.anyPrice) {
+    out.push(`• **Price:** ${info.anyPrice}`);
+  }
   if (info.groupSize) out.push(`• **Best for:** ${info.groupSize}`);
 
   if (info.inclusions.size) {
@@ -823,7 +808,54 @@ async function transcribeFromUrl(url) {
 }
 
 /* =========================
-   DM HANDLER  (patched short-circuits)
+   NEW: Story/DM image-only → vision-driven reply
+   ========================= */
+/**
+ * If the user sends only an image (typical IG Story mention → DM),
+ * ask the brain/vision to decide whether it's Roameo Resorts and craft a friendly reply.
+ */
+async function handleImageOnlyStory(psid, imageUrl, lang = 'en', history = []) {
+  if (!ENABLE_STORY_VISION || !imageUrl) return null;
+
+  const probe =
+`You are a vision assistant. Look ONLY at the image and answer:
+- Does the photo likely show **Roameo Resorts** in Tehjian, Neelum (A-frame wooden huts with triangular roofs, warm yellow lights, lawn by the river, mountains)?
+Return on the FIRST line a machine tag:
+VERDICT: ROAMEO=YES or ROAMEO=NO
+Then a single friendly sentence for the user (no prices). Keep it under 180 chars.`;
+
+  const { message: visMsg = '' } = await askBrain({
+    text: probe,
+    imageUrl,
+    surface: 'vision',
+    history,
+  });
+
+  const verdictLine = (visMsg || '').split('\n')[0].trim();
+  const isRoameo = /ROAMEO\s*=\s*YES/i.test(verdictLine);
+
+  const friendly =
+    lang === 'ur' ? 'خوبصورت شاٹ! اگر آپ بکنگ یا پیکیجز پوچھنا چاہیں تو بتا دیں۔'
+    : lang === 'roman-ur' ? 'Khoobsurat shot! Agar booking ya packages poochna chahen to batadein.'
+    : 'Beautiful shot! If you’d like details or to book, tell me your dates & group size.';
+
+  const base = isRoameo
+    ? (lang === 'ur'
+        ? `یہ **Roameo Resorts** جیسا ہی لگ رہا ہے! ${friendly}\nWhatsApp: ${WHATSAPP_LINK}`
+        : lang === 'roman-ur'
+          ? `Ye **Roameo Resorts** hi lag raha hai! ${friendly}\nWhatsApp: ${WHATSAPP_LINK}`
+          : `That looks like **Roameo Resorts**! ${friendly}\nWhatsApp: ${WHATSAPP_LINK}`)
+    : (lang === 'ur'
+        ? `بہت خوب! اگر یہ Roameo Resorts ہے تو بتائیں—میں آپ کو درست معلومات دے دوں گا۔\nWhatsApp: ${WHATSAPP_LINK}`
+        : lang === 'roman-ur'
+          ? `Zabardast! Agar ye Roameo Resorts hai to bata dein—main sahi info share kar dunga.\nWhatsApp: ${WHATSAPP_LINK}`
+          : `Looks great! If this is at Roameo Resorts, say the word and I’ll share the right info.\nWhatsApp: ${WHATSAPP_LINK}`);
+
+  return base;
+}
+
+/* =========================
+   DM HANDLER
    ========================= */
 async function handleTextMessage(
   psid,
@@ -857,51 +889,16 @@ async function handleTextMessage(
     chatHistory.set(psid, newHistory.slice(-20));
   }
 
-  // === HARD SHORT-CIRCUITS (fixes) ===
-
-  // 1) Spam / follower sellers / generic vendor pitches
-  if (intents.spammy) {
-    const decline = lang === 'ur'
-      ? 'آپ کی پیشکش کا شکریہ، لیکن ہمیں اس قسم کی سروسز میں دلچسپی نہیں ہے۔'
+  // >>> NEW GUARD: if it’s image-only and we somehow reached here (vision didn’t run), avoid generic openers
+  if (!text && imageUrl) {
+    const msg2 = lang === 'ur'
+      ? `خوبصورت تصویر! کیا یہ Roameo Resorts ہے؟ اگر جی ہاں تو تاریخیں/گروپ سائز بتائیں۔`
       : lang === 'roman-ur'
-        ? 'Shukriya, lekin is qism ki services mein dilchaspi nahi.'
-        : 'Thanks for reaching out. We’re not interested in such services.';
-    const out = `${decline}\nWhatsApp: ${WHATSAPP_LINK}`;
-    const newHistory = [...history, { role:'user', content:text }, { role:'assistant', content: out }];
-    chatHistory.set(psid, newHistory.slice(-20));
-    return sendBatched(psid, out);
-  }
-
-  // 2) Collab / influencer
-  if (intents.wantsCollab) {
-    const msg = lang === 'ur'
-      ? `ہم تعاون/کولیب میں دلچسپی رکھتے ہیں۔ براہِ کرم تفصیلات WhatsApp پر شیئر کریں: ${WHATSAPP_LINK}`
-      : lang === 'roman-ur'
-        ? `Collab mein dilchaspi hai. Details WhatsApp par share karein: ${WHATSAPP_LINK}`
-        : `We’d love to hear about collaborations! Please message us on WhatsApp: ${WHATSAPP_LINK}`;
-    const newHistory = [...history, { role:'user', content:text }, { role:'assistant', content: msg }];
-    chatHistory.set(psid, newHistory.slice(-20));
-    return sendBatched(psid, msg);
-  }
-
-  // 3) Explicit tax ask (answer directly, no dumping price card)
-  if (intents.wantsTax) {
-    const msg = lang === 'ur'
-      ? 'جی، ہمارے ریٹس تمام ٹیکسز سمیت ہیں۔ ہر بکنگ پر 4 مہمانوں کے لیے ناشتے کی سہولت بھی شامل ہے۔'
-      : lang === 'roman-ur'
-        ? 'Haan, hamare rates tax samait hain. 4 mehmaanon ke liye complimentary breakfast bhi shamil hai.'
-        : 'Yes, our rates include all taxes. Complimentary breakfast for 4 guests per booking.';
-    const newHistory = [...history, { role:'user', content:text }, { role:'assistant', content: msg }];
-    chatHistory.set(psid, newHistory.slice(-20));
-    return sendBatched(psid, msg + `\nWhatsApp: ${WHATSAPP_LINK}`);
-  }
-
-  // 4) Honeymoon → honeymoon details only
-  if (intents.wantsHoneymoon) {
-    const reply = CAMPAIGNS.honeymoon70k.priceReply;
-    const newHistory = [...history, { role:'user', content:text }, { role:'assistant', content: reply }];
-    chatHistory.set(psid, newHistory.slice(-20));
-    return sendBatched(psid, reply);
+        ? `Khoobsurat tasveer! Kya ye Roameo Resorts hai? Dates/group size batadein.`
+        : `Lovely photo! Is this Roameo Resorts? Share your dates & group size and I’ll help.`;
+    const newHistory2 = [...history, { role:'user', content:'[image-only]' }, { role:'assistant', content: msg2 }];
+    chatHistory.set(psid, newHistory2.slice(-20));
+    return sendBatched(psid, msg2 + `\nWhatsApp: ${WHATSAPP_LINK}`);
   }
 
   // === Multi-intent bundle reply container ===
@@ -1229,7 +1226,8 @@ async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null
     }
 
     let text = event.message.text || '';
-    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
+    const rawImageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
+    const imageUrl = rawImageUrl ? toVisionableUrl(rawImageUrl, ctx.req) : null;
 
     // Messenger voice notes (if any)
     const audioUrl = event.message.attachments?.find(a => a.type === 'audio')?.payload?.url || null;
@@ -1240,6 +1238,18 @@ async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null
 
     const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
     if (!text && !imageUrl && !(isShare || shareUrls.length || assetId)) return;
+
+    // NEW: Image-only short-circuit for vision (typical Story image or plain image DM)
+    if (!text && imageUrl) {
+      const lang = detectLanguage('');
+      const history = chatHistory.get(event.sender.id) || [];
+      const auto = await handleImageOnlyStory(event.sender.id, imageUrl, lang, history);
+      if (auto) {
+        const newHistory = [...history, { role: 'user', content: '[image-only message]' }, { role: 'assistant', content: auto }];
+        chatHistory.set(event.sender.id, newHistory.slice(-20));
+        return sendBatched(event.sender.id, auto);
+      }
+    }
 
     return handleTextMessage(event.sender.id, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions, assetId });
   }
@@ -1267,7 +1277,6 @@ async function routePageChange(change) {
     if (isSelfComment(v, 'facebook')) return;
 
     if (AUTO_REPLY_ENABLED) {
-      // Brain builds a good reply; we then enforce "no numeric pricing in comments".
       const dm = await askBrain({ text, surface: 'comment' });
       await replyToFacebookComment(v.comment_id, stripPricesFromPublic(dm.message));
     }
@@ -1285,7 +1294,8 @@ async function routeInstagramMessage(event, ctx = { req: null }) {
     }
 
     let text = event.message.text || '';
-    const imageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
+    const rawImageUrl = event.message.attachments?.find(a => a.type === 'image')?.payload?.url || null;
+    const imageUrl = rawImageUrl ? toVisionableUrl(rawImageUrl, ctx.req) : null;
 
     // IG voice / audio
     const audioUrl = event.message.attachments?.find(a => a.type === 'audio')?.payload?.url || null;
@@ -1297,6 +1307,18 @@ async function routeInstagramMessage(event, ctx = { req: null }) {
     const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
 
     if (!text && !imageUrl && !(isShare || shareUrls.length || assetId)) return;
+
+    // NEW: Image-only short-circuit for Story mentions
+    if (!text && imageUrl) {
+      const lang = detectLanguage('');
+      const history = chatHistory.get(igUserId) || [];
+      const auto = await handleImageOnlyStory(igUserId, imageUrl, lang, history);
+      if (auto) {
+        const newHistory = [...history, { role: 'user', content: '[image-only story mention]' }, { role: 'assistant', content: auto }];
+        chatHistory.set(igUserId, newHistory.slice(-20));
+        return sendBatched(igUserId, auto);
+      }
+    }
 
     return handleTextMessage(igUserId, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions, assetId });
   }
