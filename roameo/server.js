@@ -614,7 +614,7 @@ function formatOfferSummary(caption = '', permalink = '') {
   const info = extractInfoFromCaption(c);
 
   const out = [];
-  out.push('Thanks for sharing the post! Here's a quick summary of this offer:');
+  out.push("Thanks for sharing the post! Here's a quick summary of this offer:");
 
   if (info.title) out.push(`\n• **Package:** ${info.title}`);
   if (info.duration) out.push(`• **Duration:** ${info.duration}`);
