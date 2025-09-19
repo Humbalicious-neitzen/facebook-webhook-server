@@ -1260,7 +1260,36 @@ async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null
     const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId, isStory, storyUsername, storyUrl } = extractSharedPostDataFromAttachments(event);
     if (!text && !imageUrl && !(isShare || shareUrls.length || assetId)) return;
 
-    // === IG Story share (Messenger) → vision one-liner    if (isStory && (shareThumb || imageUrl))       const visionable = toVisionableUrl(shareThumb || imageUrl, ctx.req) || imageUrl;      const isBrandStory = !!storyUsername && (storyUsername === BRAND_USERNAME);      const reply = await storyVisionReply(        psid: event.sender.id,        imageUrl: visionable,        isBrandStory,        storyUrl      );      const history = chatHistory.get(event.sender.id) || [];      const newHistory = [...history,  role:'user', content: '[story share]' ,  role:'assistant', content: reply ];      chatHistory.set(event.sender.id, newHistory.slice(-20));      return sendBatched(event.sender.id, reply);        // NEW: Image-only short-circuit for vision (typical Story image or plain image DM)    if (!text && imageUrl)       const lang = detectLanguage('');      const history = chatHistory.get(event.sender.id) || [];      const auto = await handleImageOnlyStory(event.sender.id, imageUrl, lang, history);      if (auto)         const newHistory = [...history,  role: 'user', content: '[image-only message]' ,  role: 'assistant', content: auto ];        chatHistory.set(event.sender.id, newHistory.slice(-20));        return sendBatched(event.sender.id, auto);              return handleTextMessage(event.sender.id, text, imageUrl,  req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions, assetId, isStory, storyUsername, storyUrl );  }
+    // === IG Story share (Messenger) → vision one-liner
+    if (isStory && (shareThumb || imageUrl)) {
+      const visionable = toVisionableUrl(shareThumb || imageUrl, ctx.req) || imageUrl;
+      const isBrandStory = !!storyUsername && (storyUsername === BRAND_USERNAME);
+      const reply = await storyVisionReply({
+        psid: event.sender.id,
+        imageUrl: visionable,
+        isBrandStory,
+        storyUrl
+      });
+      const history = chatHistory.get(event.sender.id) || [];
+      const newHistory = [...history, { role:'user', content: '[story share]' }, { role:'assistant', content: reply }];
+      chatHistory.set(event.sender.id, newHistory.slice(-20));
+      return sendBatched(event.sender.id, reply);
+    }
+
+    // NEW: Image-only short-circuit for vision (typical Story image or plain image DM)
+    if (!text && imageUrl) {
+      const lang = detectLanguage('');
+      const history = chatHistory.get(event.sender.id) || [];
+      const auto = await handleImageOnlyStory(event.sender.id, imageUrl, lang, history);
+      if (auto) {
+        const newHistory = [...history, { role: 'user', content: '[image-only message]' }, { role: 'assistant', content: auto }];
+        chatHistory.set(event.sender.id, newHistory.slice(-20));
+        return sendBatched(event.sender.id, auto);
+      }
+    }
+
+    return handleTextMessage(event.sender.id, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions, assetId, isStory, storyUsername, storyUrl });
+  }
 
   if (event.postback?.payload && event.sender?.id) {
     return handleTextMessage(event.sender.id, 'help', null, { req: ctx.req });
