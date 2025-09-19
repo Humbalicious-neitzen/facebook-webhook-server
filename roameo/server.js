@@ -861,7 +861,7 @@ async function handleTextMessage(
   psid,
   text,
   imageUrl,
-  ctx = { req: null, shareUrls: [], shareThumb: null, isShare: false, brandHint: false, captions: '', assetId: null }
+  ctx = { req: null, shareUrls: [], shareThumb: null, isShare: false, brandHint: false, captions: '', assetId: null, isStory: false, storyUsername: null, storyUrl: null }
 ) {
   if (!AUTO_REPLY_ENABLED) return;
 
@@ -1066,6 +1066,19 @@ async function handleTextMessage(
 
     for (const url of combinedUrls) {
       const meta = await fetchOEmbed(url);
+      const isStoryUrl = /stories/i.test(url);
+      if (isStoryUrl) {
+        if (SEND_IMAGE_FOR_IG_SHARES && (meta?.thumbnail_url || ctx.shareThumb || imageUrl)) {
+          const thumbRemote = meta?.thumbnail_url || ctx.shareThumb || null;
+          const visionable = thumbRemote ? toVisionableUrl(thumbRemote, ctx.req) : imageUrl;
+          const isBrandStory = ((ctx.storyUsername || '')).toLowerCase() === BRAND_USERNAME;
+          const reply = await storyVisionReply(            psid,            imageUrl: visionable,            isBrandStory,            storyUrl: url          );          const newHistory = [...history,  role:'user', content: text || '[shared Story url]' ,  role:'assistant', content: reply ];          chatHistory.set(psid, newHistory.slice(-20));          return sendBatched(psid, reply);        } else {
+          const reply = `Thanks for sharing our Story! If youþ got any questions about Roameo Resorts, just ask.\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`;
+          const newHistory = [...history,  role:'user', content: text || '[shared Story url]' ,  role:'assistant', content: reply ];
+          chatHistory.set(psid, newHistory.slice(-20));
+          return sendBatched(psid, reply);
+        }
+      }
       if (meta && isFromBrand(meta)) {
         matchedBrand = true;
 
@@ -1236,23 +1249,10 @@ async function routeMessengerEvent(event, ctx = { source: 'messaging', req: null
       if (transcript) text = transcript;
     }
 
-    const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
+    const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId, isStory, storyUsername, storyUrl } = extractSharedPostDataFromAttachments(event);
     if (!text && !imageUrl && !(isShare || shareUrls.length || assetId)) return;
 
-    // NEW: Image-only short-circuit for vision (typical Story image or plain image DM)
-    if (!text && imageUrl) {
-      const lang = detectLanguage('');
-      const history = chatHistory.get(event.sender.id) || [];
-      const auto = await handleImageOnlyStory(event.sender.id, imageUrl, lang, history);
-      if (auto) {
-        const newHistory = [...history, { role: 'user', content: '[image-only message]' }, { role: 'assistant', content: auto }];
-        chatHistory.set(event.sender.id, newHistory.slice(-20));
-        return sendBatched(event.sender.id, auto);
-      }
-    }
-
-    return handleTextMessage(event.sender.id, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions, assetId });
-  }
+    // === IG Story share (Messenger) â†’ vision one-liner    if (isStory && (shareThumb || imageUrl))       const visionable = toVisionableUrl(shareThumb || imageUrl, ctx.req) || imageUrl;      const isBrandStory = !!storyUsername && (storyUsername === BRAND_USERNAME);      const reply = await storyVisionReply(        psid: event.sender.id,        imageUrl: visionable,        isBrandStory,        storyUrl      );      const history = chatHistory.get(event.sender.id) || [];      const newHistory = [...history,  role:'user', content: '[story share]' ,  role:'assistant', content: reply ];      chatHistory.set(event.sender.id, newHistory.slice(-20));      return sendBatched(event.sender.id, reply);        // NEW: Image-only short-circuit for vision (typical Story image or plain image DM)    if (!text && imageUrl)       const lang = detectLanguage('');      const history = chatHistory.get(event.sender.id) || [];      const auto = await handleImageOnlyStory(event.sender.id, imageUrl, lang, history);      if (auto)         const newHistory = [...history,  role: 'user', content: '[image-only message]' ,  role: 'assistant', content: auto ];        chatHistory.set(event.sender.id, newHistory.slice(-20));        return sendBatched(event.sender.id, auto);              return handleTextMessage(event.sender.id, text, imageUrl,  req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions, assetId, isStory, storyUsername, storyUrl );  }
 
   if (event.postback?.payload && event.sender?.id) {
     return handleTextMessage(event.sender.id, 'help', null, { req: ctx.req });
@@ -1304,7 +1304,7 @@ async function routeInstagramMessage(event, ctx = { req: null }) {
       if (transcript) text = transcript;
     }
 
-    const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId } = extractSharedPostDataFromAttachments(event);
+    const { urls: shareUrls, thumb: shareThumb, isShare, brandHint, captions, assetId, isStory, storyUsername, storyUrl } = extractSharedPostDataFromAttachments(event);
 
     if (!text && !imageUrl && !(isShare || shareUrls.length || assetId)) return;
 
@@ -1320,7 +1320,7 @@ async function routeInstagramMessage(event, ctx = { req: null }) {
       }
     }
 
-    return handleTextMessage(igUserId, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions, assetId });
+    return handleTextMessage(igUserId, text, imageUrl, { req: ctx.req, shareUrls, shareThumb, isShare, brandHint, captions, assetId, isStory, storyUsername, storyUrl });
   }
 }
 
@@ -1356,6 +1356,11 @@ function extractSharedPostDataFromAttachments(event) {
   const captions = [];
   let assetId = null;
 
+  // NEW
+  let isStory = false;
+  let storyUsername = null; // extracted from /stories/username/...
+  let storyUrl = null;
+
   function unwrapRedirect(u) {
     try {
       const url = new URL(u);
@@ -1367,7 +1372,16 @@ function extractSharedPostDataFromAttachments(event) {
       return u;
     } catch { return u; }
   }
-  const looksLikePostUrl = (u) => /(https?:\/\/(?:www\.)?instagram\.com\/(?:p|reel)\/[A-Za-z0-9_-]+)/i.test(u || '');
+
+  const looksLikePostUrl   = (u) => /(https?:(?:www)?instagramcom(?:p|reel)[A-Za-z0-9_-]+)/i.test(u || '');
+  const looksLikeStoryUrl  = (u) => /(https?:(?:www)?instagramcomstories[^/]++)/i.test(u || '');
+  const parseStoryUsername = (u) => {
+    try {
+      const url = new URL(u);
+      const m = url.pathname.match(/stories([^/]+)/i);
+      return m ? m[1].toLowerCase() : null;
+    } catch { return null; }
+  };
 
   function collect(obj) {
     if (!obj || typeof obj !== 'object') return;
@@ -1375,7 +1389,7 @@ function extractSharedPostDataFromAttachments(event) {
       if (typeof v === 'string') {
         const s = v.trim();
         if (!s) continue;
-        if (/^https?:\/\//i.test(s)) {
+        if (/^https?:/i.test(s)) {
           const u = unwrapRedirect(s);
           try {
             const uo = new URL(u);
@@ -1387,13 +1401,20 @@ function extractSharedPostDataFromAttachments(event) {
             }
           } catch {}
           if (looksLikePostUrl(u)) urls.add(u);
+          if (looksLikeStoryUrl(u)) {
+            urls.add(u);
+            isStory = true;
+            storyUrl = u;
+            storyUsername = parseStoryUsername(u);
+          }
         }
+
         if (['title','name','label','caption','description','subtitle','author','byline','text'].includes(k) && s) {
           captions.push(s);
           const low = s.toLowerCase();
           if (low.includes(BRAND_USERNAME) || low.includes(BRAND_PAGE_NAME)) brandHint = true;
         }
-        if (!thumb && ['image_url','thumbnail_url','preview_url','picture','media_url','image'].includes(k) && /^https?:\/\//i.test(s)) {
+        if (!thumb && ['image_url','thumbnail_url','preview_url','picture','media_url','image'].includes(k) && /^https?:/i.test(s)) {
           thumb = s;
         }
       } else if (typeof v === 'object') {
@@ -1403,10 +1424,9 @@ function extractSharedPostDataFromAttachments(event) {
   }
 
   for (const a of atts) {
-    // NOTE: don't mark audio as "share"
     if (a?.type && a.type !== 'image' && a.type !== 'audio') isShare = true;
 
-    if (a?.url && /^https?:\/\//i.test(a.url)) {
+    if (a?.url && /^https?:/i.test(a.url)) {
       const u = unwrapRedirect(a.url);
       try {
         const uo = new URL(u);
@@ -1418,11 +1438,28 @@ function extractSharedPostDataFromAttachments(event) {
         }
       } catch {}
       if (looksLikePostUrl(u)) urls.add(u);
+      if (looksLikeStoryUrl(u)) {
+        urls.add(u);
+        isStory = true;
+        storyUrl = u;
+        storyUsername = parseStoryUsername(u);
+      }
     }
     if (a?.payload) collect(a.payload);
   }
 
-  return { urls: [...urls], thumb, isShare, brandHint, captions: captions.filter(Boolean).join(' • '), assetId };
+  return {
+    urls: [...urls],
+    thumb,
+    isShare,
+    brandHint,
+    captions: captions.filter(Boolean).join(' â€¢ '),
+    assetId,
+    // NEW:
+    isStory,
+    storyUsername,
+    storyUrl
+  };
 }
 
 /* =========================
@@ -1630,4 +1667,34 @@ async function dmRouteMessage(userText = '') {
       : `\n\n💡 Tip: Driving is the best option. The route is beautiful!`;
 
   return sanitizeVoice(`${response}${additionalInfo}\n\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`);
+}
+
+// Story vision helper
+async function storyVisionReply({ psid, imageUrl, isBrandStory, storyUrl }) {
+  const surface = 'dm';
+  const note = [
+    'storyShare:', 
+    `type: ${isBrandStory ? 'brand' : 'user'}`, 
+    `url: ${storyUrl || ''}`, 
+    'requirements:', 
+    '- Briefly describe what you see (foreground + background) in 1-2 lines.', 
+    '- If it is from the user, appreciate their Story. If it is brand-owned, thank them for sharing our Story.', 
+    '- DO NOT mention any prices.', 
+    '- Close by inviting questions about Roameo Resorts and include WhatsApp + website.', 
+  ].join('\n');
+
+  try {
+    const response = await askBrain({ 
+      text: note, 
+      imageUrl, 
+      surface, 
+      history: chatHistory.get(psid) || [] 
+    });
+    const msg = (response?.message || '').trim();
+    if (msg) return msg;
+  } catch (e) {
+    console.error('storyVisionReply error', e?.response?.data || e.message);
+  }
+
+  return `Thanks for sharing! That's a lovely view from Roameo Resorts. If you've got any questions about stays or packages, I'm here to help.\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`;
 }
