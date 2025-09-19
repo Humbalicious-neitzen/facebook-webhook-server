@@ -1161,7 +1161,7 @@ async function handleTextMessage(
         ? 'آپ نے جو پوسٹ شیئر کی ہے وہ ہماری نہیں لگتی۔ براہِ کرم اس کا اسکرین شاٹ بھیج دیں تاکہ رہنمائی کر سکیں۔'
         : lang === 'roman-ur'
           ? 'Jo post share ki hai wo hamari nahi lagti. Behtar rehnumai ke liye uska screenshot send karein.'
-          : 'It looks like the shared post isn't from our page. Please send a screenshot and I'll help with details.';
+          : "It looks like the shared post isn't from our page. Please send a screenshot and I'll help with details.";
 
       const out = `${reply}\n\nWhatsApp: ${WHATSAPP_LINK}`;
       const newHistory = [...history, { role: 'user', content: text || '[shared non-brand post]' }, { role: 'assistant', content: out }];
