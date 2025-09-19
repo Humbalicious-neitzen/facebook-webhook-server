@@ -836,7 +836,7 @@ Then a single friendly sentence for the user (no prices). Keep it under 180 char
   const friendly =
     lang === 'ur' ? 'خوبصورت شاٹ! اگر آپ بکنگ یا پیکیجز پوچھنا چاہیں تو بتا دیں۔'
     : lang === 'roman-ur' ? 'Khoobsurat shot! Agar booking ya packages poochna chahen to batadein.'
-    : 'Beautiful shot! If you'd like details or to book, tell me your dates & group size.';
+    : "Beautiful shot! If you'd like details or to book, tell me your dates & group size.";
 
   const base = isRoameo
     ? (lang === 'ur'
