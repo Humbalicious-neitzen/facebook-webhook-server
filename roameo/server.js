@@ -1708,16 +1708,18 @@ async function dmRouteMessage(userText = '') {
 
 // Story vision helper
 async function storyVisionReply({ psid, imageUrl, isBrandStory, storyUrl }) {
-  const surface = 'dm';
+  const surface = 'vision';
   const note = [
     'storyShare:', 
     `type: ${isBrandStory ? 'brand' : 'user'}`, 
     `url: ${storyUrl || ''}`, 
     'requirements:', 
-    '- Briefly describe what you see (foreground + background) in 1-2 lines.', 
-    '- If it is from the user, appreciate their Story. If it is brand-owned, thank them for sharing our Story.', 
-    '- DO NOT mention any prices.', 
-    '- Close by inviting questions about Roameo Resorts and include WhatsApp + website.', 
+    '- Look at the image and briefly describe the foreground + background (fire/kettle/tea setup, river stones, huts, mountains, lawn, lights).', 
+    '- If you see Roameo-style A-frame huts or our riverside lawn, acknowledge it as Roameo Resorts.', 
+    '- If there is on-image text or a poll (e.g., Chai vs Coffee), acknowledge or playfully reference it in 1 short phrase.', 
+    '- Be appreciative and friendly. No prices.', 
+    '- Close with WhatsApp + website in a single short line.', 
+    '- Keep the whole reply within 2 short lines if possible.'
   ].join('\n');
 
   try {
@@ -1733,5 +1735,5 @@ async function storyVisionReply({ psid, imageUrl, isBrandStory, storyUrl }) {
     console.error('storyVisionReply error', e?.response?.data || e.message);
   }
 
-  return `Thanks for sharing! That's a lovely view from Roameo Resorts. If you've got any questions about stays or packages, I'm here to help.\nWhatsApp: ${WHATSAPP_LINK}\nWebsite: ${SITE_SHORT}`;
+  return `Beautiful view by the river — love the tea setup! If you've got any questions about stays or packages, I'm here to help.\nWhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`;
 }
