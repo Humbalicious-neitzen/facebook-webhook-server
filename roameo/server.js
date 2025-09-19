@@ -1459,7 +1459,7 @@ function extractSharedPostDataFromAttachments(event) {
             urls.add(u);
             isStory = true;
             storyUrl = u;
-            storyUsername = parseStoryUsername(u);
+            storyUsername = parseStoryUsername(u) || storyUsername;
           }
         }
 
@@ -1478,6 +1478,15 @@ function extractSharedPostDataFromAttachments(event) {
   }
 
   for (const a of atts) {
+    // ✅ Handle native IG Story type
+    if (a.type === 'ig_story' && a.payload?.story_media_url) {
+      isStory = true;
+      thumb = a.payload.story_media_url;
+      storyUrl = a.payload.story_media_url;
+      if (a.payload?.username) storyUsername = a.payload.username.toLowerCase();
+    }
+
+    // NOTE: don't mark audio as "share"
     if (a?.type && a.type !== 'image' && a.type !== 'audio') isShare = true;
 
     if (a?.url && /^https?:/i.test(a.url)) {
@@ -1496,7 +1505,7 @@ function extractSharedPostDataFromAttachments(event) {
         urls.add(u);
         isStory = true;
         storyUrl = u;
-        storyUsername = parseStoryUsername(u);
+        storyUsername = parseStoryUsername(u) || storyUsername;
       }
     }
     if (a?.payload) collect(a.payload);
