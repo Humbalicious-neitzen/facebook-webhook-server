@@ -536,7 +536,8 @@ function maybeCampaignFromCaption(caption='') {
    NEW: caption → structured summary (no raw paste)
    ========================= */
 const RX_PRICE_PER_PERSON = /(rs\.?|pkr|₨)\s*([0-9][0-9,]*)\s*(?:\/?\s*(?:per\s*person|pp|per\s*head))?/i;
-const RX_ANY_PRICE        = /(rs\.?|pkr|₨)?\s*([0-9][0-9,]*)\b|\b\d{1,2}\s*k\b/i;
+// Capture currency + number, or '9k', or plain 4-6 digit numbers; avoid '<3' via negative lookbehind
+const RX_ANY_PRICE        = /(?:(rs\.?|pkr|₨)\s*)?((?:\d{1,3}(?:,\d{3})+)|(?:\d{1,2}\s*k)|(?<!<)\b\d{4,6}\b)/i;
 const RX_DURATION         = /\b(\d{1,2})\s*(?:din|day|days|night|nights|raat)\b/i;
 const RX_GROUP_SIZE       = /\b(\d{1,2})\s*[–-]\s*(\d{1,2})\s*(?:people|persons|guests|pax)\b/i;
 const RX_PHONE_PK         = /\b(?:\+?92|0)?3\d{9}\b/;
@@ -570,10 +571,15 @@ function extractInfoFromCaption(caption = '') {
   const capLower = caption.toLowerCase();
 
   const mpp = caption.match(RX_PRICE_PER_PERSON);
-  if (mpp) info.pricePerPerson = `PKR ${Number(mpp[2].replace(/,/g,'')).toLocaleString()}/person`;
-  else {
+  if (mpp) {
+    const val = parsePriceToken(mpp[2]);
+    if (val && val >= 1000) info.pricePerPerson = `PKR ${val.toLocaleString()}/person`;
+  } else {
     const mp = caption.match(RX_ANY_PRICE);
-    if (mp) info.anyPrice = `PKR ${Number(mp[2].replace(/,/g,'')).toLocaleString()}`;
+    if (mp) {
+      const val = parsePriceToken(mp[2] || mp[1]);
+      if (val && val >= 1000) info.anyPrice = `PKR ${val.toLocaleString()}`;
+    }
   }
 
   const md = caption.match(RX_DURATION);
@@ -877,6 +883,17 @@ async function handleTextMessage(
   if (!stickyCampaign) {
     const lastMarker = [...history].reverse().find(m => m.role === 'system' && m.content.startsWith('activeCampaign:'));
     if (lastMarker) stickyCampaign = lastMarker.content.replace('activeCampaign:', '').trim();
+  }
+
+  // Early Story guard: if this DM carries a Story (by flag or URL), do vision reply and return
+  const hasStoryUrl = (ctx.shareUrls || []).some(u => /\/stories\//i.test(u));
+  if (ctx.isStory && (ctx.shareThumb || imageUrl || hasStoryUrl)) {
+    const visionable = toVisionableUrl(ctx.shareThumb || imageUrl, ctx.req) || imageUrl;
+    const isBrandStory = !!ctx.storyUsername && (ctx.storyUsername.toLowerCase() === BRAND_USERNAME);
+    const reply = await storyVisionReply({ psid, imageUrl: visionable, isBrandStory, storyUrl: ctx.storyUrl || (hasStoryUrl ? (ctx.shareUrls || []).find(u => /\/stories\//i.test(u)) : '') });
+    const newHistory = [...history, { role:'user', content: text || '[story share]' }, { role:'assistant', content: reply }];
+    chatHistory.set(psid, newHistory.slice(-20));
+    return sendBatched(psid, reply);
   }
 
   // === Detect campaign from current text ===
@@ -1736,4 +1753,12 @@ async function storyVisionReply({ psid, imageUrl, isBrandStory, storyUrl }) {
   }
 
   return `Beautiful view by the river — love the tea setup! If you've got any questions about stays or packages, I'm here to help.\nWhatsApp: ${WHATSAPP_LINK} • Website: ${SITE_SHORT}`;
+}
+
+function parsePriceToken(token = '') {
+  const s = String(token).toLowerCase().replace(/,/g, '').trim();
+  const kMatch = s.match(/^(\d{1,2})\s*k$/i);
+  if (kMatch) return parseInt(kMatch[1], 10) * 1000;
+  const num = parseInt(s, 10);
+  return Number.isFinite(num) ? num : null;
 }
